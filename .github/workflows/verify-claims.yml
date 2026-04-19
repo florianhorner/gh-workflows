@@ -1,0 +1,62 @@
+name: verify-claims
+
+on:
+  workflow_call:
+    inputs:
+      owned_repos:
+        description: "Comma-separated list of repos this owner owns (e.g. florianhorner/govee2mqtt,florianhorner/mammamiradio)"
+        required: true
+        type: string
+
+concurrency:
+  group: verify-claims-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify PR proof block
+    runs-on: ubuntu-latest
+
+    # Skip draft PRs
+    if: |
+      github.event.pull_request.draft == false &&
+      !contains(fromJson('["dependabot[bot]","pre-commit-ci[bot]","github-actions[bot]"]'), github.event.pull_request.user.login)
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install parser dependencies
+        working-directory: scripts
+        run: bun install --frozen-lockfile
+        env:
+          # Allow bun install to work even without a lockfile on first run
+          BUN_CONFIG_NO_FROZEN_LOCKFILE: "0"
+
+      - name: Fetch PR body
+        id: pr-body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body ?? "";
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
+            core.info(`PR body length: ${body.length} chars`);
+
+      - name: Validate proof block
+        working-directory: scripts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
+          OWNED_REPOS: ${{ inputs.owned_repos }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: bun run verify-proof-block.ts --body-file /tmp/pr-body.md
