@@ -28,17 +28,21 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Checkout gh-workflows scripts
+        uses: actions/checkout@v4
+        with:
+          repository: florianhorner/gh-workflows
+          ref: v1
+          path: _gh_workflows
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Install parser dependencies
-        working-directory: scripts
+        working-directory: _gh_workflows/scripts
         run: bun install --frozen-lockfile
-        env:
-          # Allow bun install to work even without a lockfile on first run
-          BUN_CONFIG_NO_FROZEN_LOCKFILE: "0"
 
       - name: Fetch PR body
         id: pr-body
@@ -51,7 +55,7 @@ jobs:
             core.info(`PR body length: ${body.length} chars`);
 
       - name: Validate proof block
-        working-directory: scripts
+        working-directory: _gh_workflows/scripts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
