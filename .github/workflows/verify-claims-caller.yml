@@ -1,0 +1,16 @@
+name: verify-claims-caller
+
+# Dogfood: validates gh-workflows' own PRs using the reusable workflow defined
+# in this same repo. References the reusable via a local path so that any change
+# to verify-claims.yml on a PR branch is tested against itself — a bad change
+# breaks its own verification, which is exactly what we want.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review]
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify-claims.yml
+    with:
+      owned_repos: "florianhorner/gh-workflows"
