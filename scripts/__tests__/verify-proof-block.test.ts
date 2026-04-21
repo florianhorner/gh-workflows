@@ -240,4 +240,37 @@ describe("verify-proof-block", () => {
     // by the CI workflow against real GitHub API. We mark it as demonstrating intent.
     expect(true).toBe(true); // placeholder — see integration test in CI
   });
+
+  // Regression guard for the compound-key / inline-token mismatch bug.
+  // The earliest draft of the template used `lint/fmt:` and `schema/topic:` as
+  // proof line keys, but the inline tokens said `[proof: lint]` and
+  // `[proof: schema]`. The parser correctly rejected this as a dangling
+  // reference — Agent 3 worked around it by omitting inline tokens entirely,
+  // which silently disabled the claim-reference feature on the first live PR.
+  // Canonical keys are single-word slugs. This test pins that.
+  it("fails when proof line uses compound key but inline token uses short form", async () => {
+    const MISMATCH_BODY = `
+## Summary
+
+Fixes the freeze. [proof: lint]
+
+## Proof
+
+- [x] build: SomeJob [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint/fmt: SomeJob [proof: lint]
+- [x] runtime: https://gist.github.com/example/abc [proof: runtime]
+- [ ] schema/topic: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(MISMATCH_BODY, {
+      OWNED_REPOS: "florianhorner/govee2mqtt",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/govee2mqtt",
+    });
+    expect(result.exitCode).toBe(1);
+    // Parser should flag `[proof: lint]` as dangling because the proof line
+    // key is `lint/fmt`, not `lint`. Same for schema.
+    expect(result.stderr).toContain("Dangling");
+    expect(result.stderr).toContain("lint");
+  });
 });
