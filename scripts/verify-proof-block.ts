@@ -158,7 +158,11 @@ function parseProofLines(section: string): ProofLine[] {
     if (!m) continue;
     const checked = m[1].toLowerCase() === "x";
     const key = m[2];
-    const value = m[3].trim();
+    // Strip a trailing self-reference tag — `[proof: <key>]` on a proof line is
+    // a claim-reference token, not part of the artifact value. Step 5
+    // (validateInlineTokens) re-scans the original body for these tokens, so
+    // removing them here does not break dangling-reference detection.
+    const value = m[3].replace(/\s*\[proof:\s*[^\]]+\]\s*$/, "").trim();
     result.push({ key, checked, value, raw: line });
   }
   return result;
@@ -217,6 +221,13 @@ async function validateProofLine(
     return;
   }
 
+  // Generic URL (gist, screenshot, release asset, blob URL, etc.)?
+  // Checked before file-path because URLs contain `/` and would otherwise
+  // be misclassified as paths and fail existsSync in CI.
+  if (/^https?:\/\//.test(value)) {
+    return;
+  }
+
   // Test name? /^[a-zA-Z_][\w:]*$/
   if (PROOF_KEY_RE.test(value)) {
     return; // valid test name
@@ -235,11 +246,6 @@ async function validateProofLine(
       }
     }
     return;
-  }
-
-  // URL (http/https)?
-  if (/^https?:\/\//.test(value)) {
-    return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
   }
 
   // Anything else: accept (test name list, comma-separated, etc.)
