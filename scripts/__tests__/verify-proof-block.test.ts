@@ -273,4 +273,80 @@ Fixes the freeze. [proof: lint]
     expect(result.stderr).toContain("Dangling");
     expect(result.stderr).toContain("lint");
   });
+
+  // Regression guard: proof lines carry a trailing self-reference token
+  // (e.g. `runtime: foo.txt [proof: runtime]`). The parser must strip that
+  // token from the artifact value before validating, otherwise file paths,
+  // generic URLs, and test names all fail because their string carries the
+  // tag suffix.
+  //
+  // Surfaced 2026-05-08 on mammamiradio PR #302: a committed
+  // `proof/...txt` runtime artifact was rejected as "File path does not
+  // exist" because `existsSync("proof/...txt [proof: runtime]")` returned
+  // false on the literal value-with-tag.
+  it("strips trailing [proof: key] self-reference from artifact value (file path)", async () => {
+    const tmpFile = `/tmp/proof-fixture-${Date.now()}.txt`;
+    await Bun.write(tmpFile, "fixture");
+
+    const FILE_PATH_BODY = `
+## Proof
+
+- [x] build: SomeBuildJob [proof: build]
+- [x] tests: TestThing [proof: tests]
+- [x] lint: LintJob [proof: lint]
+- [x] runtime: ${tmpFile} [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(FILE_PATH_BODY, {
+      OWNED_REPOS: "florianhorner/govee2mqtt",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/govee2mqtt",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.stderr).not.toContain("File path does not exist");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("accepts a generic URL artifact even when GITHUB_WORKSPACE is set", async () => {
+    // Regression: URLs contain `/` and were previously misclassified as
+    // file paths, then failed existsSync in CI. The URL branch must run
+    // before the file-path branch.
+    const URL_BODY = `
+## Proof
+
+- [x] build: SomeBuildJob [proof: build]
+- [x] tests: TestThing [proof: tests]
+- [x] lint: LintJob [proof: lint]
+- [x] runtime: https://gist.github.com/florianhorner/abc123 [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(URL_BODY, {
+      OWNED_REPOS: "florianhorner/govee2mqtt",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/govee2mqtt",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.stderr).not.toContain("File path does not exist");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("accepts a bare test-name artifact value (PROOF_KEY_RE form)", async () => {
+    // Test names previously failed because the trailing `[proof: ...]`
+    // tag broke the strict ^...$ regex. After the strip, they pass.
+    const NAME_BODY = `
+## Proof
+
+- [x] build: SomeBuildJob [proof: build]
+- [x] tests: TestThing::sub_case [proof: tests]
+- [x] lint: LintJob [proof: lint]
+- [x] runtime: https://github.com/florianhorner/x/actions/runs/12345 [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(NAME_BODY, {
+      OWNED_REPOS: "florianhorner/govee2mqtt",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/govee2mqtt",
+    });
+    expect(result.exitCode).toBe(0);
+  });
 });
