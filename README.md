@@ -87,6 +87,26 @@ bun install
 bun test
 ```
 
+## Release notes (unreleased)
+
+### Parser fixes (will land in v1.2)
+
+- **strip trailing `[proof: <KEY>]` suffix from the artifact value before
+  validation.** Pre-fix, the parser captured the self-reference tag (e.g.
+  `proof/bootstrap.txt [proof: runtime]`) as part of the file path,
+  causing `existsSync()` to fail. This blocked every commit-message-
+  standards bootstrap PR. Inline `[proof: KEY]` token validation is
+  unaffected — it still scans the original PR body.
+- **check URL artifacts before file-path artifacts.** Non-CI URLs
+  (gist links, screenshots, release assets) contain `/` and were
+  previously misrouted into the file-path branch, then failed
+  `existsSync()` whenever `GITHUB_WORKSPACE` was set (i.e. always in CI).
+  Reordering the branches makes the URL fast-path match before the
+  file-path branch.
+
+Both fixes are backwards-compatible — no template change required, no
+function signature change, no tag scheme change.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

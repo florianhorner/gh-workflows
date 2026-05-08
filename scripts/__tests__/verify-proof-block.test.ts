@@ -241,6 +241,127 @@ describe("verify-proof-block", () => {
     expect(true).toBe(true); // placeholder — see integration test in CI
   });
 
+  // ---------------------------------------------------------------------
+  // Regression guard for the [proof: <KEY>] suffix bug.
+  //
+  // The PR template uses inline `[proof: <KEY>]` tokens both in prose AND
+  // as a self-reference at the end of each proof line:
+  //
+  //   - [x] runtime: proof/bootstrap.txt [proof: runtime]
+  //
+  // Before the fix, parseProofLines() captured `proof/bootstrap.txt
+  // [proof: runtime]` as the value, then existsSync() failed because no
+  // file is literally named that. The same trap fired for non-CI URLs
+  // (gist links etc.) when GITHUB_WORKSPACE was set, because they include
+  // `/` and got misrouted into the file-path branch before reaching the
+  // URL branch.
+  //
+  // This shipped at v1.1 and broke every commit-message-standards
+  // bootstrap PR (lightener #77, mammamiradio #302, QFE #21,
+  // flora-signal #76, gstack-for-kiro #3, conversation-intelligence-
+  // dashboard #90, home-assistant-config #549, retro #4). The fix
+  // strips the trailing [proof: <KEY>] suffix during parsing AND
+  // moves the URL branch ahead of the file-path branch so URLs
+  // never hit existsSync().
+  // ---------------------------------------------------------------------
+
+  it("strips trailing [proof: KEY] tag from a file-path artifact", async () => {
+    // Use this test file's own path so existsSync() succeeds at the
+    // workspace root.
+    const FILE_PATH_BODY = `
+## Summary
+
+Bootstrap. [proof: runtime]
+
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: scripts/__tests__/verify-proof-block.test.ts [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(FILE_PATH_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      // Anchor existsSync at the repo root so the path resolves.
+      GITHUB_WORKSPACE: `${import.meta.dir}/../..`,
+    });
+    expect(result.exitCode).toBe(0);
+    // Should NOT see the dirty path (with suffix) in any error message.
+    expect(result.stderr).not.toContain("[proof: runtime]");
+    expect(result.stderr).not.toContain("does not exist");
+  });
+
+  it("rejects a missing file-path artifact AFTER stripping the [proof: KEY] tag", async () => {
+    const MISSING_PATH_BODY = `
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: this/file/does/not/exist.txt [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(MISSING_PATH_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.exitCode).toBe(1);
+    // Error should reference the CLEAN path (no suffix) — proves the
+    // strip ran before existsSync().
+    expect(result.stderr).toContain("this/file/does/not/exist.txt");
+    expect(result.stderr).not.toContain("[proof: runtime]");
+  });
+
+  it("accepts a non-CI URL artifact with trailing [proof: KEY] tag, even with GITHUB_WORKSPACE set", async () => {
+    // Pre-fix: GITHUB_WORKSPACE + URL-with-suffix routed through the
+    // file-path branch (URL contains `/`), failed existsSync(), errored.
+    const URL_BODY = `
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: https://gist.github.com/florianhorner/abc123 [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(URL_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("does not exist");
+  });
+
+  it("accepts a prose / test-name artifact with trailing [proof: KEY] tag (workaround path still works)", async () => {
+    // Pre-fix workaround: bootstrap PRs used prose values that contained
+    // no `/` and no `://`, falling through to the catch-all "Anything
+    // else: accept" branch. Verify this path still passes — the strip
+    // is additive, not breaking.
+    const PROSE_BODY = `
+## Proof
+
+- [x] build: TestBuildJob [proof: build]
+- [x] tests: TestRunner [proof: tests]
+- [x] lint: TestLintJob [proof: lint]
+- [x] runtime: proof in branch commit message [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(PROSE_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.exitCode).toBe(0);
+  });
+
   // Regression guard for the compound-key / inline-token mismatch bug.
   // The earliest draft of the template used `lint/fmt:` and `schema/topic:` as
   // proof line keys, but the inline tokens said `[proof: lint]` and

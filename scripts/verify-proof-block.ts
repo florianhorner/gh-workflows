@@ -158,10 +158,36 @@ function parseProofLines(section: string): ProofLine[] {
     if (!m) continue;
     const checked = m[1].toLowerCase() === "x";
     const key = m[2];
-    const value = m[3].trim();
+    const value = stripTrailingProofTag(m[3].trim());
     result.push({ key, checked, value, raw: line });
   }
   return result;
+}
+
+/**
+ * Strip a trailing `[proof: <KEY>]` self-reference tag from the artifact value.
+ *
+ * The PR template uses inline `[proof: <KEY>]` tokens both (a) in prose to
+ * reference a proof line ("fixes the freeze [proof: runtime]") AND (b) as a
+ * self-reference at the end of each proof line itself, e.g.
+ *
+ *   - [x] runtime: proof/bootstrap.txt [proof: runtime]
+ *
+ * Without stripping, the captured value becomes
+ * `proof/bootstrap.txt [proof: runtime]` — `existsSync` then fails because
+ * no file is literally named that. The same trap fires for non-CI URL
+ * artifacts when GITHUB_WORKSPACE is set: the value contains `/` so it
+ * routes through the file-path branch before the URL branch, and existsSync
+ * rejects the dirty string.
+ *
+ * Tag format mirrors the [proof: KEY] inline-token regex elsewhere in this
+ * file: case-sensitive `proof:`, allow whitespace around the key.
+ * Inline-token validation (validateInlineTokens) still scans the original
+ * body text, so the self-reference tags are still counted there — stripping
+ * here only affects artifact validation.
+ */
+function stripTrailingProofTag(value: string): string {
+  return value.replace(/\s*\[proof:\s*[^\]]+\]\s*$/, "").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +248,13 @@ async function validateProofLine(
     return; // valid test name
   }
 
+  // URL (http/https)? Check BEFORE the file-path branch — URLs contain `/`
+  // and would otherwise be misrouted into existsSync() and fail in CI
+  // (where GITHUB_WORKSPACE is set).
+  if (/^https?:\/\//.test(value)) {
+    return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
+  }
+
   // File path? Must exist on disk within repo
   if (value.startsWith(".") || value.startsWith("/") || value.includes("/")) {
     if (!existsSync(value)) {
@@ -235,11 +268,6 @@ async function validateProofLine(
       }
     }
     return;
-  }
-
-  // URL (http/https)?
-  if (/^https?:\/\//.test(value)) {
-    return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
   }
 
   // Anything else: accept (test name list, comma-separated, etc.)
