@@ -362,6 +362,87 @@ Bootstrap. [proof: runtime]
     expect(result.exitCode).toBe(0);
   });
 
+  // ---------------------------------------------------------------------
+  // Regression guard for the em-dash artifact-description bug.
+  //
+  // Authors annotate a real artifact with a human description after an
+  // em-dash, e.g.
+  //   - [x] runtime: proof/foo.txt — parity check confirms X [proof: runtime]
+  // After stripTrailingProofTag removed the [proof:] suffix the value was
+  // "proof/foo.txt — parity check confirms X", which still contains "/" and
+  // got misrouted into existsSync() — failing even though proof/foo.txt
+  // exists. This broke the first file-path-cited PR
+  // (florianhorner/adaptive-lighting #18:
+  // "proof/expand-light-groups-desc.txt — parity check..."). The fix splits
+  // the value at the first em-dash and validates only the artifact.
+  // ---------------------------------------------------------------------
+
+  it("accepts a file-path artifact annotated with an em-dash description", async () => {
+    const DESC_BODY = `
+## Summary
+
+Bootstrap. [proof: runtime]
+
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: scripts/__tests__/verify-proof-block.test.ts — parity check confirms the file exists [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(DESC_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: `${import.meta.dir}/../..`,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("does not exist");
+  });
+
+  it("rejects a missing file-path artifact, reporting the clean path without the em-dash description", async () => {
+    const MISSING_DESC_BODY = `
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: this/file/does/not/exist.txt — what it would prove [proof: runtime]
+- [ ] schema: n/a — no changes [proof: schema]
+`.trim();
+
+    const result = await runParser(MISSING_DESC_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: "/tmp",
+    });
+    expect(result.exitCode).toBe(1);
+    // Error references the CLEAN path only — proves the description was split off.
+    expect(result.stderr).toContain("this/file/does/not/exist.txt");
+    expect(result.stderr).not.toContain("what it would prove");
+    expect(result.stderr).not.toContain("[proof: runtime]");
+  });
+
+  it("still accepts unchecked n/a — <reason> (em-dash split does not affect the n/a path)", async () => {
+    const NA_BODY = `
+## Proof
+
+- [x] build: TestBuild [proof: build]
+- [x] tests: TestFoo [proof: tests]
+- [x] lint: TestLint [proof: lint]
+- [x] runtime: scripts/__tests__/verify-proof-block.test.ts [proof: runtime]
+- [ ] schema: n/a — no schema changes in this PR [proof: schema]
+`.trim();
+
+    const result = await runParser(NA_BODY, {
+      OWNED_REPOS: "florianhorner/example",
+      PR_HEAD_REPO_FULL_NAME: "florianhorner/example",
+      GITHUB_WORKSPACE: `${import.meta.dir}/../..`,
+    });
+    expect(result.exitCode).toBe(0);
+  });
+
   // Regression guard for the compound-key / inline-token mismatch bug.
   // The earliest draft of the template used `lint/fmt:` and `schema/topic:` as
   // proof line keys, but the inline tokens said `[proof: lint]` and
