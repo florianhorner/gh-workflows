@@ -190,6 +190,31 @@ function stripTrailingProofTag(value: string): string {
   return value.replace(/\s*\[proof:\s*[^\]]+\]\s*$/, "").trim();
 }
 
+/**
+ * Strip a trailing " — <description>" annotation from a real artifact value.
+ *
+ * Authors frequently annotate an artifact with a human description after an
+ * em-dash (or en-dash), e.g.
+ *
+ *   - [x] runtime: proof/expand-light-groups-desc.txt — parity check confirms X [proof: runtime]
+ *
+ * After stripTrailingProofTag removes the `[proof: KEY]` suffix the value is
+ * `proof/expand-light-groups-desc.txt — parity check confirms X`, which still
+ * contains `/` and gets misrouted into the file-path branch, where
+ * existsSync() fails on the whole dirty string even though the file exists.
+ *
+ * Take only the text before the first em-dash / en-dash separator (surrounded
+ * by whitespace) as the artifact to validate; the description is informational.
+ *
+ * This runs ONLY on the checked-artifact path. The unchecked `n/a — <reason>`
+ * form is validated separately on the full value, so its em-dash is untouched.
+ * A spaced ASCII hyphen is deliberately NOT a separator (file paths contain
+ * hyphens, e.g. `proof/expand-light-groups-desc.txt`); only `—`/`–` split.
+ */
+function stripArtifactDescription(value: string): string {
+  return value.split(/\s+[—–]\s+/)[0]!.trim();
+}
+
 // ---------------------------------------------------------------------------
 // Step 4: validate each proof line
 // ---------------------------------------------------------------------------
@@ -236,34 +261,38 @@ async function validateProofLine(
     return;
   }
 
+  // Strip an optional " — <description>" annotation so only the artifact
+  // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
+  const artifact = stripArtifactDescription(value);
+
   // CI run URL?
-  const ciMatch = value.match(CI_RUN_RE);
+  const ciMatch = artifact.match(CI_RUN_RE);
   if (ciMatch) {
     await validateCIRun(key, ciMatch[1], ciMatch[2], ciMatch[3], errors);
     return;
   }
 
   // Test name? /^[a-zA-Z_][\w:]*$/
-  if (PROOF_KEY_RE.test(value)) {
+  if (PROOF_KEY_RE.test(artifact)) {
     return; // valid test name
   }
 
   // URL (http/https)? Check BEFORE the file-path branch — URLs contain `/`
   // and would otherwise be misrouted into existsSync() and fail in CI
   // (where GITHUB_WORKSPACE is set).
-  if (/^https?:\/\//.test(value)) {
+  if (/^https?:\/\//.test(artifact)) {
     return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
   }
 
   // File path? Must exist on disk within repo
-  if (value.startsWith(".") || value.startsWith("/") || value.includes("/")) {
-    if (!existsSync(value)) {
+  if (artifact.startsWith(".") || artifact.startsWith("/") || artifact.includes("/")) {
+    if (!existsSync(artifact)) {
       // Soft: don't fail on file paths in CI (path relative to repo root may differ)
       // Only fail if GITHUB_WORKSPACE is set (we're in CI)
       if (process.env.GITHUB_WORKSPACE) {
-        const fullPath = `${process.env.GITHUB_WORKSPACE}/${value}`;
+        const fullPath = `${process.env.GITHUB_WORKSPACE}/${artifact}`;
         if (!existsSync(fullPath)) {
-          errors.push(`[${key}] File path does not exist: ${value}`);
+          errors.push(`[${key}] File path does not exist: ${artifact}`);
         }
       }
     }
