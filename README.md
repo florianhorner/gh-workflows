@@ -44,12 +44,26 @@ on:
     types: [opened, edited, synchronize, ready_for_review]
 jobs:
   verify:
-    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@v1
+    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@f93889a64ff7b501182e5c988b992672ca857ea9 # v1.3
     with:
       owned_repos: "florianhorner/govee2mqtt,florianhorner/mammamiradio"
 ```
 
 That's it. The reusable workflow handles checkout, Bun setup, and parser execution.
+
+### Pin to a SHA, not a tag
+
+Pin the `uses:` line to a full 40-character commit SHA with the version in a trailing
+comment, as above. Dependabot updates both halves — add the `github-actions` ecosystem to
+`.github/dependabot.yml` and bumps arrive as reviewable PRs.
+
+A tag is mutable: anyone who gains write access to this repo can move `v1` or `v1.3` to
+different code, and every consumer picks it up on its next run with no diff in their own
+repository. That is exactly how `tj-actions/changed-files` (CVE-2025-30066) and
+`aquasecurity/trivy-action` were exploited. A SHA cannot be moved.
+
+Earlier revisions of this README recommended `@v1`. That is no longer advised — it gives the
+consumer no audit trail when the code underneath changes.
 
 ### Accepted artifact types for `runtime:`
 
