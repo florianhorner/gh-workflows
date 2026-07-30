@@ -44,21 +44,38 @@ jobs:
       # the tip of v1. The outer pin locked this YAML and nothing else, so it
       # bought no reproducibility and no supply-chain protection.
       #
-      # `github.job_workflow_ref` is the *callee* reference, formatted as
-      # "<owner>/<repo>/<path>@<ref>"; everything after the final '@' is the ref.
+      # There is no `github` context property carrying the *callee* ref.
+      # `github.workflow_ref`/`workflow_sha` resolve to the CALLER, and
+      # `job_workflow_ref` is an OIDC token claim, not a context value — using it
+      # in an expression fails the whole workflow at startup.
+      #
+      # The Actions API does expose it: a run's `referenced_workflows[]` lists
+      # every remote reusable workflow it invoked, with the exact commit SHA that
+      # was resolved. That is what `actions: read` above is for.
       - name: Resolve own ref
         id: self
         env:
-          JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          ref="${JOB_WORKFLOW_REF##*@}"
-          if [ -z "$ref" ] || [ "$ref" = "$JOB_WORKFLOW_REF" ]; then
-            echo "::error::could not resolve own ref from job_workflow_ref='${JOB_WORKFLOW_REF}'"
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                   --jq '.referenced_workflows[]?
+                         | select(.path | startswith("florianhorner/gh-workflows/.github/workflows/verify-claims.yml@"))
+                         | .sha' 2>/dev/null | head -n1 || true)"
+          if [ -z "$sha" ]; then
+            # No entry means this was invoked by local path (`uses: ./…`), i.e.
+            # gh-workflows dogfooding itself. The correct scripts are the ones on
+            # the PR head, which is also what the first checkout used.
+            sha="$PR_HEAD_SHA"
+            echo "No referenced_workflows entry — local invocation, using PR head ${sha}"
+          fi
+          if [ -z "$sha" ]; then
+            echo "::error::could not resolve the ref this workflow was called with"
             exit 1
           fi
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-          echo "Resolved own ref: ${ref}"
+          echo "ref=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Resolved own ref: ${sha}"
 
       - name: Checkout gh-workflows scripts
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
