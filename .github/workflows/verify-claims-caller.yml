@@ -11,6 +11,19 @@ on:
 
 jobs:
   verify:
+    # Required, not optional. A called workflow's `permissions:` can only be
+    # maintained or reduced relative to the caller — never elevated — and an
+    # attempted elevation is rejected before anything runs: startup_failure,
+    # with no logs, no annotation and no check run to inspect.
+    #
+    # verify-claims.yml declares `actions: read` so it can read the run's
+    # `referenced_workflows[]` and resolve CI-run proof URLs. Without this block
+    # the job inherits the repository default token, which grants contents but
+    # not actions, so the callee's request reads as an elevation and the whole
+    # run is refused. Consumer callers need the same two lines.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/verify-claims.yml
     with:
       owned_repos: "florianhorner/gh-workflows"
