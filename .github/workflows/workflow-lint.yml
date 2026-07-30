@@ -1,0 +1,52 @@
+name: workflow-lint
+
+# Added after florianhorner/gh-workflows#6 shipped a `Resolve own ref` step built
+# on `github.job_workflow_ref` — a property that does not exist on the github
+# context (it is an OIDC token claim). GitHub rejected the workflow with
+# startup_failure: no logs, no annotation, no check run to inspect. actionlint
+# names it in one line:
+#
+#   property "job_workflow_ref" is not defined in object type {… workflow_ref:
+#   string; workflow_sha: string; …}
+#
+# Scope note, so this is not mistaken for full coverage: actionlint is static.
+# It cannot see the *other* failure from that day — a called workflow requesting
+# more permissions than its caller granted, which is a runtime relationship
+# between two files and also produces a bare startup_failure. The dogfood caller
+# in verify-claims-caller.yml is what catches that one. Both are needed.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Installed from the upstream release rather than a third-party action, so
+      # the only new dependency is a version-pinned binary from rhysd/actionlint.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -version
+
+      - name: Lint workflows
+        run: ./actionlint
