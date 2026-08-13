@@ -2,6 +2,36 @@
 
 Reusable GitHub Actions workflows for `florianhorner/*` repositories.
 
+## `checkout-credentials` — focused checkout-token audit
+
+This reusable workflow runs zizmor's offline `artipacked` audit over a caller's
+workflow and composite-action definitions. It fails when `actions/checkout`
+implicitly persists credentials and points to the exact file and line. Explicit
+`persist-credentials: true` remains an intentional opt-in; all other checkout
+steps should set it to `false`.
+
+Add a SHA-pinned caller that runs whenever workflow or composite-action files
+change:
+
+```yaml
+name: checkout-credentials
+on:
+  pull_request:
+    paths: [".github/workflows/**", ".github/actions/**"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**", ".github/actions/**"]
+permissions:
+  contents: read
+jobs:
+  audit:
+    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha>
+```
+
+The workflow deliberately filters out every other zizmor rule. Broader GitHub
+Actions hardening belongs in a separately reviewed policy, so adopting this
+guard cannot unexpectedly expose unrelated legacy findings.
+
 ## `verify-claims` — PR Proof Block Enforcement
 
 Every PR body must end with a `## Proof` block listing artifacts for each claim. This workflow validates that block server-side and blocks merge if it's missing or malformed.
