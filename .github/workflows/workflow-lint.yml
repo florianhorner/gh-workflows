@@ -19,10 +19,12 @@ on:
   pull_request:
     paths:
       - '.github/workflows/**'
+      - 'scripts/test-checkout-credentials'
   push:
     branches: [main]
     paths:
       - '.github/workflows/**'
+      - 'scripts/test-checkout-credentials'
 
 permissions:
   contents: read
@@ -50,3 +52,11 @@ jobs:
 
       - name: Lint workflows
         run: ./actionlint
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+
+      - name: Test checkout credential audit
+        run: bash scripts/test-checkout-credentials
