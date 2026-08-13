@@ -15,17 +15,16 @@ trusted base branch. The reusable workflow downloads only changed workflow and
 composite-action YAML through GitHub's API and never checks out or executes pull
 request code. Pushes still scan the complete checked-out repository.
 
-Add a SHA-pinned caller that runs whenever workflow or composite-action files
-change:
+Add a SHA-pinned caller. Do not add trigger-level path filters: GitHub evaluates
+only a bounded changed-file list for filtered events, while this security gate
+must run and fail closed even for oversized pull requests.
 
 ```yaml
 name: checkout-credentials
 on:
   pull_request_target:
-    paths: [".github/workflows/**", ".github/actions/**"]
   push:
     branches: [main]
-    paths: [".github/workflows/**", ".github/actions/**"]
 permissions:
   contents: read
   pull-requests: read
