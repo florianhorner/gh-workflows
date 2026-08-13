@@ -10,21 +10,33 @@ implicitly persists credentials and points to the exact file and line. Explicit
 `persist-credentials: true` remains an intentional opt-in; all other checkout
 steps should set it to `false`.
 
+Pull requests use `pull_request_target`, so GitHub loads the caller from the
+trusted base branch. The reusable workflow downloads only changed workflow and
+composite-action YAML through GitHub's API and never checks out or executes pull
+request code. Pushes still scan the complete checked-out repository.
+
 Add a SHA-pinned caller that runs whenever workflow or composite-action files
 change:
 
 ```yaml
 name: checkout-credentials
 on:
-  pull_request:
+  pull_request_target:
     paths: [".github/workflows/**", ".github/actions/**"]
   push:
     branches: [main]
     paths: [".github/workflows/**", ".github/actions/**"]
 permissions:
   contents: read
+  pull-requests: read
 jobs:
-  audit:
+  audit-pr:
+    if: github.event_name == 'pull_request_target'
+    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha>
+    with:
+      pull_request_number: ${{ github.event.pull_request.number }}
+  audit-push:
+    if: github.event_name == 'push'
     uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha>
 ```
 
