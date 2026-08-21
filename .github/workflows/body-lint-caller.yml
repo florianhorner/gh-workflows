@@ -16,6 +16,23 @@ on:
     types: [opened, edited]
 
 jobs:
+  # The pattern set is only as good as the harness that measures it, and a test
+  # that nothing runs is not a gate. This job is also where GNU grep gets
+  # exercised: the local hook resolves BSD grep, so without a Linux runner half
+  # the dialect contract is untested.
+  patterns:
+    if: github.event_name == 'pull_request'
+    name: Pattern harness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run pattern regression test
+        run: bash tests/test-lint-patterns.sh
+
   pr-body:
     if: github.event_name == 'pull_request'
     # Required, not optional. A called workflow's permissions can only be
