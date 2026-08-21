@@ -144,11 +144,19 @@ if [ "$MODE" = "body" ] && [ "${#LINT_BASELINE_PROSE_STYLE[@]}" -gt 0 ]; then
       echo "ERROR: prose pattern '$PAT' failed (grep exit $RC)." >&2
       exit 2
     fi
+    # Advisory, not blocking. This rule matches 141 of 161 merged PR bodies —
+    # correct, but a gate that fires on nine of ten pull requests trains the
+    # author to reach for --no-verify, which disables the 25 editorial patterns
+    # too. It warns until the count falls; promote it by moving the increment
+    # of HITS/FAIL here, once the corpus says the habit has changed.
+    STYLE_HITS=0
     while IFS= read -r line; do
-      echo "FAIL: [prose-style] $line  [pattern: $PAT]"
-      HITS=$((HITS + 1))
+      echo "WARN: [prose-style] $line"
+      STYLE_HITS=$((STYLE_HITS + 1))
     done <<< "$MATCHES"
-    FAIL=1
+    if [ "$STYLE_HITS" -gt 0 ]; then
+      echo "NOTE: $STYLE_HITS em dash(es) outside proof lines. Advisory, not blocking."
+    fi
   done
 fi
 
