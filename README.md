@@ -142,6 +142,79 @@ bun install
 bun test
 ```
 
+## `body-lint` — editorial boundary for PR bodies, issue bodies and changelogs
+
+Public bodies describe user-visible outcomes. Review archaeology, agent
+provenance, operator telemetry and process narrative belong in the private
+durable record. `body-lint` enforces that server-side.
+
+It exists because the local `PreToolUse` hook only runs on the maintainer's
+machine: the GitHub web UI, cloud agents and MCP clients all reach a public body
+with no gate at all unless CI holds the line.
+
+### Shapes, not phrases
+
+The predecessor was a literal-phrase denylist grown one incident at a time. It
+held `findings (raised|confirmed|refuted)` and still passed "Findings from
+review"; it held `adversarially verif` and still passed "mutation testing
+found". Every escape was a new wording of an already-banned class.
+
+`scripts/lint-patterns.sh` matches the *grammatical frame* instead — a review
+noun near a discovery verb, a review actor mid-action, a telemetry possessive —
+so paraphrase does not walk through. Patterns are POSIX ERE and must behave
+identically under BSD grep (the local hook) and GNU grep (CI).
+
+### Caller workflow
+
+```yaml
+jobs:
+  pr-body:
+    permissions: { contents: read, actions: read }   # both lines required
+    uses: florianhorner/gh-workflows/.github/workflows/body-lint.yml@<sha>
+    with:
+      target: pr-body
+      extra_patterns: scripts/lint-patterns.sh   # optional, repo-local additions
+```
+
+`target` is `pr-body`, `issue-body` or `changelog`. Repo-local patterns are
+**unioned** with the baseline — a repo may only ADD. Removing a baseline pattern
+is a PR to this repo, not a local override. The workflow checks out the caller's
+**base** ref, so a PR cannot weaken the gate judging it in the same change.
+
+### Adding or changing a pattern
+
+A pattern is not shipped until it has been measured. Guessing produces gates
+that fire on legitimate prose and then get disabled.
+
+```bash
+bash scripts/lint-pattern-report.sh > /tmp/report.tsv   # every hit, with the matched span
+bash tests/test-lint-patterns.sh                        # compile / recall / precision / drift
+```
+
+- **Ship gate:** no pattern ships while any row for it is marked `FP` in
+  `tests/expected/lint-pattern-baseline.tsv`. That is a count on an adjudicated
+  column, not a hit-rate threshold, so it is immune to the "four counts, four
+  answers" problem.
+- **Admission to `LINT_BASELINE_CORE`** (the set applied to changelogs and docs)
+  requires **zero** hits against the consuming repo's real changelogs. One hit
+  turns `main` red on merge day.
+- **The em-dash rule is advisory**, not blocking: it matches 141 of 161 merged
+  bodies, and a gate firing on nine of ten PRs trains the author to bypass it —
+  taking the 25 editorial patterns with it. Promote it once the count falls.
+- **A pattern with zero corpus hits is unfalsified, not validated.** It needs
+  hand-written paraphrases in `tests/fixtures/lint-known-bad.txt` before it
+  counts as covered — that is the exact profile the old denylist had the day
+  before it failed.
+
+### What it cannot catch
+
+Regex reaches lexical tells, not meaning. Of six phrases that escaped the old
+gate, five are now caught; `two guards that needed teeth` is pure metaphor with
+no lexical signal and is not reachable this way. Renaming a `## Findings`
+section to `## Notes` also defeats the heading rule, which matches the label and
+never the content. Treat a pass as a tripwire on habitual violations, not as
+evidence that a body is clean.
+
 ## Release notes (unreleased)
 
 ### Parser fixes (will land in v1.2)

@@ -1,0 +1,145 @@
+name: body-lint
+
+# Editorial lint for PR and issue bodies, and for public changelogs.
+#
+# Server-side backstop for the local PreToolUse hook. The hook only exists on
+# the maintainer's machine, so every other path to a public body — the GitHub
+# web UI, a cloud agent, an MCP client, a phone — reaches GitHub with no gate at
+# all unless this runs.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "What to lint: pr-body | issue-body | changelog"
+        required: true
+        type: string
+      extra_patterns:
+        description: >-
+          Optional repo-local pattern file (e.g. scripts/lint-patterns.sh),
+          resolved against the caller's BASE ref. Its LINT_PATTERNS array is
+          unioned with the baseline. Repos may only ADD patterns.
+        required: false
+        default: ""
+        type: string
+      changelog_paths:
+        description: "Space-separated changelog files, used when target=changelog."
+        required: false
+        default: "CHANGELOG.md"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  lint:
+    name: Editorial body lint
+    runs-on: ubuntu-latest
+
+    # Bots are not held to the editorial boundary; their bodies are generated.
+    # Drafts ARE linted, unlike verify-claims: a draft body is already public,
+    # so exempting it would leave the leak open for exactly as long as the draft
+    # sits there.
+    if: >-
+      github.event_name != 'pull_request' ||
+      !contains(fromJson('["dependabot[bot]","pre-commit-ci[bot]","github-actions[bot]"]'), github.event.pull_request.user.login)
+
+    steps:
+      # Base ref, never head. A PR must not be able to weaken the gate that is
+      # judging it in the same change.
+      - name: Checkout caller base ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
+          path: _caller
+          persist-credentials: false
+
+      # See verify-claims.yml for why this is necessary: no github context
+      # property carries the callee ref, so it is read back off the run's
+      # referenced_workflows[]. That is what `actions: read` is for.
+      - name: Resolve own ref
+        id: self
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                   --jq '.referenced_workflows[]?
+                         | select(.path | startswith("florianhorner/gh-workflows/.github/workflows/body-lint.yml@"))
+                         | .sha' 2>/dev/null | head -n1 || true)"
+          if [ -z "$sha" ]; then
+            # Local invocation (`uses: ./…`) — gh-workflows dogfooding itself.
+            sha="${GITHUB_SHA}"
+            echo "No referenced_workflows entry — local invocation, using ${sha}"
+          fi
+          echo "ref=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout gh-workflows scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: florianhorner/gh-workflows
+          ref: ${{ steps.self.outputs.ref }}
+          path: _gh_workflows
+          persist-credentials: false
+
+      - name: Write body to disk
+        id: body
+        env:
+          TARGET: ${{ inputs.target }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            pr-body)    printf '%s' "$PR_BODY"    > /tmp/body.md ;;
+            issue-body) printf '%s' "$ISSUE_BODY" > /tmp/body.md ;;
+            changelog)  : ;;
+            *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
+          esac
+
+      - name: Lint
+        env:
+          TARGET: ${{ inputs.target }}
+          EXTRA: ${{ inputs.extra_patterns }}
+          CHANGELOGS: ${{ inputs.changelog_paths }}
+        run: |
+          set -uo pipefail
+          LINT=_gh_workflows/scripts/check-body-lint.sh
+          # Array, not a bare string: an empty scalar expands to an empty
+          # argument that check-body-lint.sh would read as an unreadable
+          # pattern file and reject as a gate error.
+          EXTRA_ARGS=()
+          if [ -n "$EXTRA" ]; then
+            if [ -r "_caller/$EXTRA" ]; then
+              EXTRA_ARGS=("_caller/$EXTRA")
+            else
+              # Fail loud. A missing extra-pattern file means the caller's own
+              # rules are silently not being applied, which reads as "clean".
+              echo "::error::extra_patterns '$EXTRA' not found on the base ref"
+              exit 1
+            fi
+          fi
+
+          rc=0
+          if [ "$TARGET" = "changelog" ]; then
+            for f in $CHANGELOGS; do
+              [ -r "_caller/$f" ] || { echo "::notice::skipping absent $f"; continue; }
+              echo "--- $f"
+              bash "$LINT" --mode changelog "_caller/$f" ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"} || rc=$?
+            done
+          else
+            if [ ! -s /tmp/body.md ]; then
+              echo "::notice::empty body, nothing to lint"
+              exit 0
+            fi
+            bash "$LINT" --mode body /tmp/body.md ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"} || rc=$?
+          fi
+
+          # 2 is a gate error, not a clean result. Surface it distinctly so a
+          # broken lint never reads as a passing one.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::editorial lint could not run (gate error)"
+            exit 2
+          fi
+          exit "$rc"
