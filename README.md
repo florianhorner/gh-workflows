@@ -198,9 +198,10 @@ bash tests/test-lint-patterns.sh                        # compile / recall / pre
 - **Admission to `LINT_BASELINE_CORE`** (the set applied to changelogs and docs)
   requires **zero** hits against the consuming repo's real changelogs. One hit
   turns `main` red on merge day.
-- **The em-dash rule is advisory**, not blocking: it matches 141 of 161 merged
-  bodies, and a gate firing on nine of ten PRs trains the author to bypass it —
-  taking the 25 editorial patterns with it. Promote it once the count falls.
+- **The em-dash rule blocks.** It shipped advisory first, since it matched 141 of 161
+  historical bodies — but that counts bodies written before the rule existed. The
+  proof-block carve-out (`n/a — <reason>` lines are exempt) is what makes blocking
+  safe, since the proof gate and this gate run on the same body.
 - **A pattern with zero corpus hits is unfalsified, not validated.** It needs
   hand-written paraphrases in `tests/fixtures/lint-known-bad.txt` before it
   counts as covered — that is the exact profile the old denylist had the day
