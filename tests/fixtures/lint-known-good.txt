@@ -1,0 +1,70 @@
+# lint-known-good.txt - every line here MUST be caught by ZERO patterns.
+#
+# Legitimate technical prose that a PR body, issue body or changelog is entitled
+# to contain. This is the precision half of the harness: without it, the only
+# pressure on a pattern is "catch more", and the gate drifts broad until someone
+# disables it in a hurry.
+#
+# Seed rule: every FP and ALLOW row adjudicated in
+# tests/expected/lint-pattern-baseline.tsv gets a line here, so a narrowing fix
+# can never silently regress.
+#
+# Lines starting with '#' are comments and are not asserted.
+
+# --- near-misses for R1/R2 (present tense, or no review noun) ---------------
+The linter flags a bare except clause in the handler
+The parser found an unterminated string and reports it cleanly
+A reviewer opens the page that shows the verified licence
+This audit trail is written to the ledger on every run
+The test suite catches this regression now
+Reviewers can see the diff in the Files tab
+The health check surfaces stale segments to the operator
+Static analysis flags unused imports at build time
+
+# --- near-misses for R3 (neutral headings) ----------------------------------
+## Summary
+## What changed
+## Notes
+## Testing
+## Proof
+### Behaviour
+
+# --- near-misses for R4 (not first-person debrief) --------------------------
+Callers should have a timeout configured
+The handler drafted a response before the socket closed
+Users initially see the placeholder artwork
+
+# --- near-misses for R5 (counts that are not process tallies) ---------------
+29 of 30 paths covered; the only uncovered path is the fallback
+Retries 3 times before giving up
+Exit codes: 0 clean, 1 violation, 2 gate error
+The queue holds five segments at steady state
+Two tracks are prefetched ahead of the cursor
+3 of 5 workers acknowledged the shutdown signal
+
+# --- near-misses for R6 (data words without the telemetry frame) ------------
+The operator preferences panel gained a reset button
+Playback data is cached for the duration of the session
+Usage of the legacy endpoint is now logged
+The station serves its own manifest from the add-on
+Telemetry is disabled by default and documented in operations.md
+
+# --- near-misses for R7 -----------------------------------------------------
+Nobody is served by a silent failure here, so it now raises
+The default profile ships the curated crate
+
+# --- near-misses for CORE provenance ----------------------------------------
+Claude is not involved in the runtime path
+The codex directory holds the vendored fixtures
+Conductor tracks are enumerated from the manifest
+Generated files live under build/ and are gitignored
+
+# --- near-misses for CORE archaeology ---------------------------------------
+The stash is flushed on shutdown
+Files untracked by the manifest are ignored by the packer
+Pushed builds are tagged with the release SHA
+
+# --- em-dash exemptions: the proof block legitimately requires one ----------
+- [ ] runtime: n/a — no runtime surface changed
+- [ ] build: n/a — pure documentation change
+- [x] tests: proof/pytest.log

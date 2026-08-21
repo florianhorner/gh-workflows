@@ -1,0 +1,108 @@
+# lint-known-bad.txt - every line here MUST be caught by at least one pattern.
+#
+# Two kinds of line live here:
+#
+#   1. REAL ESCAPES. Text that actually shipped in a public PR body and that the
+#      gate of the day failed to stop. These are the regression cases; a pattern
+#      edit that stops catching one of them is a coverage loss, and the test says
+#      so in those words.
+#
+#   2. HAND-WRITTEN PARAPHRASES. Written at pattern-authoring time, 5-10 per
+#      class. These exist because 17 of the 23 baseline patterns hit NOTHING in
+#      the frozen corpus. A zero-hit pattern is unfalsified, not validated - it
+#      is precisely the profile the old literal denylist had the day before it
+#      failed. Paraphrases are what make incident-driven growth cumulative
+#      instead of literal.
+#
+# Lines starting with '#' are comments and are not asserted.
+# Blank lines are ignored.
+
+# --- REAL ESCAPES: PR #994 / #995, 2026-08-21 -------------------------------
+# Two of the six escapes are absent by design. "the station's own operator
+# preference data rejected most of that tier" is covered below, but
+# "A fresh install started with music nobody had chosen" and
+# "two guards that needed teeth" are SEMANTIC - they carry no lexical tell, and
+# no regex reaches them. That residual risk is documented, not papered over.
+Findings from review
+mutation testing found two gaps in the licence binding
+Two guards were tightened after a reviewer flagged them
+the station's own operator preference data rejected most of that tier
+
+# --- R1: review noun near a discovery verb ----------------------------------
+The audit surfaced a race in the queue drain
+Fuzzing found an off-by-one in the segment parser
+A reviewer caught the missing timeout before merge
+The security review revealed a weakened ban fence
+Code review turned up two more defects in the same helper
+mutation testing flagged an unkilled mutant in the retry guard
+
+# --- R1b: review actor mid-action, no discovery verb ------------------------
+a reviewer ticking the box on the admin checklist
+A reviewer noticing the stale pin filed it separately
+a review pass questioning the fallback order
+a reviewer asking about the licence binding
+A reviewer bot suggesting the narrower type
+
+# --- R2: discovery verb first, review noun after ----------------------------
+Two gaps found during review are closed here
+The regression was caught in the audit rather than in CI
+A cache-staleness risk surfaced during review
+Three issues raised by review, all fixed
+
+# --- R3: review-artifact section headings -----------------------------------
+## Pre-Landing Review
+## Pre Landing Review
+### Findings
+## Review notes
+## Review findings
+## What I cut
+Findings from the review
+
+# --- R4: first-person debrief register --------------------------------------
+What I cut for slop: every em dash outside the proof lines
+I should have applied that boundary when I wrote them
+I drafted the bodies as a debrief
+I rewrote the retry loop after the second pass
+I initially reached for a semaphore here
+
+# --- R5: process tallies ----------------------------------------------------
+24 findings, 9 rated critical
+Two findings, both fixed before this PR
+0 findings from the specialist pass
+Three review rounds on this diff
+2 review passes over the fix itself
+3 of 5 reviewers agreed the design was sound
+findings raised during the adversarial pass
+findings confirmed by the second reviewer
+adversarially verified against the previous behaviour
+
+# --- R6: operator telemetry -------------------------------------------------
+operator preference data
+The service's own telemetry data revealed the skip pattern
+Listening data showed most sessions ended early
+usage data confirmed the tier was unpopular
+The station's own playback data rejected that whole tier
+
+# --- R7: product judgement framed as fact -----------------------------------
+A fresh install started with music nobody had chosen
+The default tier shipped tracks nobody wanted
+It surfaced a crate nobody had picked
+
+# --- CORE: agent and tool provenance ----------------------------------------
+Ran /autoplan over the design doc before implementing
+Codex review found no blocking issues
+Codex independent review agreed with the approach
+Claude review confirmed the fix
+Generated with Claude Code
+See CLAUDE.md for the editorial boundary
+🤖 Generated with something
+
+# --- CORE: workspace archaeology --------------------------------------------
+The earlier attempt is parked in stash@{0}
+This was sitting on an unpushed branch until today
+An un-pushed branch carried the earlier fix
+The worktree had untracked files from the previous run
+untracked code in the sibling worktree explained the discrepancy
+Reproduced in this Conductor workspace
+The Conductor session that produced this is gone
+A Conductor agent opened the original PR
