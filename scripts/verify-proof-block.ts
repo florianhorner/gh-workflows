@@ -20,6 +20,11 @@ import { unified } from "unified";
 import { visit } from "unist-util-visit";
 import { readFileSync } from "fs";
 import { existsSync } from "fs";
+import {
+  cleanIntegrateWitness,
+  makeGitRunner,
+  type WitnessResult,
+} from "./clean-integrate-witness";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,8 +48,13 @@ interface ValidationResult {
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
 const PR_HEAD_SHA = process.env.PR_HEAD_SHA ?? "";
+const PR_BASE_REF = process.env.PR_BASE_REF ?? "";
 const PR_HEAD_REPO = process.env.PR_HEAD_REPO_FULL_NAME ?? "";
 const PR_BASE_REPO = process.env.PR_BASE_REPO_FULL_NAME ?? "";
+// GitHub Actions sets GITHUB_API_URL natively (and to the right value on GHES).
+// Honouring it also lets the test suite point the verifier at a local stub and
+// exercise the CI-run path end to end instead of only its parts.
+const GITHUB_API_URL = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
 const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
   .split(",")
   .map((s) => s.trim())
@@ -302,6 +312,48 @@ async function validateProofLine(
   // Anything else: accept (test name list, comma-separated, etc.)
 }
 
+/**
+ * Asks the clean-integrate witness, but only once the environment has been
+ * proved to be the one the question is about.
+ *
+ * Two preconditions, both fail-closed, both cheap:
+ *
+ *  - the checkout must actually BE the PR head. The witness runs git in
+ *    GITHUB_WORKSPACE; if that is unset the runner falls back to the process
+ *    cwd, which under the reusable workflow is the nested gh-workflows
+ *    checkout — a different repository that would answer about the wrong
+ *    history. Comparing HEAD to PR_HEAD_SHA is the one check that cannot be
+ *    satisfied by the wrong repo.
+ *  - PR_BASE_REF must be set, because the witness anchors the merged-in parent
+ *    to the base branch and cannot do that without knowing which branch it is.
+ *
+ * A failed precondition is never an error of its own: it just leaves the
+ * original strict "Run is stale" verdict standing, which is the behaviour this
+ * change started from.
+ */
+function witnessCleanIntegrate(runHeadSha: string): WitnessResult {
+  const git = makeGitRunner(process.env.GITHUB_WORKSPACE);
+
+  if (!PR_BASE_REF) {
+    return { accepted: false, reason: "unresolvable", detail: "PR_BASE_REF is not set" };
+  }
+
+  const checkoutHead = git(["rev-parse", "HEAD"]);
+  if (!checkoutHead.ok || checkoutHead.stdout !== PR_HEAD_SHA) {
+    return {
+      accepted: false,
+      reason: "unresolvable",
+      detail: "the checkout is not the PR head, so git cannot be asked about it",
+    };
+  }
+
+  return cleanIntegrateWitness(git, {
+    runHead: runHeadSha,
+    prHead: PR_HEAD_SHA,
+    baseRef: PR_BASE_REF,
+  });
+}
+
 async function validateCIRun(
   key: string,
   owner: string,
@@ -319,7 +371,7 @@ async function validateCIRun(
 
   try {
     const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`,
+      `${GITHUB_API_URL}/repos/${owner}/${repo}/actions/runs/${runId}`,
       {
         headers: {
           Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -348,9 +400,21 @@ async function validateCIRun(
     }
 
     if (data.head_sha !== PR_HEAD_SHA) {
-      errors.push(
-        `[${key}] CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale.`
-      );
+      // Not the same commit. Before calling it stale, ask whether it is the
+      // same *content*: a branch that integrated its base and changed nothing
+      // else is the case branch protection forces on every PR that is not the
+      // next one to land. See scripts/clean-integrate-witness.ts.
+      const witness = witnessCleanIntegrate(data.head_sha);
+      if (!witness.accepted) {
+        const detail = witness.detail ? ` — ${witness.detail}` : "";
+        errors.push(
+          `[${key}] CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale (${witness.reason})${detail}.`
+        );
+      } else {
+        console.log(
+          `ℹ [${key}] CI run ${runId} ran on ${data.head_sha}, which this head integrates from ${PR_BASE_REF} without changing content — accepted.`
+        );
+      }
     }
   } catch (err) {
     errors.push(`[${key}] Failed to fetch CI run: ${String(err)}`);
