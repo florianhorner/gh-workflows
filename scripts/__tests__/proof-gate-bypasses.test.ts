@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -142,7 +143,9 @@ describe("a CI-run URL is recognised by its path, not by an exact host string", 
   });
 
   it("rejects a failed run cited with a trailing path segment", async () => {
-    // /actions/runs/123/job/456 is the shape gh prints for a job link.
+    // /actions/runs/123/job/456 is the shape gh prints for a job link. This is
+    // a no-regression control, not a guard: the old prefix-matching regex read
+    // a slash terminator too. The non-slash terminators below are the guards.
     const api = stubApi("failure", "cafebabe");
     const res = await verify(
       bodyWith(
@@ -151,6 +154,75 @@ describe("a CI-run URL is recognised by its path, not by an exact host string", 
       { GITHUB_API_URL: api }
     );
     expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('conclusion is "failure"');
+  });
+
+  // A run id that is not bare digits must be an ERROR, never a pass. Requiring
+  // `\d+` in the path pattern meant `runs/123.` simply did not match, fell into
+  // the generic-URL accept and skipped the run lookup entirely — while GFM
+  // strips the trailing period from a bare autolink, so the body still rendered
+  // a live link to the real run.
+  const RUN_ID_TERMINATORS = [".", ",", ":", "!", "~", ")"] as const;
+
+  for (const suffix of RUN_ID_TERMINATORS) {
+    it(`still looks the run up when the URL ends in "${suffix}"`, async () => {
+      const api = stubApi("failure", "cafebabe");
+      const res = await verify(
+        bodyWith(
+          `- [x] tests: https://github.com/florianhorner/demo/actions/runs/123${suffix} [proof: tests]`
+        ),
+        { GITHUB_API_URL: api }
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('conclusion is "failure"');
+    });
+  }
+
+  it("decodes a percent-encoded run id rather than treating it as a generic URL", async () => {
+    // github.com routes %31 to run 1, so the reader and the validator must
+    // agree on which run was cited.
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      bodyWith(
+        "- [x] tests: https://github.com/florianhorner/demo/actions/runs/%31 [proof: tests]"
+      ),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('conclusion is "failure"');
+  });
+
+  it("collapses a doubled slash rather than treating the URL as a generic one", async () => {
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      bodyWith(
+        "- [x] tests: https://github.com//florianhorner/demo/actions/runs/123 [proof: tests]"
+      ),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('conclusion is "failure"');
+  });
+
+  it("rejects a run id it cannot read instead of accepting the URL", async () => {
+    const res = await verify(
+      bodyWith(
+        "- [x] tests: https://github.com/florianhorner/demo/actions/runs/12a [proof: tests]"
+      )
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("unreadable run id");
+  });
+
+  it("rejects a run URL on a non-default port", async () => {
+    // A different port is a different origin than the api.github.com lookup.
+    const res = await verify(
+      bodyWith(
+        "- [x] tests: https://github.com:444/florianhorner/demo/actions/runs/123 [proof: tests]"
+      )
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("must be on github.com");
   });
 
   it("refuses a run-shaped path on a lookalike host instead of accepting it", async () => {
@@ -414,5 +486,146 @@ describe("n/a and unchecked values are judged, not waved through", () => {
       bodyWith("- [ ] schema: n/a — no interface changes [proof: schema]")
     );
     expect(res.exitCode).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Markdown-stripper holes found by adversarial review of the fix itself.
+//    Each of these was a way to make the gate read a different document than
+//    the one GitHub renders.
+// ---------------------------------------------------------------------------
+
+describe("the stripper reads the same document GitHub renders", () => {
+  it("does not parse a proof block hidden after a second comment opener", async () => {
+    // `<!-- a --> <!--` contains `-->`, so an includes() check called the line
+    // closed and never entered comment mode. GitHub renders nothing after the
+    // dangling opener; the gate was counting it as verified evidence.
+    const res = await verify(
+      [
+        "A change with no evidence at all.",
+        "",
+        "<!-- template start --> <!--",
+        "",
+        "## Proof",
+        "",
+        "- [x] tests: FakeTest",
+        "",
+        "-->",
+        "",
+      ].join("\n")
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("does not contain a ## Proof section");
+  });
+
+  it("treats a tilde fence with tildes in its info string as a fence", async () => {
+    // CommonMark forbids backticks inside a backtick fence's info string but
+    // ALLOWS tildes inside a tilde fence's, so the inline-span shortcut was
+    // wrong for `~~~`: the fenced line stayed in as a live claim while GitHub
+    // rendered it as code.
+    const res = await verify(
+      ["## Proof", "", "~~~ template ~~~", "- [x] tests: FakeTest", "~~~", ""].join("\n")
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("no checkbox lines");
+  });
+
+  it("does not treat a 4-space-indented triple backtick as a fence opener", async () => {
+    // At 4 spaces CommonMark makes it an indented code block. Reading it as a
+    // fence blanked everything after it, which both hid the LAST `## Proof`
+    // section and deleted its claims — so the gate validated an earlier block
+    // while the reviewer read the later one.
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      [
+        "## Proof",
+        "",
+        "- [x] tests: FakeTest",
+        "",
+        "An indented code sample:",
+        "",
+        "    ```",
+        "",
+        "## Proof",
+        "",
+        "- [x] tests: https://github.com/florianhorner/demo/actions/runs/123",
+        "",
+      ].join("\n"),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('conclusion is "failure"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. "Committed to the PR branch" is a git question, not an existsSync one.
+// ---------------------------------------------------------------------------
+
+describe("a file-path artifact must be committed to the PR branch", () => {
+  function gitRepo(): string {
+    const d = workspace();
+    execFileSync("git", ["init", "-q"], { cwd: d });
+    writeFileSync(join(d, "README.md"), "hi\n");
+    execFileSync("git", ["add", "README.md"], { cwd: d });
+    execFileSync(
+      "git",
+      ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
+      { cwd: d }
+    );
+    return d;
+  }
+
+  it("rejects a path that exists only in the nested gh-workflows checkout", async () => {
+    // The reusable workflow checks gh-workflows out at `_gh_workflows/` INSIDE
+    // github.workspace and runs `bun install` there, so those files are inside
+    // the workspace and in no PR commit. Lexical containment alone accepted
+    // them; git does not.
+    const ws = gitRepo();
+    mkdirSync(join(ws, "_gh_workflows", "scripts", "__tests__"), { recursive: true });
+    writeFileSync(join(ws, "_gh_workflows", "scripts", "__tests__", "x.test.ts"), "x\n");
+    const res = await verify(
+      bodyWith("- [x] runtime: _gh_workflows/scripts/__tests__/x.test.ts [proof: runtime]"),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("not committed to the PR branch");
+  });
+
+  it("rejects an untracked file the PR merely left lying in the checkout", async () => {
+    // Note the directory: a value with no `/` never reaches the file-path
+    // branch at all, it lands in the terminal prose accept. That gap is
+    // pre-existing and documented in README "Known gaps"; this test is about
+    // the tracked check, so it uses a path that actually routes there.
+    const ws = gitRepo();
+    mkdirSync(join(ws, "proof"), { recursive: true });
+    writeFileSync(join(ws, "proof", "scratch.txt"), "x\n");
+    const res = await verify(
+      bodyWith("- [x] runtime: proof/scratch.txt [proof: runtime]"),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("not committed to the PR branch");
+  });
+
+  it("accepts a file the PR actually committed", async () => {
+    const res = await verify(
+      bodyWith("- [x] runtime: README.md [proof: runtime]"),
+      { GITHUB_WORKSPACE: gitRepo() }
+    );
+    expect(res.exitCode).toBe(0);
+  });
+
+  it("rejects a symlink that points out of the checkout", async () => {
+    // resolve() is lexical and existsSync follows links, so a committed
+    // `etc-link -> /etc` made `etc-link/passwd` look like checkout content.
+    const ws = workspace();
+    symlinkSync("/etc", join(ws, "etc-link"));
+    const res = await verify(
+      bodyWith("- [x] runtime: etc-link/passwd [proof: runtime]"),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("escapes the repository checkout");
   });
 });

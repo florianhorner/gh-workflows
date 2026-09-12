@@ -55,9 +55,10 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored — including checkbox lines fenced *inside* a real `## Proof` section |
 | Checked boxes have real artifacts | `https://` URL, test name, repo-relative file path, or `n/a — <reason>` |
 | Unchecked boxes | Either `n/a — <reason>` with a non-empty reason, or a real artifact, which is then validated like a checked one. `—`, `–` and a spaced `-` all separate the reason |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). Host is matched case-insensitively with `www.` stripped, so `GitHub.com` and `www.github.com` validate like `github.com` instead of being waved through |
-| Artifact URL scheme | `http://` is rejected; a run-shaped path on any host other than `github.com` is rejected rather than accepted as a generic artifact |
-| File paths | Resolved **only** against `GITHUB_WORKSPACE` and confined to it. Absolute paths and `../` traversal are rejected; the process cwd is never consulted |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`.,:;!~)`) ignored — so every spelling that renders as a link to the run is looked up rather than waved through |
+| Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
+| Artifact URL scheme | `http://` is rejected |
+| File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules` |
 | Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) parse identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
 | Inline `[proof: key]` tokens | Must match an existing proof line key |
@@ -167,9 +168,10 @@ consumer no audit trail when the code underneath changes.
 - File path in `.context/proof/` committed to the PR branch
 - Screenshot URL (for UI/HA dashboard changes)
 
-All URL forms must be `https://`. File paths must be repository-relative — they
-are resolved against the PR checkout (`GITHUB_WORKSPACE`) and a path that
-escapes it is an error.
+All URL forms must be `https://`. File paths must be repository-relative and
+**committed** — they are resolved against the PR checkout (`GITHUB_WORKSPACE`)
+and checked against `git ls-files`, so an uncommitted file sitting in the
+checkout is an error, as is a path that escapes it.
 
 ### Running the parser locally
 
@@ -360,10 +362,36 @@ regression test that fails against it.
   regex-based. `bun install --frozen-lockfile` pulled them on every PR of every
   consuming repo.
 
+### Adversarial follow-up (same branch)
+
+A cross-model adversarial pass over the fixes above found that two of them were
+themselves wrong, and both are corrected here:
+
+- **Requiring `\d+` in the run-URL path made every other spelling fail open.**
+  `…/actions/runs/123.` did not match, so it fell into the generic-URL accept and
+  skipped the run lookup — and GFM strips a trailing period from a bare autolink,
+  so the body rendered a live link to the real run. A period ending a sentence is
+  ordinary authoring, not an attack. The id slot now captures anything and is
+  judged separately: readable ids are looked up, unreadable ones are errors.
+  Percent-encoding (`%31`, `actions%2Fruns`) and doubled slashes are normalised
+  the way github.com routes them, and a non-default port is rejected.
+- **Testing `line.includes("-->")` for comment state let a comment hide a whole
+  proof block.** `<!-- a --> <!--` contains `-->`, so comment mode was never
+  entered and the claims after the dangling opener were parsed as real, while
+  GitHub rendered none of them. Marker counting is restored.
+
+Three further holes in the same pass, all now closed: a tilde fence whose info
+string contains tildes (`~~~ template ~~~`) was misread as inline code, so its
+fenced claims stayed live; a 4-space-indented triple backtick was treated as a
+fence, blanking a later `## Proof` section and its claims; and lexical
+containment plus `existsSync` accepted a committed symlink pointing out of the
+checkout.
+
 Known gaps, deliberately not addressed here: strict mode keys on the *head* repo
 rather than the base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and
 unused), nothing requires any given proof key to be present, and the terminal
-`// Anything else: accept` still passes arbitrary prose. All three change
+`// Anything else: accept` still passes arbitrary prose — including a value with
+no `/` in it, which never reaches the file-path branch at all. All three change
 semantics for existing PR bodies and are tracked separately.
 
 ## License

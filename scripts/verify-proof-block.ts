@@ -26,7 +26,7 @@
  *                            support.
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
 import {
   cleanIntegrateWitness,
@@ -73,11 +73,21 @@ const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
 const PROOF_KEY_RE = /^[a-zA-Z_][\w:]*$/;
 
 // Path shape of a run page: /{owner}/{repo}/actions/runs/{id}
-const CI_RUN_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\/|$)/;
+//
+// The id group is deliberately NOT `\d+`. Requiring digits here meant anything
+// else — `runs/123.`, `runs/%31` — simply failed to match, fell through to the
+// generic-URL accept and skipped validation. Capture whatever is in the slot and
+// judge it separately, so an id we cannot read is an ERROR rather than a pass.
+const CI_RUN_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([^/]*)/;
+
+// Trailing punctuation GFM's autolink extension excludes from a bare link, so
+// `…/runs/123.` at the end of a sentence renders as a link to run 123.
+const AUTOLINK_TRAILING = /[?!.,:;*_~)\]]+$/;
 
 type ArtifactUrl =
   | { kind: "ci-run"; owner: string; repo: string; runId: string }
   | { kind: "ci-run-wrong-host"; host: string }
+  | { kind: "ci-run-bad-id"; id: string }
   | { kind: "insecure" }
   | { kind: "url" }
   | { kind: "not-url" };
@@ -114,16 +124,34 @@ function classifyArtifactUrl(value: string): ArtifactUrl {
   }
 
   const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
-  const runMatch = parsed.pathname.match(CI_RUN_PATH_RE);
+
+  // Decode and collapse before matching. `%2F`, `%61ctions` and `//owner/...`
+  // all route to the same page on github.com, so a matcher that reads the raw
+  // pathname sees a non-run URL where the reader sees a run link.
+  let path = parsed.pathname;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // Malformed escape: leave it encoded rather than guessing.
+  }
+  path = path.replace(/\/{2,}/g, "/");
+
+  const runMatch = path.match(CI_RUN_PATH_RE);
 
   if (runMatch) {
-    if (host !== "github.com") return { kind: "ci-run-wrong-host", host };
+    // A non-default port is a different origin than the one the API is asked
+    // about, so it is not this run page.
+    if (host !== "github.com" || parsed.port !== "") {
+      return { kind: "ci-run-wrong-host", host: parsed.host.toLowerCase() };
+    }
     if (parsed.protocol !== "https:") return { kind: "insecure" };
+    const id = runMatch[3]!.replace(AUTOLINK_TRAILING, "");
+    if (!/^\d+$/.test(id)) return { kind: "ci-run-bad-id", id: runMatch[3]! };
     return {
       kind: "ci-run",
       owner: runMatch[1]!,
       repo: runMatch[2]!,
-      runId: runMatch[3]!,
+      runId: id,
     };
   }
 
@@ -197,12 +225,35 @@ function blankMarkdownNoise(body: string): string {
       continue;
     }
 
-    const opener = trimmed.match(/^(`{3,}|~{3,})/);
+    // Blank balanced comment pairs first, then decide whether an unbalanced
+    // opener remains. Counting markers is what makes a line like
+    // `<!-- a --> <!--` enter comment mode: testing `includes("-->")` said the
+    // line was closed, so a whole proof block hidden after the dangling opener
+    // was parsed as real claims while GitHub rendered none of it.
+    const withoutPairs = line.replace(/<!--[\s\S]*?-->/g, "");
+    if ((withoutPairs.match(/<!--/g) ?? []).length > 0) {
+      inComment = true;
+      out.push("");
+      continue;
+    }
+
+    // A fence opener may be indented at most 3 spaces. At 4 it is an indented
+    // code block, and treating it as a fence swallowed everything after it —
+    // including a later `## Proof` heading and its claims.
+    const indent = line.length - line.trimStart().length;
+    const opener = indent <= 3 ? trimmed.match(/^(`{3,}|~{3,})/) : null;
     if (opener) {
       const marker = opener[1]!;
-      if (new RegExp(`${marker[0]}{${marker.length},}`).test(trimmed.slice(marker.length))) {
-        // Inline span, not a fence opener.
-        out.push(line.replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ""));
+      // The inline-span shortcut applies to BACKTICKS ONLY. CommonMark forbids
+      // backticks in a backtick fence's info string, so a second run on the
+      // same line really does mean inline code. A tilde fence's info string MAY
+      // contain tildes, so `~~~ template ~~~` is a genuine opener — reading it
+      // as an inline span left the fenced lines in place as live claims.
+      const inlineSpan =
+        marker[0] === "`" &&
+        new RegExp(`\`{${marker.length},}`).test(trimmed.slice(marker.length));
+      if (inlineSpan) {
+        out.push(withoutPairs.replace(/(`{3,})[\s\S]*?\1/g, ""));
       } else {
         fence = marker;
         out.push("");
@@ -210,13 +261,7 @@ function blankMarkdownNoise(body: string): string {
       continue;
     }
 
-    if (trimmed.includes("<!--") && !trimmed.includes("-->")) {
-      inComment = true;
-      out.push("");
-      continue;
-    }
-
-    out.push(line.replace(/<!--.*?-->/g, ""));
+    out.push(withoutPairs);
   }
 
   return out.join("\n");
@@ -394,14 +439,46 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
     return;
   }
 
-  const root = resolve(workspace);
-  const full = resolve(root, artifact);
+  // realpath, not just resolve: resolve() is lexical, and existsSync follows
+  // symlinks, so a committed `etc-link -> /etc` made `etc-link/passwd` look
+  // like it lived inside the checkout.
+  const root = realpathOrSelf(resolve(workspace));
+  const full = realpathOrSelf(resolve(root, artifact));
   if (full !== root && !full.startsWith(root + sep)) {
     errors.push(`[${key}] File path escapes the repository checkout: ${artifact}`);
     return;
   }
   if (!existsSync(full)) {
     errors.push(`[${key}] File path does not exist: ${artifact}`);
+    return;
+  }
+
+  // Existing inside the checkout directory is not the claim. The claim is
+  // "committed to the PR branch", and only git can answer it. This is what
+  // excludes the nested gh-workflows checkout: the reusable workflow puts it at
+  // `_gh_workflows/` INSIDE github.workspace and then runs `bun install` there,
+  // so `_gh_workflows/scripts/__tests__/...` and `_gh_workflows/scripts/
+  // node_modules/<anything>` are inside the workspace yet in no PR commit.
+  const git = makeGitRunner(workspace);
+  if (git(["ls-files", "--error-unmatch", "--", artifact]).ok) return;
+
+  // git said no. Distinguish "untracked" from "cannot answer": a workspace that
+  // is not a git checkout (local usage, tests) leaves existence as the only
+  // available evidence, which is the behaviour this function started from.
+  const insideRepo = git(["rev-parse", "--is-inside-work-tree"]);
+  if (insideRepo.ok && insideRepo.stdout === "true") {
+    errors.push(
+      `[${key}] File path is not committed to the PR branch: ${artifact}`
+    );
+  }
+}
+
+/** realpath, falling back to the lexical path when it does not exist yet. */
+function realpathOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
   }
 }
 
@@ -427,6 +504,11 @@ async function validateArtifact(
     case "ci-run-wrong-host":
       errors.push(
         `[${key}] CI run URL must be on github.com, got host "${url.host}": ${artifact}`
+      );
+      return;
+    case "ci-run-bad-id":
+      errors.push(
+        `[${key}] CI run URL has an unreadable run id "${url.id}": ${artifact}`
       );
       return;
     case "insecure":
