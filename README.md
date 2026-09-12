@@ -52,9 +52,13 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Block present | PR body must contain `## Proof` at end-of-body |
-| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored |
-| Checked boxes have real artifacts | URL, test name, file path, or `n/a — <reason>` |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below) |
+| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored — including checkbox lines fenced *inside* a real `## Proof` section |
+| Checked boxes have real artifacts | `https://` URL, test name, repo-relative file path, or `n/a — <reason>` |
+| Unchecked boxes | Either `n/a — <reason>` with a non-empty reason, or a real artifact, which is then validated like a checked one. `—`, `–` and a spaced `-` all separate the reason |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). Host is matched case-insensitively with `www.` stripped, so `GitHub.com` and `www.github.com` validate like `github.com` instead of being waved through |
+| Artifact URL scheme | `http://` is rejected; a run-shaped path on any host other than `github.com` is rejected rather than accepted as a generic artifact |
+| File paths | Resolved **only** against `GITHUB_WORKSPACE` and confined to it. Absolute paths and `../` traversal are rejected; the process cwd is never consulted |
+| Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) parse identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
 | Inline `[proof: key]` tokens | Must match an existing proof line key |
 | Draft PRs | Exempt |
@@ -163,6 +167,10 @@ consumer no audit trail when the code underneath changes.
 - File path in `.context/proof/` committed to the PR branch
 - Screenshot URL (for UI/HA dashboard changes)
 
+All URL forms must be `https://`. File paths must be repository-relative — they
+are resolved against the PR checkout (`GITHUB_WORKSPACE`) and a path that
+escapes it is an error.
+
 ### Running the parser locally
 
 ```bash
@@ -183,10 +191,13 @@ PR_BASE_REF=main                         # base branch; the clean-integrate
                                          # parent to it and refuses without it
 GITHUB_WORKSPACE=/path/to/a/full/clone   # the witness runs git here, and checks
                                          # this checkout is actually PR_HEAD_SHA.
-                                         # NOTE: this is also the "we are in CI"
-                                         # signal for file-path proof lines, so
-                                         # setting it locally makes a missing
-                                         # proof file a hard failure
+                                         # NOTE: this is also the ONLY root that
+                                         # file-path proof lines resolve against,
+                                         # and the "we are in CI" signal that
+                                         # makes a missing proof file a hard
+                                         # failure. Unset, existence is not
+                                         # checked at all, but an absolute or
+                                         # escaping path is still rejected
 GITHUB_API_URL=https://api.github.com    # optional; override for GHES
 PR_HEAD_REPO_FULL_NAME=florianhorner/your-repo
 PR_BASE_REPO_FULL_NAME=florianhorner/your-repo
@@ -306,6 +317,54 @@ the reason named. The reusable workflow's PR-head checkout moved to
 
 Both fixes are backwards-compatible — no template change required, no
 function signature change, no tag scheme change.
+
+### Gate-bypass fixes (v1.3)
+
+Six inputs made the validator exit 0 when it should have exited 1. Each was
+reproduced against the previous parser before being fixed, and each has a
+regression test that fails against it.
+
+- **CI-run URLs are recognised by canonical host, not by exact string.** The old
+  pattern was host-exact, case-sensitive and `https`-only, and the generic
+  `^https?://` accept sat directly behind it returning unconditionally. So
+  `https://GitHub.com/o/r/actions/runs/1` skipped the `conclusion=success` and
+  head_sha checks entirely — one capital letter — while the PR body still
+  rendered a live link to the same run page. `http://` is now rejected, and a
+  run-shaped path on a lookalike host is an error rather than a generic artifact.
+- **The unchecked branch is exhaustive.** `if (value && value !== "n/a") return;`
+  was a silent accept that skipped every check. Once the `[proof: KEY]` strip
+  shortened `n/a — [proof: runtime]` to `n/a —`, the `n/a` classifier stopped
+  recognising it and it fell into that hole, taking the cross-owner `runtime: n/a`
+  prohibition with it. An `n/a` now needs a non-empty reason, a spaced ASCII
+  hyphen counts as a separator, and an unchecked box carrying a real artifact is
+  validated instead of waved through.
+- **File paths are confined to the checkout.** `existsSync(value)` was tried bare
+  first, i.e. against the process cwd — which under the reusable workflow is the
+  nested gh-workflows checkout, so `__tests__/...` or `node_modules/<anything>`
+  satisfied "committed to the PR branch". There was no containment check at all
+  despite the code claiming one, so `/etc/passwd` and `../../../../etc/hosts`
+  both passed. Resolution is now only ever against `GITHUB_WORKSPACE`.
+- **CRLF bodies parse.** `.` excludes `\r` and `$` was not multiline-anchored, so
+  on a CRLF body every proof line was dropped while the heading survived — the
+  error blamed a missing checkbox list. GitHub stores web-UI-authored and
+  web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
+  gate the moment someone fixes a typo in the description.
+- **One markdown stripper instead of three.** The three hand-rolled strippers
+  disagreed. Checkbox lines inside a fence *within* the `## Proof` section were
+  parsed as real claims (fence stripping only ever protected the heading); a line
+  merely starting with an inline ` ```span``` ` latched the fence state machine
+  and made a visible `## Proof` heading invisible; and token validation handled
+  ``` but not `~~~`, reporting a false dangling token on valid markdown.
+- **Four unused dependencies removed.** `remark`, `remark-parse`, `unified` and
+  `unist-util-visit` were imported but never referenced — the parser is entirely
+  regex-based. `bun install --frozen-lockfile` pulled them on every PR of every
+  consuming repo.
+
+Known gaps, deliberately not addressed here: strict mode keys on the *head* repo
+rather than the base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and
+unused), nothing requires any given proof key to be present, and the terminal
+`// Anything else: accept` still passes arbitrary prose. All three change
+semantics for existing PR bodies and are tracked separately.
 
 ## License
 

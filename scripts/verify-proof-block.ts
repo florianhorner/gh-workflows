@@ -26,12 +26,8 @@
  *                            support.
  */
 
-import { remark } from "remark";
-import remarkParse from "remark-parse";
-import { unified } from "unified";
-import { visit } from "unist-util-visit";
-import { readFileSync } from "fs";
-import { existsSync } from "fs";
+import { readFileSync, existsSync } from "fs";
+import { resolve, sep } from "path";
 import {
   cleanIntegrateWitness,
   makeGitRunner,
@@ -49,11 +45,6 @@ interface ProofLine {
   raw: string;
 }
 
-interface ValidationResult {
-  ok: boolean;
-  errors: string[];
-}
-
 // ---------------------------------------------------------------------------
 // Env / config
 // ---------------------------------------------------------------------------
@@ -67,9 +58,9 @@ const PR_BASE_REPO = process.env.PR_BASE_REPO_FULL_NAME ?? "";
 // stub and exercise the CI-run path end to end instead of only its parts.
 //
 // It is NOT GHES support, and an earlier version of this comment wrongly implied
-// it was. CI_RUN_RE below only recognises `https://github.com/...`, so a GHES run
-// URL never reaches validateCIRun at all: it falls through to the generic-URL
-// branch and is accepted without the conclusion check or the content witness.
+// it was. classifyArtifactUrl below only accepts `github.com` as a CI-run host, so
+// a GHES run URL never reaches validateCIRun at all: it is reported as a wrong-host
+// CI-run claim rather than validated.
 // Supporting GHES means teaching URL recognition the configured host and mapping
 // its API URL to its web URL, which nothing here exercises — so the claim is
 // dropped rather than the limitation hidden.
@@ -79,11 +70,66 @@ const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// CI run URL pattern: https://github.com/{owner}/{repo}/actions/runs/{id}
-const CI_RUN_RE =
-  /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)/;
-
 const PROOF_KEY_RE = /^[a-zA-Z_][\w:]*$/;
+
+// Path shape of a run page: /{owner}/{repo}/actions/runs/{id}
+const CI_RUN_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\/|$)/;
+
+type ArtifactUrl =
+  | { kind: "ci-run"; owner: string; repo: string; runId: string }
+  | { kind: "ci-run-wrong-host"; host: string }
+  | { kind: "insecure" }
+  | { kind: "url" }
+  | { kind: "not-url" };
+
+/**
+ * Classifies an artifact value as a URL, canonicalising the host FIRST.
+ *
+ * This replaces a single anchored regex over the raw string
+ * (`/^https:\/\/github\.com\/...\/actions\/runs\/(\d+)/`): host-exact,
+ * case-sensitive, https-only. Every near-miss — `GitHub.com`, `http://`,
+ * `www.github.com` — missed it and then landed in the generic-URL accept
+ * sitting directly behind it, which returns unconditionally. One capital letter
+ * therefore skipped the `conclusion === "success"` and head_sha checks that are
+ * the only reason this script exists, while the PR body still rendered a live
+ * link to the same run page. Hosts are case-insensitive in DNS; the three
+ * spellings are the same page.
+ *
+ * So: any URL whose PATH looks like an Actions run is treated as a CI-run claim
+ * and must validate. It is never allowed to fall through to the generic accept.
+ * A run-shaped path on some other host is an error, not a generic artifact —
+ * `github.com.example.test/o/r/actions/runs/1` is not a run page.
+ */
+function classifyArtifactUrl(value: string): ArtifactUrl {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return { kind: "not-url" };
+  }
+  // A bare test name parses as a URL: `TestThing::sub_case` has protocol
+  // "testthing:". Only http(s) is a URL for our purposes.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { kind: "not-url" };
+  }
+
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  const runMatch = parsed.pathname.match(CI_RUN_PATH_RE);
+
+  if (runMatch) {
+    if (host !== "github.com") return { kind: "ci-run-wrong-host", host };
+    if (parsed.protocol !== "https:") return { kind: "insecure" };
+    return {
+      kind: "ci-run",
+      owner: runMatch[1]!,
+      repo: runMatch[2]!,
+      runId: runMatch[3]!,
+    };
+  }
+
+  if (parsed.protocol !== "https:") return { kind: "insecure" };
+  return { kind: "url" };
+}
 
 // ---------------------------------------------------------------------------
 // Step 1: read body
@@ -109,68 +155,96 @@ function readBody(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the raw markdown content of the ## Proof section, anchored
- * to end-of-body. The section starts at the last `## Proof` heading that
- * is NOT inside an HTML comment or code fence.
+ * Blanks HTML comments and fenced code blocks, keeping the line count intact.
+ *
+ * One stripper for all three call sites. There used to be three, and they
+ * disagreed:
+ *
+ *  - extractProofSection ran a paired-fence regex to FIND the heading, then a
+ *    separate line-state machine to RE-LOCATE it in the original body;
+ *  - validateInlineTokens ran a third variant that handled ``` but not ~~~,
+ *    so a proof token inside a `~~~` block was reported as dangling on a body
+ *    that is perfectly valid markdown.
+ *
+ * The state machine also latched on a line that merely STARTS with an inline
+ * triple-backtick span (`` ```bun test``` passes now ``): it set inFence and
+ * never found a closer, so a `## Proof` heading further down became invisible
+ * and the validator denied a section it could plainly see. An opener that
+ * closes on its own line is inline code, not a fence.
+ */
+function blankMarkdownNoise(body: string): string {
+  const out: string[] = [];
+  let inComment = false;
+  let fence: string | null = null;
+
+  for (const raw of body.split("\n")) {
+    // CRLF bodies: see parseProofLines.
+    const line = raw.replace(/\r+$/, "");
+    const trimmed = line.trim();
+
+    if (inComment) {
+      out.push("");
+      if (trimmed.includes("-->")) inComment = false;
+      continue;
+    }
+
+    if (fence !== null) {
+      out.push("");
+      // Closer: same character, at least as long, alone on the line.
+      if (new RegExp(`^${fence[0]}{${fence.length},}\\s*$`).test(trimmed)) {
+        fence = null;
+      }
+      continue;
+    }
+
+    const opener = trimmed.match(/^(`{3,}|~{3,})/);
+    if (opener) {
+      const marker = opener[1]!;
+      if (new RegExp(`${marker[0]}{${marker.length},}`).test(trimmed.slice(marker.length))) {
+        // Inline span, not a fence opener.
+        out.push(line.replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ""));
+      } else {
+        fence = marker;
+        out.push("");
+      }
+      continue;
+    }
+
+    if (trimmed.includes("<!--") && !trimmed.includes("-->")) {
+      inComment = true;
+      out.push("");
+      continue;
+    }
+
+    out.push(line.replace(/<!--.*?-->/g, ""));
+  }
+
+  return out.join("\n");
+}
+
+/**
+ * Returns the markdown content of the ## Proof section, anchored to
+ * end-of-body, with comments and fenced blocks blanked out. The section starts
+ * at the last `## Proof` heading that is NOT inside an HTML comment or code
+ * fence.
+ *
+ * The returned text is the BLANKED text, not the original. The old version
+ * returned the original slice "because we need original text for URL
+ * validation etc." — but nothing in the section needs it, and returning it
+ * meant a checkbox line inside a fence *within* the section was parsed as a
+ * real proof claim. A `- [x] runtime: FakeArtifact` inside a block labelled
+ * "Template:" counted as satisfied runtime evidence.
  */
 function extractProofSection(body: string): string | null {
-  // Strip HTML comments to prevent fake ## Proof inside <!-- -->
-  const noComments = body.replace(/<!--[\s\S]*?-->/g, "");
+  const lines = blankMarkdownNoise(body).split("\n");
 
-  // Strip code fences (``` or ~~~)
-  const noFences = noComments.replace(/`{3,}[\s\S]*?`{3,}/g, "").replace(/~{3,}[\s\S]*?~{3,}/g, "");
-
-  // Find the last ## Proof heading (case-sensitive, per spec)
-  const lines = noFences.split("\n");
-  let proofStart = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^##\s+Proof\s*$/.test(lines[i].trim())) {
-      proofStart = i;
-      break;
-    }
-  }
-  if (proofStart === -1) return null;
-
-  // The proof section is everything from proofStart to end-of-body in the
-  // ORIGINAL body (we need original text for URL validation etc.)
-  // Re-locate in original body by finding the same ## Proof occurrence.
-  const originalLines = body.split("\n");
-  // We need to find the corresponding line in original body.
-  // Strategy: walk original body lines counting ## Proof occurrences that
-  // are NOT inside comments or code fences, and take the last one.
-  let inComment = false;
-  let inFence = false;
   let lastProofLine = -1;
-
-  for (let i = 0; i < originalLines.length; i++) {
-    const line = originalLines[i];
-
-    // Track HTML comments (multiline)
-    const openComments = (line.match(/<!--/g) ?? []).length;
-    const closeComments = (line.match(/-->/g) ?? []).length;
-    if (inComment) {
-      if (closeComments > 0) inComment = false;
-      continue;
-    }
-    if (openComments > closeComments) {
-      inComment = true;
-      continue;
-    }
-
-    // Track code fences
-    if (/^(`{3,}|~{3,})/.test(line.trim())) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-
-    if (/^##\s+Proof\s*$/.test(line.trim())) {
-      lastProofLine = i;
-    }
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+Proof\s*$/.test(lines[i]!.trim())) lastProofLine = i;
   }
-
   if (lastProofLine === -1) return null;
-  return originalLines.slice(lastProofLine).join("\n");
+
+  return lines.slice(lastProofLine).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +255,17 @@ function parseProofLines(section: string): ProofLine[] {
   const lines = section.split("\n");
   const result: ProofLine[] = [];
 
-  for (const line of lines) {
+  for (const raw of lines) {
+    // Strip a trailing CR before matching. GitHub stores browser-authored and
+    // browser-edited PR bodies with CRLF endings, and in JS `.` excludes \r
+    // while `$` here is not multiline-anchored — so on a CRLF body the value
+    // capture could never reach end-of-string and EVERY proof line was
+    // dropped. The heading survived (it is matched against line.trim()), so
+    // the failure reported "no checkbox lines" plus a dangling token for each
+    // real claim: three errors, none of them the cause. The caller's
+    // `types: [edited]` re-runs the gate the moment someone fixes a typo in
+    // the description, which is exactly when this fired.
+    const line = raw.replace(/\r+$/, "");
     // Match: - [x] key: value  OR  - [ ] key: value
     const m = line.match(/^-\s+\[([ xX])\]\s+(\S+?):\s+(.*)$/);
     if (!m) continue;
@@ -248,6 +332,125 @@ function stripArtifactDescription(value: string): string {
 // Step 4: validate each proof line
 // ---------------------------------------------------------------------------
 
+/** An `n/a` value, however its reason is (or is not) attached. */
+const NA_PREFIX_RE = /^n\/a\b/i;
+
+/**
+ * Parses an `n/a` value into its reason.
+ *
+ * Returns the reason, `""` for an `n/a` with no reason at all (`n/a`, `n/a —`),
+ * or `null` when the value is an `n/a` whose reason is not attached in a form
+ * we recognise.
+ *
+ * A spaced ASCII hyphen counts as a separator here even though
+ * stripArtifactDescription deliberately excludes it. The two are not the same
+ * question: an `n/a` reason is prose, while a real artifact may be a file path
+ * full of hyphens. Requiring an em-dash left the rule one keystroke from
+ * unenforced — `n/a - no device` was silently accepted on a cross-owner PR.
+ */
+function parseNotApplicable(value: string): string | null {
+  const m = value.match(/^n\/a(?:\s*[\u2014\u2013-]\s*(.*))?$/i);
+  if (!m) return null;
+  return (m[1] ?? "").trim();
+}
+
+function looksLikeFilePath(artifact: string): boolean {
+  return (
+    artifact.startsWith(".") || artifact.startsWith("/") || artifact.includes("/")
+  );
+}
+
+/**
+ * Validates a file-path artifact and confines it to the PR checkout.
+ *
+ * Two defects this replaces, both of which let a path that is nowhere in the PR
+ * pass as "committed to the PR branch":
+ *
+ *  - `existsSync(artifact)` was tried BARE first, i.e. against the process cwd.
+ *    Under the reusable workflow that cwd is the nested gh-workflows checkout
+ *    (`working-directory: _gh_workflows/scripts`), so
+ *    `__tests__/verify-proof-block.test.ts` or `node_modules/<anything>`
+ *    satisfied the check. The `${GITHUB_WORKSPACE}/${value}` fallback was
+ *    correct — it just never ran, because the wrong tree answered first.
+ *  - There was no containment check at all, despite the comment claiming
+ *    "must exist on disk within repo". `/etc/passwd` and `../../../../etc/hosts`
+ *    both passed.
+ *
+ * Resolution is now only ever against GITHUB_WORKSPACE, which the workflow
+ * points at the PR head checkout.
+ */
+function validateFilePath(key: string, artifact: string, errors: string[]): void {
+  const workspace = process.env.GITHUB_WORKSPACE;
+
+  if (!workspace) {
+    // Local usage: no checkout root to resolve against, so existence is
+    // unknowable and stays soft, as before. An escape is still an escape
+    // though, and saying so needs no filesystem.
+    if (artifact.startsWith("/") || artifact.split("/").includes("..")) {
+      errors.push(
+        `[${key}] File-path artifact must be repository-relative, got: ${artifact}`
+      );
+    }
+    return;
+  }
+
+  const root = resolve(workspace);
+  const full = resolve(root, artifact);
+  if (full !== root && !full.startsWith(root + sep)) {
+    errors.push(`[${key}] File path escapes the repository checkout: ${artifact}`);
+    return;
+  }
+  if (!existsSync(full)) {
+    errors.push(`[${key}] File path does not exist: ${artifact}`);
+  }
+}
+
+/**
+ * Validates one artifact value — the part of a proof line that is supposed to
+ * BE the evidence. Shared by the checked and the unchecked path so the two
+ * cannot drift apart.
+ */
+async function validateArtifact(
+  key: string,
+  value: string,
+  errors: string[]
+): Promise<void> {
+  // Strip an optional " — <description>" annotation so only the artifact
+  // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
+  const artifact = stripArtifactDescription(value);
+
+  const url = classifyArtifactUrl(artifact);
+  switch (url.kind) {
+    case "ci-run":
+      await validateCIRun(key, url.owner, url.repo, url.runId, errors);
+      return;
+    case "ci-run-wrong-host":
+      errors.push(
+        `[${key}] CI run URL must be on github.com, got host "${url.host}": ${artifact}`
+      );
+      return;
+    case "insecure":
+      errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
+      return;
+    case "url":
+      return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
+    case "not-url":
+      break;
+  }
+
+  // Test name? /^[a-zA-Z_][\w:]*$/
+  if (PROOF_KEY_RE.test(artifact)) {
+    return; // valid test name
+  }
+
+  if (looksLikeFilePath(artifact)) {
+    validateFilePath(key, artifact, errors);
+    return;
+  }
+
+  // Anything else: accept (test name list, comma-separated, etc.)
+}
+
 async function validateProofLine(
   line: ProofLine,
   isUpstream: boolean,
@@ -256,8 +459,14 @@ async function validateProofLine(
   const { key, checked, value } = line;
 
   if (!checked) {
-    // Unchecked: must be n/a — <reason> (reason non-empty)
-    if (/^n\/a\s*—\s*.+/.test(value)) {
+    if (NA_PREFIX_RE.test(value)) {
+      const reason = parseNotApplicable(value);
+      if (!reason) {
+        errors.push(
+          `[${key}] Unchecked "n/a" needs a reason in the form "n/a — <reason>". Got: "${value}"`
+        );
+        return;
+      }
       // runtime: n/a is forbidden for upstream PRs
       if (key === "runtime" && isUpstream) {
         errors.push(
@@ -266,15 +475,22 @@ async function validateProofLine(
       }
       return; // valid n/a
     }
-    // Also accept checked=false with a real artifact (author chose not to check it):
-    // treat same as checked for validation purposes if it has content
-    if (value && value !== "n/a") {
-      // unchecked but has a value — warn but don't fail (author may still be filling it)
+
+    if (!value) {
+      errors.push(
+        `[${key}] Unchecked box must have a value like "n/a — <reason>" or a real artifact. Got: "${value}"`
+      );
       return;
     }
-    errors.push(
-      `[${key}] Unchecked box must have a value like "n/a — <reason>" or a real artifact. Got: "${value}"`
-    );
+
+    // Unchecked but carrying a real artifact: validate it exactly as a checked
+    // one. This used to be an unconditional `return` guarded only by
+    // `value !== "n/a"` — a silent accept that skipped every check, and the
+    // hole that `n/a —` with an empty reason fell into once the
+    // [proof: KEY] strip shortened the value to something the n/a classifier
+    // no longer recognised. The classifier and the fallthrough disagreed, and
+    // the strip moved the boundary between them.
+    await validateArtifact(key, value, errors);
     return;
   }
 
@@ -285,50 +501,12 @@ async function validateProofLine(
   }
 
   // n/a on a checked box is contradictory
-  if (/^n\/a/.test(value)) {
+  if (NA_PREFIX_RE.test(value)) {
     errors.push(`[${key}] Checked box cannot have n/a value.`);
     return;
   }
 
-  // Strip an optional " — <description>" annotation so only the artifact
-  // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
-  const artifact = stripArtifactDescription(value);
-
-  // CI run URL?
-  const ciMatch = artifact.match(CI_RUN_RE);
-  if (ciMatch) {
-    await validateCIRun(key, ciMatch[1], ciMatch[2], ciMatch[3], errors);
-    return;
-  }
-
-  // Test name? /^[a-zA-Z_][\w:]*$/
-  if (PROOF_KEY_RE.test(artifact)) {
-    return; // valid test name
-  }
-
-  // URL (http/https)? Check BEFORE the file-path branch — URLs contain `/`
-  // and would otherwise be misrouted into existsSync() and fail in CI
-  // (where GITHUB_WORKSPACE is set).
-  if (/^https?:\/\//.test(artifact)) {
-    return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
-  }
-
-  // File path? Must exist on disk within repo
-  if (artifact.startsWith(".") || artifact.startsWith("/") || artifact.includes("/")) {
-    if (!existsSync(artifact)) {
-      // Soft: don't fail on file paths in CI (path relative to repo root may differ)
-      // Only fail if GITHUB_WORKSPACE is set (we're in CI)
-      if (process.env.GITHUB_WORKSPACE) {
-        const fullPath = `${process.env.GITHUB_WORKSPACE}/${artifact}`;
-        if (!existsSync(fullPath)) {
-          errors.push(`[${key}] File path does not exist: ${artifact}`);
-        }
-      }
-    }
-    return;
-  }
-
-  // Anything else: accept (test name list, comma-separated, etc.)
+  await validateArtifact(key, value, errors);
 }
 
 /**
@@ -448,11 +626,12 @@ function validateInlineTokens(
   const proofKeys = new Set(proofLines.map((l) => l.key));
   const tokenRe = /\[proof:\s*([^\]]+)\]/g;
 
-  // Find all [proof: key] tokens in the body (skip inside code fences / comments)
-  const strippedBody = body
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/`{3,}[\s\S]*?`{3,}/g, "")
-    .replace(/`[^`]+`/g, ""); // inline code too
+  // Find all [proof: key] tokens in the body (skip inside code fences /
+  // comments). Uses the same stripper as extractProofSection so the two can
+  // never disagree about what counts as a fence; inline single-backtick code
+  // is stripped only here, because a proof line's value may legitimately be
+  // wrapped in backticks and must survive parseProofLines.
+  const strippedBody = blankMarkdownNoise(body).replace(/`[^`]+`/g, "");
 
   let m: RegExpExecArray | null;
   while ((m = tokenRe.exec(strippedBody)) !== null) {

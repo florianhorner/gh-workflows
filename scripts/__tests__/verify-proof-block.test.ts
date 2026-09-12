@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { $ } from "bun";
+import { describe, it, expect } from "bun:test";
+import { unlink } from "node:fs/promises";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,7 +17,9 @@ async function runParser(
   body: string,
   env: Record<string, string> = {}
 ): Promise<RunResult> {
-  const tmp = `/tmp/proof-test-${Date.now()}.md`;
+  // randomUUID, not Date.now(): two fixtures written in the same millisecond
+  // collided silently.
+  const tmp = `/tmp/proof-test-${crypto.randomUUID()}.md`;
   await Bun.write(tmp, body);
 
   try {
@@ -46,8 +48,11 @@ async function runParser(
 
     return { exitCode, stdout, stderr };
   } finally {
-    // cleanup
-    try { Bun.file(tmp).slice(0, 0); } catch {}
+    // Actually delete it. The old `Bun.file(tmp).slice(0, 0)` constructed a
+    // Blob slice and removed nothing, so every run since this suite was
+    // written leaked a fixture into /tmp (702 of them by the time anyone
+    // counted).
+    await unlink(tmp).catch(() => {});
   }
 }
 
