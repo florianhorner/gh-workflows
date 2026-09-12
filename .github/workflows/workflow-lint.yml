@@ -90,7 +90,11 @@ jobs:
         run: |
           set -euo pipefail
           git --version
-          git merge-tree --write-tree --help >/dev/null
+          # Run it for real rather than probing --help: `--help` after a flag
+          # exits 129 regardless of whether the flag is supported, so the probe
+          # failed on a runner whose git was fine. Merging a commit with itself
+          # is a pure object-database read that prints its tree.
+          git merge-tree --write-tree --no-messages HEAD HEAD >/dev/null
 
       - name: Install dependencies
         working-directory: scripts
