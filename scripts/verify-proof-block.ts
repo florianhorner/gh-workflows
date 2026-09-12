@@ -26,7 +26,7 @@
  *                            support.
  */
 
-import { readFileSync, existsSync, realpathSync } from "fs";
+import { readFileSync, existsSync, realpathSync, statSync } from "fs";
 import { resolve, sep } from "path";
 import {
   cleanIntegrateWitness,
@@ -138,7 +138,9 @@ function classifyArtifactUrl(value: string): ArtifactUrl {
 
   const runMatch = path.match(CI_RUN_PATH_RE);
 
-  if (runMatch) {
+  // An empty id slot is `…/actions/runs/`, the runs index. That is not a run
+  // claim at all, so it stays a generic URL rather than becoming an error.
+  if (runMatch && runMatch[3] !== "") {
     // A non-default port is a different origin than the one the API is asked
     // about, so it is not this run page.
     if (host !== "github.com" || parsed.port !== "") {
@@ -147,12 +149,18 @@ function classifyArtifactUrl(value: string): ArtifactUrl {
     if (parsed.protocol !== "https:") return { kind: "insecure" };
     const id = runMatch[3]!.replace(AUTOLINK_TRAILING, "");
     if (!/^\d+$/.test(id)) return { kind: "ci-run-bad-id", id: runMatch[3]! };
-    return {
-      kind: "ci-run",
-      owner: runMatch[1]!,
-      repo: runMatch[2]!,
-      runId: id,
-    };
+    // owner/repo come out of the DECODED path and are interpolated into the API
+    // URL, so `demo%23` decodes to `demo#` and truncates the request to
+    // /repos/{owner}/{repo} — the validator would then judge the repository
+    // object as if it were a run. GitHub names cannot contain these characters,
+    // so refuse rather than encode: an encoded name is a 404 round trip for a
+    // repo that cannot exist.
+    const owner = runMatch[1]!;
+    const repo = runMatch[2]!;
+    if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
+      return { kind: "ci-run-bad-id", id: `${owner}/${repo}` };
+    }
+    return { kind: "ci-run", owner, repo, runId: id };
   }
 
   if (parsed.protocol !== "https:") return { kind: "insecure" };
@@ -225,21 +233,16 @@ function blankMarkdownNoise(body: string): string {
       continue;
     }
 
-    // Blank balanced comment pairs first, then decide whether an unbalanced
-    // opener remains. Counting markers is what makes a line like
-    // `<!-- a --> <!--` enter comment mode: testing `includes("-->")` said the
-    // line was closed, so a whole proof block hidden after the dangling opener
-    // was parsed as real claims while GitHub rendered none of it.
-    const withoutPairs = line.replace(/<!--[\s\S]*?-->/g, "");
-    if ((withoutPairs.match(/<!--/g) ?? []).length > 0) {
-      inComment = true;
-      out.push("");
-      continue;
-    }
-
     // A fence opener may be indented at most 3 spaces. At 4 it is an indented
     // code block, and treating it as a fence swallowed everything after it —
     // including a later `## Proof` heading and its claims.
+    //
+    // ORDER MATTERS, and both orders have been wrong once. Checking comments
+    // first let `` ``` <!-- `` enter comment mode instead of fence mode, so one
+    // `-->` reopened the document and everything GitHub renders as code became
+    // live claims. Checking fences first does NOT reintroduce the multi-marker
+    // comment bug, because a line that is not a fence opener still falls
+    // through to the marker count below.
     const indent = line.length - line.trimStart().length;
     const opener = indent <= 3 ? trimmed.match(/^(`{3,}|~{3,})/) : null;
     if (opener) {
@@ -253,11 +256,23 @@ function blankMarkdownNoise(body: string): string {
         marker[0] === "`" &&
         new RegExp(`\`{${marker.length},}`).test(trimmed.slice(marker.length));
       if (inlineSpan) {
-        out.push(withoutPairs.replace(/(`{3,})[\s\S]*?\1/g, ""));
+        out.push(line.replace(/(`{3,})[\s\S]*?\1/g, ""));
       } else {
         fence = marker;
         out.push("");
       }
+      continue;
+    }
+
+    // Blank balanced comment pairs, then decide whether an unbalanced opener
+    // remains. Counting markers is what makes a line like `<!-- a --> <!--`
+    // enter comment mode: testing `includes("-->")` said the line was closed,
+    // so a proof block hidden after the dangling opener was parsed as real
+    // claims while GitHub rendered none of it.
+    const withoutPairs = line.replace(/<!--[\s\S]*?-->/g, "");
+    if ((withoutPairs.match(/<!--/g) ?? []).length > 0) {
+      inComment = true;
+      out.push("");
       continue;
     }
 
@@ -453,6 +468,23 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
     return;
   }
 
+  // A directory is not an artifact. `git ls-files --error-unmatch` treats its
+  // argument as a PATHSPEC and succeeds for anything covering at least one
+  // tracked file, so `.` — or `proof/` — satisfied the tracked check on its own.
+  if (!statSync(full).isFile()) {
+    errors.push(`[${key}] File-path artifact must be a file, not a directory: ${artifact}`);
+    return;
+  }
+
+  // "Repository-relative" has to be enforced, not just documented: an absolute
+  // path inside the workspace passed both containment and the tracked check.
+  if (artifact.startsWith("/")) {
+    errors.push(
+      `[${key}] File-path artifact must be repository-relative, got: ${artifact}`
+    );
+    return;
+  }
+
   // Existing inside the checkout directory is not the claim. The claim is
   // "committed to the PR branch", and only git can answer it. This is what
   // excludes the nested gh-workflows checkout: the reusable workflow puts it at
@@ -465,12 +497,31 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
   // git said no. Distinguish "untracked" from "cannot answer": a workspace that
   // is not a git checkout (local usage, tests) leaves existence as the only
   // available evidence, which is the behaviour this function started from.
+  //
+  // "Cannot answer" is decided by the presence of `.git`, NOT by the exit code.
+  // Keying on `rev-parse` returning exactly "true" meant any git failure read as
+  // "not a checkout" and accepted — and the everyday cause of that in CI is
+  // `detected dubious ownership` (safe.directory) on container and self-hosted
+  // runners, which would silently reopen this hole with nothing in the log.
+  const looksLikeRepo = existsSync(resolve(root, ".git"));
   const insideRepo = git(["rev-parse", "--is-inside-work-tree"]);
-  if (insideRepo.ok && insideRepo.stdout === "true") {
+  const answered = insideRepo.ok && insideRepo.stdout === "true";
+
+  if (answered || looksLikeRepo) {
     errors.push(
       `[${key}] File path is not committed to the PR branch: ${artifact}`
     );
+    if (!answered) {
+      console.error(
+        `  (git could not be queried in ${root}: ${insideRepo.stderr || "no reason given"})`
+      );
+    }
+    return;
   }
+
+  console.log(
+    `ℹ [${key}] ${artifact} exists but ${root} is not a git checkout, so "committed to the PR branch" was not verified.`
+  );
 }
 
 /** realpath, falling back to the lexical path when it does not exist yet. */

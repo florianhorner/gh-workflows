@@ -52,13 +52,13 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Block present | PR body must contain `## Proof` at end-of-body |
-| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored — including checkbox lines fenced *inside* a real `## Proof` section |
+| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored — including checkbox lines fenced *inside* a real `## Proof` section. Fence and comment handling is approximate, not CommonMark-complete; see "Known gaps" |
 | Checked boxes have real artifacts | `https://` URL, test name, repo-relative file path, or `n/a — <reason>` |
 | Unchecked boxes | Either `n/a — <reason>` with a non-empty reason, or a real artifact, which is then validated like a checked one. `—`, `–` and a spaced `-` all separate the reason |
 | CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`.,:;!~)`) ignored — so every spelling that renders as a link to the run is looked up rather than waved through |
 | Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
 | Artifact URL scheme | `http://` is rejected |
-| File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules` |
+| File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
 | Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) parse identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
 | Inline `[proof: key]` tokens | Must match an existing proof line key |
@@ -362,7 +362,7 @@ regression test that fails against it.
   regex-based. `bun install --frozen-lockfile` pulled them on every PR of every
   consuming repo.
 
-### Adversarial follow-up (same branch)
+### Adversarial follow-up (same branch, two passes)
 
 A cross-model adversarial pass over the fixes above found that two of them were
 themselves wrong, and both are corrected here:
@@ -387,11 +387,45 @@ fence, blanking a later `## Proof` section and its claims; and lexical
 containment plus `existsSync` accepted a committed symlink pointing out of the
 checkout.
 
-Known gaps, deliberately not addressed here: strict mode keys on the *head* repo
-rather than the base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and
-unused), nothing requires any given proof key to be present, and the terminal
-`// Anything else: accept` still passes arbitrary prose — including a value with
-no `/` in it, which never reaches the file-path branch at all. All three change
+A second adversarial pass over those corrections found that moving comment
+detection ahead of fence detection had reopened the hidden-block class through
+the other door (`` ``` <!-- `` followed by `-->` made a fenced, unrendered proof
+block read as live evidence). Fences are checked first again; that does not
+reintroduce the multi-marker comment bug, because a line that is not a fence
+opener still reaches the marker count. The same pass found that `git ls-files`
+takes a *pathspec*, so a lone `.` satisfied the tracked check; that artifacts
+must now be files and repository-relative; that a decoded `#` in an owner or
+repo name retargeted the API request at the repository object instead of the
+run; and that keying "git cannot answer" on an exit code made every git failure
+fail open.
+
+### Known gaps
+
+**Markdown handling is approximate.** Fence and comment detection is a
+hand-rolled line scanner, not a CommonMark parser, and it has now been wrong in
+both directions twice. Specifically still open:
+
+- A fence indented to a nested list item's content column (4+ spaces) is not
+  recognised, so a `[proof: key]` token inside it is reported as dangling on
+  valid markdown.
+- A closing fence is honoured at any indent, while CommonMark caps it at 3, so
+  a 4-space-indented ```` ``` ```` inside a fence ends the block early.
+- An unbalanced `<!--` inside an inline code span swallows the rest of the
+  body, so a PR body that *discusses* comment stripping cannot pass.
+
+These are all "our model of markdown disagrees with CommonMark", which is a
+class that patching cannot close. The repository already declared `remark`,
+`remark-parse`, `unified` and `unist-util-visit` without ever wiring them up;
+adopting a real parser is the structural fix and is deliberately not attempted
+in this branch.
+
+**Also open, unchanged:** strict mode keys on the *head* repo rather than the
+base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and unused);
+nothing requires any given proof key to be present; the terminal
+`// Anything else: accept` still passes arbitrary prose, including a value with
+no `/` in it, which never reaches the file-path branch at all; and a run URL
+written as a markdown link (`[text](url)`) or an angle autolink (`<url>`) is not
+recognised as a run at all, so in CI it fails as a missing file path. All change
 semantics for existing PR bodies and are tracked separately.
 
 ## License

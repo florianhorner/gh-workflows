@@ -629,3 +629,141 @@ describe("a file-path artifact must be committed to the PR branch", () => {
     expect(res.out).toContain("escapes the repository checkout");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. Second adversarial pass, over the corrections themselves. The first
+//    correction moved comment detection ahead of fence detection and thereby
+//    reopened the same hidden-block class through the other door, so these
+//    pin the ORDER and the remaining artifact-shape holes.
+// ---------------------------------------------------------------------------
+
+describe("a fence opener is a fence even when it carries a comment marker", () => {
+  for (const marker of ["```", "~~~"] as const) {
+    it(`does not enter comment mode on \`${marker} <!--\``, async () => {
+      // GitHub reads `${marker} <!--` as a fence opener whose info string is
+      // `<!--`, so everything below is code and the rendered body has no proof
+      // block. Checking comments first made one `-->` reopen the document.
+      const res = await verify(
+        [
+          "A change with no evidence at all.",
+          "",
+          `${marker} <!--`,
+          "-->",
+          "",
+          "## Proof",
+          "",
+          "- [x] tests: FakeTest",
+          "",
+        ].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
+});
+
+describe("an artifact must name a committed file, not a container", () => {
+  function gitRepoWithProof(): string {
+    const d = workspace();
+    execFileSync("git", ["init", "-q"], { cwd: d });
+    mkdirSync(join(d, "proof"), { recursive: true });
+    writeFileSync(join(d, "proof", "real.txt"), "ok\n");
+    execFileSync("git", ["add", "proof/real.txt"], { cwd: d });
+    execFileSync(
+      "git",
+      ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
+      { cwd: d }
+    );
+    return d;
+  }
+
+  for (const dir of [".", "./", "proof/"] as const) {
+    it(`rejects "${dir}" instead of letting a directory satisfy the tracked check`, async () => {
+      // `git ls-files --error-unmatch` takes a PATHSPEC and succeeds for
+      // anything covering at least one tracked file, so a single dot cleared
+      // the check the README calls the strongest part of this gate.
+      const res = await verify(
+        bodyWith(`- [x] runtime: ${dir} [proof: runtime]`),
+        { GITHUB_WORKSPACE: gitRepoWithProof() }
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("must be a file, not a directory");
+    });
+  }
+
+  it("rejects an absolute path even when it points inside the checkout", async () => {
+    const ws = gitRepoWithProof();
+    const res = await verify(
+      bodyWith(`- [x] runtime: ${join(ws, "proof", "real.txt")} [proof: runtime]`),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("repository-relative");
+  });
+
+  it("accepts the committed file itself", async () => {
+    const res = await verify(
+      bodyWith("- [x] runtime: proof/real.txt [proof: runtime]"),
+      { GITHUB_WORKSPACE: gitRepoWithProof() }
+    );
+    expect(res.exitCode).toBe(0);
+  });
+
+  it("fails closed when .git is present but git cannot answer", async () => {
+    // Keying "cannot answer" on the exit code meant ANY git failure read as
+    // "not a checkout" and accepted. The everyday CI cause is safe.directory
+    // / dubious ownership on container and self-hosted runners, which would
+    // have silently reopened the whole tracked check with nothing in the log.
+    const ws = workspace();
+    writeFileSync(join(ws, ".git"), "gitdir: /nonexistent-gitdir\n");
+    mkdirSync(join(ws, "proof"), { recursive: true });
+    writeFileSync(join(ws, "proof", "fabricated.txt"), "x\n");
+    const res = await verify(
+      bodyWith("- [x] runtime: proof/fabricated.txt [proof: runtime]"),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("not committed to the PR branch");
+  });
+
+  it("says out loud when it could not verify a workspace that is no checkout", async () => {
+    // Local usage keeps working, but the skipped check is announced rather
+    // than silently passing as if it had run.
+    const ws = workspace();
+    mkdirSync(join(ws, "proof"), { recursive: true });
+    writeFileSync(join(ws, "proof", "plain.txt"), "x\n");
+    const res = await verify(
+      bodyWith("- [x] runtime: proof/plain.txt [proof: runtime]"),
+      { GITHUB_WORKSPACE: ws }
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("was not verified");
+  });
+});
+
+describe("decoding the run path must not retarget the API request", () => {
+  it("rejects an owner or repo that decodes to something GitHub cannot name", async () => {
+    // `demo%23` decodes to `demo#`, which truncated the interpolated request to
+    // /repos/{owner}/{repo} — so the validator judged the REPOSITORY object as
+    // if it were a run, and a repo object has no conclusion to fail on.
+    const res = await verify(
+      bodyWith(
+        "- [x] tests: https://github.com/florianhorner/demo%23/actions/runs/1 [proof: tests]"
+      )
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("unreadable run id");
+  });
+
+  it("treats the runs index as a generic URL, not a malformed run", async () => {
+    // `…/actions/runs/` has an empty id slot. It is not a run claim at all, so
+    // erroring on it would be a false rejection.
+    const res = await verify(
+      bodyWith(
+        "- [x] runtime: https://github.com/florianhorner/demo/actions/runs/ [proof: runtime]"
+      ),
+      { GITHUB_WORKSPACE: workspace() }
+    );
+    expect(res.exitCode).toBe(0);
+  });
+});
