@@ -229,17 +229,12 @@ describe("verify-proof-block", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  it("fails stale CI run when token + SHA mismatch is detected", async () => {
-    // Mock: we can't make real GitHub API calls in tests.
-    // This test verifies the error message format when the API returns stale data.
-    // We use a custom mock server via a test-only env override.
-    // For the purposes of this test suite, we verify the logic path exists
-    // by checking the code handles mismatched head_sha.
-
-    // This test is a documentation test — real stale-SHA validation is integration-tested
-    // by the CI workflow against real GitHub API. We mark it as demonstrating intent.
-    expect(true).toBe(true); // placeholder — see integration test in CI
-  });
+  // The stale-CI-run path is covered for real in
+  // __tests__/clean-integrate-witness.test.ts, which drives this script against
+  // a local API stub and real git fixtures. A placeholder asserting
+  // `expect(true).toBe(true)` stood here and claimed the path was
+  // "integration-tested by the CI workflow against real GitHub API" — there was
+  // no such test, so the file advertised coverage that existed nowhere.
 
   // ---------------------------------------------------------------------
   // Regression guard for the [proof: <KEY>] suffix bug.

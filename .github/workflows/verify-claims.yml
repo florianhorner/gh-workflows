@@ -31,10 +31,46 @@ jobs:
       !contains(fromJson('["dependabot[bot]","pre-commit-ci[bot]","github-actions[bot]"]'), github.event.pull_request.user.login)
 
     steps:
+      # Runs before the checkouts because it decides how much history to fetch.
+      - name: Fetch PR body
+        id: pr-body
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body ?? "";
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
+            core.info(`PR body length: ${body.length} chars`);
+            // The clean-integrate witness is the only thing here that reads git,
+            // and it is only ever consulted for a cited CI-run URL. No such URL
+            // means no git question, so the full history is dead weight — on a
+            // large consumer that is a ~570 MB fetch added to a 20 s job.
+            //
+            // Getting this wrong is safe in both directions: a false positive
+            // costs one needless deep fetch, and a false negative leaves a
+            // shallow clone in which the witness fails closed, i.e. the strict
+            // pre-change behaviour. It can never turn a refusal into an accept.
+            const citesCiRun = /\/actions\/runs\/\d+/.test(body);
+            core.info(`Cites a CI run URL: ${citesCiRun}`);
+            core.setOutput("cites_ci_run", String(citesCiRun));
+
+      # The full history is load-bearing, not hygiene. verify-proof-block.ts asks
+      # git whether a cited CI run's commit is this head minus a clean base
+      # integration (scripts/clean-integrate-witness.ts). That needs the head's
+      # ancestry — the run's commit, the merge's integrated parent, and the base
+      # branch to anchor it to. A depth-1 checkout cannot resolve any of them and
+      # the witness fails closed, so a shallow clone here does not weaken the
+      # check; it silently restores the old behaviour of calling every integrated
+      # branch stale. It is fetched only when the body cites a CI run at all.
+      #
+      # The quotes matter: GitHub expressions treat the number 0 as falsy, so the
+      # unquoted `&& 0 || 1` form always yields 1 and would make this shallow in
+      # exactly the case that needs depth.
       - name: Checkout PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: ${{ steps.pr-body.outputs.cites_ci_run == 'true' && '0' || '1' }}
           persist-credentials: false
 
       # Resolve the ref this workflow was itself called with, so the scripts we
@@ -94,21 +130,15 @@ jobs:
         working-directory: _gh_workflows/scripts
         run: bun install --frozen-lockfile
 
-      - name: Fetch PR body
-        id: pr-body
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const body = context.payload.pull_request.body ?? "";
-            const fs = require("fs");
-            fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
-            core.info(`PR body length: ${body.length} chars`);
-
       - name: Validate proof block
         working-directory: _gh_workflows/scripts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The clean-integrate witness anchors a merge's integrated parent to
+          # this branch. Without it the witness cannot tell a base integrate
+          # from `git merge any-other-branch`, and it refuses rather than guess.
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
           PR_BASE_REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
           OWNED_REPOS: ${{ inputs.owned_repos }}
