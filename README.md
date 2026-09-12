@@ -65,9 +65,10 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 A run is accepted when its `head_sha` **is** the PR head, or when the PR head is
 that commit with base integrations on top and no content of its own. Git's own
 three-way merge of the run's commit with the integrated parent must produce
-exactly the head's tree, and that parent must be content the PR's base branch
-already carries. Repeated integrations are fine; the head itself has to be the
-merge commit, so a commit pushed after the merge invalidates the block again.
+exactly the head's tree, and that parent must be a state the PR's base branch
+has actually been in — a commit on its first-parent chain. Repeated integrations
+are fine; the head itself has to be the merge commit, so a commit pushed after
+the merge invalidates the block again.
 
 This exists because two rules were in direct conflict. Branch protection that
 requires a branch to be up to date means landing any PR forces every other open
@@ -85,13 +86,21 @@ the author chooses the something: `git merge any-branch` satisfies every other
 condition by construction, so a head carrying code no run ever saw would be
 reported as proven.
 
+Reachability is not a strong enough anchor either, which cost a second round to
+learn. A base branch built from merged pull requests *reaches* every commit of
+every merged branch, including work-in-progress states it was never at, so
+`git merge some-previously-merged-branch` would have passed. The anchor is
+membership of the base branch's first-parent chain: the states the branch has
+actually been in.
+
 Still refused, each with its reason named in the message: content changed after
 the run, a conflicted or hand-resolved merge, an evil merge, `-s ours`, an
-octopus merge, a rebase, a run from an unrelated branch, a merge of a branch
-that is not the base, a run whose commit the base already contained (which would
-make the comparison vacuous), and any state git cannot adjudicate — a shallow
-clone, a missing object, a `merge-tree` too old to answer. Every one of those
-fails closed.
+octopus merge, a rebase, a run from an unrelated branch, a merge of anything the
+base branch was never at (including a branch it merely reaches), a base ref that
+resolves only as a tag, a run whose commit the base already contained (which
+would make the comparison vacuous), and any state git cannot adjudicate — a
+shallow clone, a missing object, an unreadable first-parent chain, a
+`merge-tree` too old to answer. Every one of those fails closed.
 
 The predicate is `scripts/clean-integrate-witness.ts`. It reads the head's
 ancestry with git, so the reusable workflow checks the PR head out with full
@@ -173,7 +182,11 @@ PR_BASE_REF=main                         # base branch; the clean-integrate
                                          # witness anchors a merge's integrated
                                          # parent to it and refuses without it
 GITHUB_WORKSPACE=/path/to/a/full/clone   # the witness runs git here, and checks
-                                         # this checkout is actually PR_HEAD_SHA
+                                         # this checkout is actually PR_HEAD_SHA.
+                                         # NOTE: this is also the "we are in CI"
+                                         # signal for file-path proof lines, so
+                                         # setting it locally makes a missing
+                                         # proof file a hard failure
 GITHUB_API_URL=https://api.github.com    # optional; override for GHES
 PR_HEAD_REPO_FULL_NAME=florianhorner/your-repo
 PR_BASE_REPO_FULL_NAME=florianhorner/your-repo

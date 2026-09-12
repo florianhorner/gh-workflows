@@ -19,7 +19,7 @@
  * that predicate, applied to CI runs:
  *
  *     merge_tree(run_head, base) produces exactly the PR head's tree,
- *     where `base` is landed content on the PR's actual base branch
+ *     where `base` is a state the PR's actual base branch has been in
  *
  * That second clause is load-bearing and was missing from the first draft of
  * this file, which an adversarial review caught before it shipped. Without it
@@ -27,9 +27,11 @@
  * *something* — and the author picks the something. `git merge evil-branch`
  * satisfies every other condition by construction, so a head carrying code no
  * CI run ever saw would have been reported as proven. The witness pulls content
- * out of that parent into the accepted answer, so the parent has to be content
- * the base branch already carries. `evidence.py::_assert_landed_base` makes the
- * same argument for the receipt witness in almost the same words.
+ * out of that parent into the accepted answer, so the parent has to be a state
+ * the base branch has actually been in. `evidence.py::_assert_landed_base` makes
+ * the same argument for the receipt witness, though it settles for reachability;
+ * a second adversarial pass showed reachability is not enough when the base
+ * branch itself contains merges, which it does in every repo consuming this.
  *
  * Everything else still fails. A commit that changes content after the run, a
  * conflicted or hand-resolved merge, an evil merge, `-s ours`, an octopus merge,
@@ -59,11 +61,20 @@ export interface GitResult {
 
 export type GitRunner = (args: string[]) => GitResult;
 
-export function makeGitRunner(cwd?: string): GitRunner {
+/**
+ * `env` exists for the test suite. The fixtures seal their own git off from the
+ * machine's global config, and without passing the same env here the predicate
+ * would recompute merges under the developer's `merge.*` / `diff.renames`
+ * settings while the fixture built them under defaults — a box with any of those
+ * set non-default could turn an accepting case red for a reason no reader would
+ * guess. Production passes nothing and inherits the runner's environment.
+ */
+export function makeGitRunner(cwd?: string, env?: NodeJS.ProcessEnv): GitRunner {
   return (args: string[]): GitResult => {
     try {
       const stdout = execFileSync("git", args, {
         cwd,
+        env,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 20_000,
@@ -97,6 +108,28 @@ function isAncestor(git: GitRunner, ancestor: string, descendant: string): boole
   if (r.ok) return true;
   if (r.code === 1) return false;
   return null; // 128 (missing object), killed process, git absent
+}
+
+/**
+ * Was `commit` ever the tip of `branch`?
+ *
+ * Not the same question as "is it reachable from `branch`", and the difference
+ * is the whole anchor. A base branch built by merging pull requests reaches
+ * every commit of every merged branch, including work-in-progress states it was
+ * never at — so reachability let an author integrate a previously-merged side
+ * branch and have this report "proven" for content the base never carried. The
+ * first-parent chain is exactly the sequence of states the branch has been in.
+ *
+ * null when git could not answer, which every caller treats as a refusal.
+ */
+function isOnFirstParentChain(
+  git: GitRunner,
+  commit: string,
+  branch: string
+): boolean | null {
+  const r = git(["rev-list", "--first-parent", "--format=%H", branch]);
+  if (!r.ok) return null;
+  return r.stdout.split("\n").some((line) => line.trim() === commit);
 }
 
 export interface WitnessResult {
@@ -136,12 +169,18 @@ export interface WitnessInput {
  *
  * A fork PR is checked out from the BASE repository, so `origin` is the base
  * repo in both cases and `refs/remotes/origin/<ref>` is the right answer. The
- * two fallbacks cover a local invocation, where the checkout may have the branch
- * only as a local head. Nothing is guessed: if none of the three resolve, the
- * caller fails closed.
+ * fallback covers a local invocation, where the checkout may have the branch only
+ * as a local head. Nothing is guessed: if neither resolves, the caller fails
+ * closed.
+ *
+ * A third candidate — the bare ref — used to sit at the end. It bought nothing
+ * (the two explicit namespaces already cover CI and local clones) and cost
+ * something: rev-parse resolves a bare name through refs/tags first, so a tag
+ * sharing the base branch's name pointed the anchor at whatever the tag pointed
+ * at. Narrow to reach, but a PR base is never a tag.
  */
 function resolveBaseBranch(git: GitRunner, baseRef: string): string | null {
-  for (const candidate of [`refs/remotes/origin/${baseRef}`, `refs/heads/${baseRef}`, baseRef]) {
+  for (const candidate of [`refs/remotes/origin/${baseRef}`, `refs/heads/${baseRef}`]) {
     const oid = resolve(git, candidate);
     if (oid) return oid;
   }
@@ -164,9 +203,11 @@ function resolveBaseBranch(git: GitRunner, baseRef: string): string | null {
  *     that happens to produce the same tree is not evidence about this PR;
  *  4. `prHead` is a two-parent merge — with no merge there was no integration,
  *     and an octopus merge is not one either;
- *  5. the merged-in parent is content the PR's base branch already carries —
- *     without this the author chooses what gets merged in, and any branch at
- *     all would satisfy condition 7;
+ *  5. the merged-in parent is a state the PR's base branch has actually been in
+ *     — its first-parent chain, not merely something the branch can reach.
+ *     Without any anchor the author chooses what gets merged in and any branch
+ *     satisfies condition 7; with mere reachability the choice is still wide
+ *     enough to pull in any previously-merged side branch;
  *  6. `runHead` is NOT already contained in that parent — otherwise merge_tree
  *     collapses to the base's tree and the comparison is vacuous, accepting a
  *     run that predates the PR's own work;
@@ -204,12 +245,17 @@ export function cleanIntegrateWitness(git: GitRunner, input: WitnessInput): Witn
   if (!baseBranch) {
     return no("unresolvable", `base branch ${baseRef} does not resolve in this clone`);
   }
-  const baseIsLanded = isAncestor(git, base, baseBranch);
+  const baseIsLanded = isOnFirstParentChain(git, base, baseBranch);
   if (baseIsLanded !== true) {
-    return no(
-      baseIsLanded === null ? "unresolvable" : "base-not-on-base-branch",
-      `merged-in parent ${base} is not contained in ${baseRef}`
-    );
+    // The detail must not assert what git declined to determine: when the
+    // answer is null, git could not read the chain, which is a different
+    // statement from "your parent is not on it".
+    return baseIsLanded === null
+      ? no("unresolvable", `cannot read the first-parent chain of ${baseRef}`)
+      : no(
+          "base-not-on-base-branch",
+          `merged-in parent ${base} was never a state of ${baseRef}`
+        );
   }
 
   const runInBase = isAncestor(git, run, base);
@@ -233,7 +279,9 @@ export function cleanIntegrateWitness(git: GitRunner, input: WitnessInput): Witn
   const headTree = git(["rev-parse", `${head}^{tree}`]);
   if (!headTree.ok) return no("unresolvable", headTree.stderr);
 
-  return merged.stdout === headTree.stdout
+  // Every other rev in this file is shape-checked; this is the comparison that
+  // decides the verdict, and "" === "" would read as accepted.
+  return FULL_OID.test(merged.stdout) && merged.stdout === headTree.stdout
     ? { accepted: true, reason: "accepted" }
     : no("drift");
 }

