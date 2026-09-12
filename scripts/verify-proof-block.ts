@@ -51,9 +51,16 @@ const PR_HEAD_SHA = process.env.PR_HEAD_SHA ?? "";
 const PR_BASE_REF = process.env.PR_BASE_REF ?? "";
 const PR_HEAD_REPO = process.env.PR_HEAD_REPO_FULL_NAME ?? "";
 const PR_BASE_REPO = process.env.PR_BASE_REPO_FULL_NAME ?? "";
-// GitHub Actions sets GITHUB_API_URL natively (and to the right value on GHES).
-// Honouring it also lets the test suite point the verifier at a local stub and
-// exercise the CI-run path end to end instead of only its parts.
+// Honouring GITHUB_API_URL lets the test suite point the verifier at a local
+// stub and exercise the CI-run path end to end instead of only its parts.
+//
+// It is NOT GHES support, and an earlier version of this comment wrongly implied
+// it was. CI_RUN_RE below only recognises `https://github.com/...`, so a GHES run
+// URL never reaches validateCIRun at all: it falls through to the generic-URL
+// branch and is accepted without the conclusion check or the content witness.
+// Supporting GHES means teaching URL recognition the configured host and mapping
+// its API URL to its web URL, which nothing here exercises — so the claim is
+// dropped rather than the limitation hidden.
 const GITHUB_API_URL = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
 const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
   .split(",")
