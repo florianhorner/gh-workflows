@@ -28,6 +28,11 @@
 
 import { readFileSync, existsSync, realpathSync, statSync } from "fs";
 import { resolve, sep } from "path";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkRehype from "remark-rehype";
+import rehypeRaw from "rehype-raw";
+import { parseFragment } from "parse5";
 import {
   cleanIntegrateWitness,
   makeGitRunner,
@@ -187,154 +192,189 @@ function readBody(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: strip HTML comments and code fences, then find ## Proof section
+// Step 2: parse Markdown and HTML once, retaining source coordinates
 // ---------------------------------------------------------------------------
 
-/**
- * Blanks HTML comments and fenced code blocks, keeping the line count intact.
- *
- * One stripper for all three call sites. There used to be three, and they
- * disagreed:
- *
- *  - extractProofSection ran a paired-fence regex to FIND the heading, then a
- *    separate line-state machine to RE-LOCATE it in the original body;
- *  - validateInlineTokens ran a third variant that handled ``` but not ~~~,
- *    so a proof token inside a `~~~` block was reported as dangling on a body
- *    that is perfectly valid markdown.
- *
- * The state machine also latched on a line that merely STARTS with an inline
- * triple-backtick span (`` ```bun test``` passes now ``): it set inFence and
- * never found a closer, so a `## Proof` heading further down became invisible
- * and the validator denied a section it could plainly see. An opener that
- * closes on its own line is inline code, not a fence.
- */
-function blankMarkdownNoise(body: string): string {
+// These are the shared structural fields used by both mdast and hast. Neither
+// tree's normalized text is an artifact: validation still receives source text.
+interface SyntaxNode {
+  type: string;
+  value?: string;
+  depth?: number;
+  tagName?: string;
+  children?: SyntaxNode[];
+  position?: {
+    start: { line: number; offset?: number };
+    end?: { offset?: number };
+  };
+}
+
+type SourceRange = [start: number, end: number];
+
+const markdownParser = unified()
+  .use(remarkParse)
+  .use(remarkRehype, { allowDangerousHtml: true })
+  .use(rehypeRaw);
+
+function walk(node: SyntaxNode, visit: (node: SyntaxNode) => boolean | void): void {
+  if (visit(node) === false) return;
+  for (const child of node.children ?? []) walk(child, visit);
+}
+
+function sourceRange(node: SyntaxNode): SourceRange | null {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  return start !== undefined && end !== undefined && end >= start
+    ? [start, end]
+    : null;
+}
+
+/** Remove only parser-identified ranges; never interpret Markdown with regex. */
+function omitRanges(source: string, ranges: SourceRange[], blank = false): string {
+  let cursor = 0;
   const out: string[] = [];
-  let inComment = false;
-  let fence: string | null = null;
-
-  for (const raw of body.split("\n")) {
-    // CRLF bodies: see parseProofLines.
-    const line = raw.replace(/\r+$/, "");
-    const trimmed = line.trim();
-
-    if (inComment) {
-      out.push("");
-      if (trimmed.includes("-->")) inComment = false;
-      continue;
+  for (const [start, end] of [...ranges].sort((a, b) => a[0] - b[0])) {
+    if (end <= cursor) continue;
+    out.push(source.slice(cursor, Math.max(cursor, start)));
+    if (blank) {
+      out.push(source.slice(Math.max(cursor, start), end).replace(/[^\n]/g, " "));
     }
-
-    if (fence !== null) {
-      out.push("");
-      // Closer: same character, at least as long, alone on the line.
-      if (new RegExp(`^${fence[0]}{${fence.length},}\\s*$`).test(trimmed)) {
-        fence = null;
-      }
-      continue;
-    }
-
-    // A fence opener may be indented at most 3 spaces. At 4 it is an indented
-    // code block, and treating it as a fence swallowed everything after it —
-    // including a later `## Proof` heading and its claims.
-    //
-    // ORDER MATTERS, and both orders have been wrong once. Checking comments
-    // first let `` ``` <!-- `` enter comment mode instead of fence mode, so one
-    // `-->` reopened the document and everything GitHub renders as code became
-    // live claims. Checking fences first does NOT reintroduce the multi-marker
-    // comment bug, because a line that is not a fence opener still falls
-    // through to the marker count below.
-    const indent = line.length - line.trimStart().length;
-    const opener = indent <= 3 ? trimmed.match(/^(`{3,}|~{3,})/) : null;
-    if (opener) {
-      const marker = opener[1]!;
-      // The inline-span shortcut applies to BACKTICKS ONLY. CommonMark forbids
-      // backticks in a backtick fence's info string, so a second run on the
-      // same line really does mean inline code. A tilde fence's info string MAY
-      // contain tildes, so `~~~ template ~~~` is a genuine opener — reading it
-      // as an inline span left the fenced lines in place as live claims.
-      const inlineSpan =
-        marker[0] === "`" &&
-        new RegExp(`\`{${marker.length},}`).test(trimmed.slice(marker.length));
-      if (inlineSpan) {
-        out.push(line.replace(/(`{3,})[\s\S]*?\1/g, ""));
-      } else {
-        fence = marker;
-        out.push("");
-      }
-      continue;
-    }
-
-    // Blank balanced comment pairs, then decide whether an unbalanced opener
-    // remains. Counting markers is what makes a line like `<!-- a --> <!--`
-    // enter comment mode: testing `includes("-->")` said the line was closed,
-    // so a proof block hidden after the dangling opener was parsed as real
-    // claims while GitHub rendered none of it.
-    const withoutPairs = line.replace(/<!--[\s\S]*?-->/g, "");
-    if ((withoutPairs.match(/<!--/g) ?? []).length > 0) {
-      inComment = true;
-      out.push("");
-      continue;
-    }
-
-    out.push(withoutPairs);
+    cursor = end;
   }
-
-  return out.join("\n");
+  out.push(source.slice(cursor));
+  return out.join("");
 }
 
 /**
- * Returns the markdown content of the ## Proof section, anchored to
- * end-of-body, with comments and fenced blocks blanked out. The section starts
- * at the last `## Proof` heading that is NOT inside an HTML comment or code
- * fence.
+ * A Markdown node may only supply evidence if it remains an HTML element after
+ * raw HTML is parsed. Source coordinates join the two trees, so raw <h2>/<li>
+ * tags cannot invent Markdown proof entries. Reference checks include visible
+ * HTML text, but never HTML attributes, comments, or code examples.
  *
- * The returned text is the BLANKED text, not the original. The old version
- * returned the original slice "because we need original text for URL
- * validation etc." — but nothing in the section needs it, and returning it
- * meant a checkbox line inside a fence *within* the section was parsed as a
- * real proof claim. A `- [x] runtime: FakeArtifact` inside a block labelled
- * "Template:" counted as satisfied runtime evidence.
+ * rehype-raw recovers from incomplete raw tokens when it meets a structured
+ * node. In particular, `<!-- a --> <!--` does NOT hide the following heading
+ * there, although a browser consuming serialized HTML would still be inside
+ * the comment. Reject incomplete HTML with parse5 before that recovery occurs.
+ * This check is scoped to real HTML nodes: `<!--` in inline code or in a quoted
+ * HTML attribute cannot accidentally change the document's comment state.
  */
-function extractProofSection(body: string): string | null {
-  const lines = blankMarkdownNoise(body).split("\n");
+function parseProofDocument(body: string): {
+  proofLines: ProofLine[] | null;
+  tokenText: string;
+} {
+  // Normalize before parsing so both trees and every source slice agree on
+  // offsets, including bodies authored with CRLF in GitHub's editor.
+  const source = body.replace(/\r\n?/g, "\n");
+  const markdown = markdownParser.parse(source);
+  const headings: SyntaxNode[] = [];
+  const items: SyntaxNode[] = [];
+  const comments: SourceRange[] = [];
+  const excluded: SourceRange[] = [];
 
-  let lastProofLine = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Proof\s*$/.test(lines[i]!.trim())) lastProofLine = i;
+  walk(markdown, (node) => {
+    const range = sourceRange(node);
+    if (node.type === "code" || node.type === "inlineCode") {
+      if (range) excluded.push(range);
+      return false;
+    }
+    if (node.type === "html") {
+      const fragment = parseFragment(node.value ?? "", {
+        onParseError(error) {
+          if (error.code.startsWith("eof-")) {
+            throw new Error(
+              "PR body does not contain a ## Proof section whose visibility can be verified: " +
+              `incomplete HTML at line ${node.position?.start.line} (${error.code}).`
+            );
+          }
+        },
+      });
+      if (range) {
+        excluded.push(range);
+        // Preserve the existing removal of comments from artifact lines, but
+        // leave actual HTML tags, link wrappers, and inline-code values intact.
+        if (
+          fragment.childNodes.some((child) => child.nodeName === "#comment") &&
+          fragment.childNodes.every((child) =>
+            child.nodeName === "#comment" ||
+            (child.nodeName === "#text" && "value" in child && !child.value.trim())
+          )
+        ) {
+          comments.push(range);
+        }
+      }
+      return false;
+    }
+    if (node.type === "heading" && node.depth === 2) headings.push(node);
+    if (node.type === "listItem" && node.children?.[0]?.type === "paragraph") {
+      items.push(node);
+    }
+  });
+
+  const html = markdownParser.runSync(markdown);
+  const visibleHeadings = new Set<number>();
+  const visibleItems = new Set<number>();
+  const visibleText: string[] = [];
+  const literalElements = new Set([
+    "code", "pre", "script", "style", "textarea", "title", "iframe",
+    "noembed", "noframes", "xmp", "plaintext", "template", "noscript",
+  ]);
+  walk(html, (node) => {
+    const range = sourceRange(node);
+    if (node.type === "element" && literalElements.has(node.tagName ?? "")) {
+      if (!range) {
+        throw new Error("Cannot determine the source range of an HTML code container.");
+      }
+      excluded.push(range);
+      visibleText.push("\n");
+      return false;
+    }
+    if (node.type === "element" && range) {
+      if (node.tagName === "h2") visibleHeadings.add(range[0]);
+      if (node.tagName === "li") visibleItems.add(range[0]);
+    }
+    if (node.type === "text") visibleText.push(node.value ?? "");
+  });
+
+  function sourceLine(node: SyntaxNode): string {
+    const offset = node.position!.start.offset!;
+    const start = source.lastIndexOf("\n", offset - 1) + 1;
+    const next = source.indexOf("\n", offset);
+    const end = next < 0 ? source.length : next;
+    const lineComments: SourceRange[] = comments
+      .filter(([a, b]) => a < end && b > start)
+      .map(([a, b]) => [Math.max(a, start) - start, Math.min(b, end) - start]);
+    return omitRanges(source.slice(start, end), lineComments);
   }
-  if (lastProofLine === -1) return null;
 
-  return lines.slice(lastProofLine).join("\n");
-}
+  // Keep the exact source grammar and the last matching heading through EOF.
+  // Node slices alone would erase `>` / list prefixes and broaden that grammar.
+  const proofHeading = headings.filter((node) =>
+    visibleHeadings.has(node.position!.start.offset!) &&
+    /^##\s+Proof\s*$/.test(sourceLine(node).trim())
+  ).at(-1);
+  // Keep source spelling (including reference-link brackets) and also inspect
+  // HTML text. A raw <div> can contain visible tokens as well as hidden markup;
+  // excluding the entire raw node without this second projection hides claims.
+  // Both projections come from this parse, and validation deduplicates keys.
+  const sourceTokens = omitRanges(omitRanges(source, excluded, true), comments);
+  const tokenText = sourceTokens + "\n" + visibleText.join("");
+  if (!proofHeading) return { proofLines: null, tokenText };
 
-// ---------------------------------------------------------------------------
-// Step 3: parse proof lines
-// ---------------------------------------------------------------------------
-
-function parseProofLines(section: string): ProofLine[] {
-  const lines = section.split("\n");
-  const result: ProofLine[] = [];
-
-  for (const raw of lines) {
-    // Strip a trailing CR before matching. GitHub stores browser-authored and
-    // browser-edited PR bodies with CRLF endings, and in JS `.` excludes \r
-    // while `$` here is not multiline-anchored — so on a CRLF body the value
-    // capture could never reach end-of-string and EVERY proof line was
-    // dropped. The heading survived (it is matched against line.trim()), so
-    // the failure reported "no checkbox lines" plus a dangling token for each
-    // real claim: three errors, none of them the cause. The caller's
-    // `types: [edited]` re-runs the gate the moment someone fixes a typo in
-    // the description, which is exactly when this fired.
-    const line = raw.replace(/\r+$/, "");
-    // Match: - [x] key: value  OR  - [ ] key: value
-    const m = line.match(/^-\s+\[([ xX])\]\s+(\S+?):\s+(.*)$/);
-    if (!m) continue;
-    const checked = m[1].toLowerCase() === "x";
-    const key = m[2];
-    const value = stripTrailingProofTag(m[3].trim());
-    result.push({ key, checked, value, raw: line });
+  const proofLines: ProofLine[] = [];
+  for (const node of items) {
+    const offset = node.position!.start.offset!;
+    if (offset <= proofHeading.position!.start.offset! || !visibleItems.has(offset)) continue;
+    const raw = sourceLine(node);
+    const match = raw.match(/^-\s+\[([ xX])\]\s+(\S+?):\s+(.*)$/);
+    if (!match) continue;
+    proofLines.push({
+      key: match[2]!,
+      checked: match[1]!.toLowerCase() === "x",
+      value: stripTrailingProofTag(match[3]!.trim()),
+      raw,
+    });
   }
-  return result;
+  return { proofLines, tokenText };
 }
 
 /**
@@ -752,23 +792,21 @@ async function validateCIRun(
 // ---------------------------------------------------------------------------
 
 function validateInlineTokens(
-  body: string,
+  tokenText: string,
   proofLines: ProofLine[],
   errors: string[]
 ): void {
   const proofKeys = new Set(proofLines.map((l) => l.key));
+  const seen = new Set<string>();
   const tokenRe = /\[proof:\s*([^\]]+)\]/g;
 
-  // Find all [proof: key] tokens in the body (skip inside code fences /
-  // comments). Uses the same stripper as extractProofSection so the two can
-  // never disagree about what counts as a fence; inline single-backtick code
-  // is stripped only here, because a proof line's value may legitimately be
-  // wrapped in backticks and must survive parseProofLines.
-  const strippedBody = blankMarkdownNoise(body).replace(/`[^`]+`/g, "");
-
+  // Exclusions come from the same parsed document that authorized the lines.
+  // Raw token spelling is preserved; escaped or mismatched backticks are text.
   let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(strippedBody)) !== null) {
+  while ((m = tokenRe.exec(tokenText)) !== null) {
     const ref = m[1].trim();
+    if (seen.has(ref)) continue;
+    seen.add(ref);
     if (!proofKeys.has(ref)) {
       errors.push(
         `Dangling [proof: ${ref}] token — no proof line with key "${ref}" found.`
@@ -786,8 +824,8 @@ async function main(): Promise<void> {
   const errors: string[] = [];
 
   // 1. Find proof section
-  const proofSection = extractProofSection(body);
-  if (!proofSection) {
+  const { proofLines, tokenText } = parseProofDocument(body);
+  if (proofLines === null) {
     console.error(
       "ERROR: PR body does not contain a ## Proof section anchored to end-of-body."
     );
@@ -797,8 +835,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 2. Parse proof lines
-  const proofLines = parseProofLines(proofSection);
+  // 2. Require at least one visible checkbox entry
   if (proofLines.length === 0) {
     errors.push(
       "## Proof section found but contains no checkbox lines. Add at least one proof entry."
@@ -823,7 +860,7 @@ async function main(): Promise<void> {
   );
 
   // 5. Validate inline [proof: key] tokens
-  validateInlineTokens(body, proofLines, errors);
+  validateInlineTokens(tokenText, proofLines, errors);
 
   // 6. Report
   if (errors.length > 0) {

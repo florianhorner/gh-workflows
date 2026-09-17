@@ -14,7 +14,8 @@ import { join } from "node:path";
 // never recognised at all and fell into the generic-URL accept behind it, while
 // the rendered PR body still links to the same run page.
 
-const SCRIPT = `${import.meta.dir}/../verify-proof-block.ts`;
+// Test-only override for proving regressions against an immutable old parser.
+const SCRIPT = process.env.PROOF_TEST_SCRIPT ?? `${import.meta.dir}/../verify-proof-block.ts`;
 
 let servers: ReturnType<typeof Bun.serve>[] = [];
 let dirs: string[] = [];
@@ -766,4 +767,306 @@ describe("decoding the run path must not retarget the API request", () => {
     );
     expect(res.exitCode).toBe(0);
   });
+});
+
+// Every test in this group fails against 9353434. Keep controls that already
+// passed there in the separate compatibility group below, so a filtered run
+// proves each regression independently of the current parser implementation.
+describe("CommonMark regressions", () => {
+  const proofAfter = (prefix: string) =>
+    `${prefix}\n\n## Proof\n- [x] tests: TestThing`;
+
+  const validBodies = [
+    [
+      "a token inside a nested-list tilde fence",
+      proofAfter("- outer\n  - inner\n\n    ~~~\n    [proof: missing]\n    ~~~"),
+    ],
+    [
+      "a token inside a blockquote tilde fence",
+      proofAfter("> ~~~\n> [proof: missing]\n> ~~~"),
+    ],
+    ["a token inside indented code", proofAfter("    [proof: missing]")],
+    ["a comment opener inside inline code", proofAfter("Use `<!--` to begin a comment.")],
+    ["a comment opener inside a double-backtick span", proofAfter("Use ``<!--`` syntax.")],
+    ["an escaped comment opener", proofAfter("Use \\<!-- as literal text.")],
+    ["a comment marker inside an HTML attribute", proofAfter('<div title="<!--">Notes</div>')],
+    ["a comment marker inside script text", proofAfter('<script>const marker = "<!--";</script>')],
+    ["a token inside an HTML attribute", proofAfter('<div title="[proof: missing]">Notes</div>')],
+    ["a token inside raw HTML code", proofAfter("<div><code>[proof: missing]</code></div>")],
+    ["a token inside raw HTML preformatted text", proofAfter("<div><pre>[proof: missing]</pre></div>")],
+    ["a matching token split by inline HTML", proofAfter("<div>[proof: <em>tests</em>]</div>")],
+  ] as const;
+
+  for (const [label, body] of validBodies) {
+    it(`accepts ${label} before real proof`, async () => {
+      const res = await verify(body);
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+  }
+
+  it("accepts a nested-list code token in a CRLF body", async () => {
+    const body = proofAfter(
+      "- outer\n  - inner\n\n    ~~~\n    [proof: missing]\n    ~~~"
+    ).replace(/\n/g, "\r\n");
+    const res = await verify(body);
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  for (const marker of ["```", "~~~"] as const) {
+    it(`rejects a hidden Proof heading after an over-indented ${marker} closer`, async () => {
+      const res = await verify(
+        [marker, `    ${marker}`, "## Proof", "- [x] tests: TestThing"].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+
+    it(`rejects a hidden checkbox after an over-indented ${marker} closer`, async () => {
+      const res = await verify(
+        ["## Proof", marker, `    ${marker}`, "- [x] tests: TestThing"].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("no checkbox lines");
+    });
+  }
+
+  it("rejects a hidden Proof heading after a CRLF over-indented closer", async () => {
+    const res = await verify(
+      ["```", "    ```", "## Proof", "- [x] tests: TestThing"].join("\r\n")
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("does not contain a ## Proof section");
+  });
+
+  for (const [label, indent] of [["four spaces", "    "], ["a tab", "\t"]] as const) {
+    it(`rejects an indented-code Proof heading with ${label}`, async () => {
+      const res = await verify(`${indent}## Proof\n\n- [x] tests: TestThing`);
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
+
+  for (const tag of ["div", "script"] as const) {
+    it(`rejects a Proof block contained in raw ${tag} HTML`, async () => {
+      const res = await verify(
+        [`<${tag}>`, "## Proof", "- [x] tests: TestThing", `</${tag}>`].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+
+    it(`rejects the only checkbox when it is raw ${tag} HTML`, async () => {
+      const res = await verify(
+        ["## Proof", `<${tag}>`, "- [x] tests: TestThing", `</${tag}>`].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("no checkbox lines");
+    });
+  }
+
+  for (const [label, prefix] of [
+    ["unequal backtick delimiters", "``[proof: missing]`"],
+    ["escaped backticks", "\\`[proof: missing]\\`"],
+  ] as const) {
+    it(`rejects a visible dangling token surrounded by ${label}`, async () => {
+      const res = await verify(proofAfter(prefix));
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("Dangling [proof: missing]");
+    });
+  }
+
+  it("rejects a visible token whose marker is split by inline HTML", async () => {
+    const res = await verify(proofAfter("<div>[pro<strong>of</strong>: missing]</div>"));
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("Dangling [proof: missing]");
+  });
+
+  for (const tag of ["pre", "template", "code"] as const) {
+    it(`rejects a Proof heading inside ${tag} across blank lines`, async () => {
+      const res = await verify(
+        [`<${tag}>`, "", "## Proof", "- [x] tests: TestThing", "", `</${tag}>`].join("\n")
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
+
+  it("rejects Proof swallowed by an unfinished HTML attribute", async () => {
+    const res = await verify(proofAfter('<div title="'));
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("does not contain a ## Proof section");
+  });
+
+  for (const [label, prefix, suffix] of [
+    ["a multiline comment", "<!-- start\nclosed --> <!--", "-->"],
+    ["mixed raw HTML", "<div><!-- start\nclosed --> <!--", "-->\n</div>"],
+  ] as const) {
+    it(`rejects Proof hidden by a second comment opener after ${label}`, async () => {
+      const res = await verify(`${proofAfter(prefix)}\n${suffix}`);
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
+});
+
+describe("CommonMark compatibility", () => {
+  const runUrl = "https://github.com/florianhorner/demo/actions/runs/123";
+
+  for (const [label, heading] of [
+    ["a list-prefixed heading", "- ## Proof"],
+    ["a blockquote-prefixed heading", "> ## Proof"],
+    ["closing heading hashes", "## Proof ##"],
+    ["a setext heading", "Proof\n-----"],
+    ["an emphasized heading", "## **Proof**"],
+    ["an inline-code heading label", "## `Proof`"],
+    ["an inline-code heading example", "`## Proof`"],
+  ] as const) {
+    it(`retains the exact heading grammar for ${label}`, async () => {
+      const res = await verify(`${heading}\n\n- [x] tests: TestThing`);
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
+
+  for (const eol of ["\n", "\r\n"] as const) {
+    it(`accepts an existing list-continuation Proof heading with ${JSON.stringify(eol)}`, async () => {
+      const api = stubApi("success", "cafebabe");
+      const res = await verify(
+        ["- item", "  ## Proof", "", `- [x] tests: ${runUrl} [proof: tests]`].join(eol),
+        { GITHUB_API_URL: api }
+      );
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+  }
+
+  it("selects the last matching heading and ignores an earlier failed claim", async () => {
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      [
+        "## Proof", `- [x] old: ${runUrl}`, "",
+        "## Proof", "- [x] tests: TestThing",
+      ].join("\n"),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  it("continues validating through EOF after an unrelated later heading", async () => {
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      [
+        "## Proof", "- [x] tests: TestThing", "",
+        "## Later", `- [ ] later: ${runUrl}`,
+      ].join("\n"),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('[later] CI run 123 conclusion is "failure"');
+  });
+
+  for (const box of ["x", "X", " "] as const) {
+    it(`validates a failed run carried by a [${box}] checkbox`, async () => {
+      const api = stubApi("failure", "cafebabe");
+      const res = await verify(bodyWith(`- [${box}] tests: ${runUrl}`), {
+        GITHUB_API_URL: api,
+      });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('conclusion is "failure"');
+    });
+  }
+
+  it("keeps unchecked n/a with a reason and checked test-name artifacts", async () => {
+    const res = await verify(
+      [
+        "## Proof", "- [x] tests: TestThing [proof: tests]",
+        "- [ ] schema: n/a — no schema changes [proof: schema]",
+      ].join("\n")
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("2 proof line(s) checked");
+  });
+
+  for (const [label, artifact] of [
+    ["backticks", `\`${runUrl}\``],
+    ["a Markdown link", `[run](${runUrl})`],
+    ["an angle autolink", `<${runUrl}>`],
+  ] as const) {
+    it(`preserves the raw artifact wrapped in ${label}`, async () => {
+      const api = stubApi("success", "cafebabe");
+      const res = await verify(bodyWith(`- [x] tests: ${artifact} [proof: tests]`), {
+        GITHUB_API_URL: api,
+        GITHUB_WORKSPACE: workspace(),
+      });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain(`File path does not exist: ${artifact}`);
+    });
+  }
+
+  const htmlPreambles = [
+    ["adjacent complete comments", "<!-- first --> <!-- second -->"],
+    ["a multiline complete comment", "<!-- first\nsecond -->"],
+    ["a prose-inline comment", "Text <!-- [proof: missing] --> continues."],
+    ["a mixed HTML comment", "<div><!-- [proof: missing] --></div>"],
+    ["an ordinary HTML attribute", '<div title="Notes">Text</div>'],
+    ["complete comment text inside an attribute", '<div title="<!-- marker -->">Text</div>'],
+    ["details markup", "<details>\n<summary>More</summary>\n\nNotes.\n</details>"],
+  ] as const;
+
+  for (const [label, prefix] of htmlPreambles) {
+    it(`accepts ${label} before real proof`, async () => {
+      const res = await verify(`${prefix}\n\n## Proof\n- [x] tests: TestThing`);
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+  }
+
+  it("preserves inline comments in a visible heading and artifact", async () => {
+    const res = await verify(
+      "## Pro<!-- heading -->of\n- [x] tests: Test<!-- artifact -->Thing"
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  for (const [label, html] of [
+    ["a div", "<div>[proof: missing]</div>"],
+    ["details", "<details><summary>[proof: missing]</summary></details>"],
+    ["a table", "<table><tr><td>[proof: missing]</td></tr></table>"],
+    ["an inline tag inside the key", "<div>[proof: <em>missing</em>]</div>"],
+  ] as const) {
+    it(`rejects a visible dangling token in ${label}`, async () => {
+      const res = await verify(`${html}\n\n## Proof\n- [x] tests: TestThing`);
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("Dangling");
+    });
+  }
+
+  it("accepts actual Markdown proof inside details separated by blank lines", async () => {
+    const api = stubApi("success", "cafebabe");
+    const res = await verify(
+      [
+        "<details>", "<summary>Proof details</summary>", "", "## Proof",
+        `- [x] tests: ${runUrl}`, "", "</details>",
+      ].join("\n"),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  for (const [label, prefix] of [
+    ["adjacent comment openers", "<!-- first --> <!--"],
+    ["a raw HTML comment opener", "<div><!--"],
+    ["a comment followed by mixed HTML", "<!-- first --><div><!--"],
+  ] as const) {
+    it(`rejects hidden proof after ${label}`, async () => {
+      const res = await verify(`${prefix}\n\n## Proof\n- [x] tests: TestThing\n-->`);
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("does not contain a ## Proof section");
+    });
+  }
 });

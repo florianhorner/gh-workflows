@@ -52,7 +52,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Block present | PR body must contain `## Proof` at end-of-body |
-| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored — including checkbox lines fenced *inside* a real `## Proof` section. Fence and comment handling is approximate, not CommonMark-complete; see "Known gaps" |
+| Markdown structure | Headings and checkboxes must be real Markdown nodes that survive HTML parsing. Fenced or indented examples, raw HTML lookalikes, and commented-out claims do not count |
 | Checked boxes have real artifacts | `https://` URL, test name, repo-relative file path, or `n/a — <reason>` |
 | Unchecked boxes | Either `n/a — <reason>` with a non-empty reason, or a real artifact, which is then validated like a checked one. `—`, `–` and a spaced `-` all separate the reason |
 | CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`.,:;!~)`) ignored — so every spelling that renders as a link to the run is looked up rather than waved through |
@@ -61,7 +61,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
 | Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) parse identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
-| Inline `[proof: key]` tokens | Must match an existing proof line key |
+| Inline `[proof: key]` tokens | Must match an existing proof line key, including references visible in raw HTML text. Code examples, HTML attributes, and comments are excluded |
 | Draft PRs | Exempt |
 | Bot authors | `dependabot[bot]`, `pre-commit-ci[bot]`, `github-actions[bot]` exempt |
 
@@ -351,16 +351,13 @@ regression test that fails against it.
   error blamed a missing checkbox list. GitHub stores web-UI-authored and
   web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
   gate the moment someone fixes a typo in the description.
-- **One markdown stripper instead of three.** The three hand-rolled strippers
-  disagreed. Checkbox lines inside a fence *within* the `## Proof` section were
-  parsed as real claims (fence stripping only ever protected the heading); a line
-  merely starting with an inline ` ```span``` ` latched the fence state machine
-  and made a visible `## Proof` heading invisible; and token validation handled
-  ``` but not `~~~`, reporting a false dangling token on valid markdown.
-- **Four unused dependencies removed.** `remark`, `remark-parse`, `unified` and
-  `unist-util-visit` were imported but never referenced — the parser is entirely
-  regex-based. `bun install --frozen-lockfile` pulled them on every PR of every
-  consuming repo.
+- **Shared Markdown interpretation.** The initial fix consolidated three
+  disagreeing strippers. That scanner has since been replaced by the parser
+  pipeline described below; headings, checkbox eligibility, and token checks
+  now use one parsed document.
+- **Parser dependencies are used.** The initial fix removed four unused imports.
+  `unified` and `remark-parse` are now used with `remark-rehype`, `rehype-raw`,
+  and `parse5`; the unused `remark` wrapper and `unist-util-visit` remain removed.
 
 ### Adversarial follow-up (same branch, two passes)
 
@@ -378,7 +375,9 @@ themselves wrong, and both are corrected here:
 - **Testing `line.includes("-->")` for comment state let a comment hide a whole
   proof block.** `<!-- a --> <!--` contains `-->`, so comment mode was never
   entered and the claims after the dangling opener were parsed as real, while
-  GitHub rendered none of them. Marker counting is restored.
+  GitHub rendered none of them. The intermediate fix counted markers; the
+  parser pipeline below now rejects incomplete HTML before recovery can expose
+  the hidden claims.
 
 Three further holes in the same pass, all now closed: a tilde fence whose info
 string contains tildes (`~~~ template ~~~`) was misread as inline code, so its
@@ -390,34 +389,46 @@ checkout.
 A second adversarial pass over those corrections found that moving comment
 detection ahead of fence detection had reopened the hidden-block class through
 the other door (`` ``` <!-- `` followed by `-->` made a fenced, unrendered proof
-block read as live evidence). Fences are checked first again; that does not
-reintroduce the multi-marker comment bug, because a line that is not a fence
-opener still reaches the marker count. The same pass found that `git ls-files`
+block read as live evidence). That intermediate ordering fix is superseded
+by structural parsing below. The same pass found that `git ls-files`
 takes a *pathspec*, so a lone `.` satisfied the tracked check; that artifacts
 must now be files and repository-relative; that a decoded `#` in an owner or
 repo name retargeted the API request at the repository object instead of the
 run; and that keying "git cannot answer" on an exit code made every git failure
 fail open.
 
+### Markdown and HTML parsing
+
+The verifier parses Markdown once with `unified` and `remark-parse`, converts
+it with `remark-rehype`, and resolves raw HTML with `rehype-raw`. A heading or
+checkbox can supply evidence only if it originates in Markdown and survives
+HTML parsing. Source positions connect the trees; artifact values come from
+original source lines, with the existing comment and trailing-tag removal.
+Markdown links and code-wrapped artifacts are not silently unwrapped.
+
+This closes the scanner's nested-list fence, over-indented closing fence,
+indented fake-heading, and inline-comment-literal failures. Escaped or unequal
+backticks remain ordinary text, so they cannot conceal dangling proof tokens.
+Visible references inside raw HTML are checked too; attributes, comments, and
+code containers do not supply references.
+
+`rehype-raw` recovers from unfinished HTML tokens when it reaches a structured
+Markdown node. That recovery alone would reopen the `<!-- a --> <!--` bypass.
+Before conversion, `parse5` checks each actual HTML node and rejects incomplete
+comments, tags, and other end-of-input parse errors. Complete comments, literal
+comment markers inside attributes or code, and normal `<details>` markup remain
+supported. The verifier parses HTML without executing or displaying it.
+
+The existing source grammar is preserved: select the last matching `## Proof`
+heading and validate checkbox entries through the end of the body, including
+entries after an unrelated later heading. Parsing failures reject the body.
+
 ### Known gaps
 
-**Markdown handling is approximate.** Fence and comment detection is a
-hand-rolled line scanner, not a CommonMark parser, and it has now been wrong in
-both directions twice. Specifically still open:
-
-- A fence indented to a nested list item's content column (4+ spaces) is not
-  recognised, so a `[proof: key]` token inside it is reported as dangling on
-  valid markdown.
-- A closing fence is honoured at any indent, while CommonMark caps it at 3, so
-  a 4-space-indented ```` ``` ```` inside a fence ends the block early.
-- An unbalanced `<!--` inside an inline code span swallows the rest of the
-  body, so a PR body that *discusses* comment stripping cannot pass.
-
-These are all "our model of markdown disagrees with CommonMark", which is a
-class that patching cannot close. The repository already declared `remark`,
-`remark-parse`, `unified` and `unist-util-visit` without ever wiring them up;
-adopting a real parser is the structural fix and is deliberately not attempted
-in this branch.
+The parser enforces CommonMark and HTML structure; it does not claim complete
+parity with GitHub's additional Markdown extensions or final HTML sanitization.
+Incomplete raw HTML fragments are rejected even if later fragments might let a
+browser recover; close each comment and tag within its Markdown HTML node.
 
 **Also open, unchanged:** strict mode keys on the *head* repo rather than the
 base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and unused);
