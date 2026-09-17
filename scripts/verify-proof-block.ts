@@ -258,6 +258,13 @@ function omitRanges(source: string, ranges: SourceRange[], blank = false): strin
  * This check is scoped to real HTML nodes: `<!--` in inline code or in a quoted
  * HTML attribute cannot accidentally change the document's comment state.
  */
+/**
+ * A PR body the gate refuses to interpret. Reported like a missing ## Proof
+ * section (one ERROR line plus the template hint), never as an uncaught
+ * exception with a stack trace.
+ */
+class ProofBodyError extends Error {}
+
 function parseProofDocument(body: string): {
   proofLines: ProofLine[] | null;
   tokenText: string;
@@ -281,7 +288,7 @@ function parseProofDocument(body: string): {
       const fragment = parseFragment(node.value ?? "", {
         onParseError(error) {
           if (error.code.startsWith("eof-")) {
-            throw new Error(
+            throw new ProofBodyError(
               "PR body does not contain a ## Proof section whose visibility can be verified: " +
               `incomplete HTML at line ${node.position?.start.line} (${error.code}).`
             );
@@ -322,7 +329,7 @@ function parseProofDocument(body: string): {
     const range = sourceRange(node);
     if (node.type === "element" && literalElements.has(node.tagName ?? "")) {
       if (!range) {
-        throw new Error("Cannot determine the source range of an HTML code container.");
+        throw new ProofBodyError("Cannot determine the source range of an HTML code container.");
       }
       excluded.push(range);
       visibleText.push("\n");
@@ -824,7 +831,18 @@ async function main(): Promise<void> {
   const errors: string[] = [];
 
   // 1. Find proof section
-  const { proofLines, tokenText } = parseProofDocument(body);
+  let parsed: ReturnType<typeof parseProofDocument>;
+  try {
+    parsed = parseProofDocument(body);
+  } catch (err) {
+    if (!(err instanceof ProofBodyError)) throw err;
+    console.error(`ERROR: ${err.message}`);
+    console.error(
+      'Every PR must end with a ## Proof block. See https://github.com/florianhorner/gh-workflows for the template.'
+    );
+    process.exit(1);
+  }
+  const { proofLines, tokenText } = parsed;
   if (proofLines === null) {
     console.error(
       "ERROR: PR body does not contain a ## Proof section anchored to end-of-body."

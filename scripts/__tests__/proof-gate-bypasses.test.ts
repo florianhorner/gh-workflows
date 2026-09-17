@@ -519,6 +519,21 @@ describe("the stripper reads the same document GitHub renders", () => {
     expect(res.out).toContain("does not contain a ## Proof section");
   });
 
+  it("reports an unfinished comment as a gate error, not as a crash", async () => {
+    // The rejection is right, but it used to surface as "Unexpected error:"
+    // followed by a Bun stack trace. A developer reading CI should get the
+    // same ERROR line and template hint as a missing ## Proof section.
+    const res = await verify(
+      ["A change.", "", "<!-- a --> <!--", "", "## Proof", "", "- [x] tests: FakeTest", ""].join("\n")
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("ERROR: PR body does not contain a ## Proof section");
+    expect(res.out).toContain("incomplete HTML at line 3 (eof-in-comment)");
+    expect(res.out).toContain("Every PR must end with a ## Proof block");
+    expect(res.out).not.toContain("Unexpected error");
+    expect(res.out).not.toMatch(/^\s+at /m);
+  });
+
   it("treats a tilde fence with tildes in its info string as a fence", async () => {
     // CommonMark forbids backticks inside a backtick fence's info string but
     // ALLOWS tildes inside a tilde fence's, so the inline-span shortcut was

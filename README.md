@@ -320,11 +320,14 @@ the reason named. The reusable workflow's PR-head checkout moved to
 Both fixes are backwards-compatible — no template change required, no
 function signature change, no tag scheme change.
 
-### Gate-bypass fixes (v1.3)
+### Unreleased — the gate fails closed and reads the body GitHub renders
 
-Six inputs made the validator exit 0 when it should have exited 1. Each was
-reproduced against the previous parser before being fixed, and each has a
-regression test that fails against it.
+A set of inputs made the validator exit 0 when it should have exited 1, and a
+smaller set made it exit 1 on valid markdown. Each was reproduced against the
+previous parser before being fixed, and each has a regression test that fails
+against it.
+
+**Fail-open inputs, now rejected:**
 
 - **CI-run URLs are recognised by canonical host, not by exact string.** The old
   pattern was host-exact, case-sensitive and `https`-only, and the generic
@@ -332,7 +335,12 @@ regression test that fails against it.
   `https://GitHub.com/o/r/actions/runs/1` skipped the `conclusion=success` and
   head_sha checks entirely — one capital letter — while the PR body still
   rendered a live link to the same run page. `http://` is now rejected, and a
-  run-shaped path on a lookalike host is an error rather than a generic artifact.
+  run-shaped path on a lookalike host or a non-default port is an error rather
+  than a generic artifact. The run-id slot captures anything and is judged
+  separately: readable ids are looked up, unreadable ones (`…/runs/123.` with
+  the period GFM strips from an autolink) are errors. Percent-encoding and
+  doubled slashes are normalised the way github.com routes them, and a decoded
+  `#` in an owner or repo name cannot retarget the API request.
 - **The unchecked branch is exhaustive.** `if (value && value !== "n/a") return;`
   was a silent accept that skipped every check. Once the `[proof: KEY]` strip
   shortened `n/a — [proof: runtime]` to `n/a —`, the `n/a` classifier stopped
@@ -345,57 +353,34 @@ regression test that fails against it.
   nested gh-workflows checkout, so `__tests__/...` or `node_modules/<anything>`
   satisfied "committed to the PR branch". There was no containment check at all
   despite the code claiming one, so `/etc/passwd` and `../../../../etc/hosts`
-  both passed. Resolution is now only ever against `GITHUB_WORKSPACE`.
+  both passed. Resolution is now only ever against `GITHUB_WORKSPACE`, through
+  `realpath`, so a committed symlink pointing out is rejected too. The path must
+  name a tracked file: `git ls-files` is queried with a literal pathspec (a lone
+  `.` used to satisfy it), directories are rejected, and when git cannot answer
+  the check fails closed and says why.
 - **CRLF bodies parse.** `.` excludes `\r` and `$` was not multiline-anchored, so
   on a CRLF body every proof line was dropped while the heading survived — the
   error blamed a missing checkbox list. GitHub stores web-UI-authored and
   web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
   gate the moment someone fixes a typo in the description.
-- **Shared Markdown interpretation.** The initial fix consolidated three
-  disagreeing strippers. That scanner has since been replaced by the parser
-  pipeline described below; headings, checkbox eligibility, and token checks
-  now use one parsed document.
-- **Parser dependencies are used.** The initial fix removed four unused imports.
-  `unified` and `remark-parse` are now used with `remark-rehype`, `rehype-raw`,
-  and `parse5`; the unused `remark` wrapper and `unist-util-visit` remain removed.
+- **Fenced, indented and commented-out claims are not evidence.** Checkbox lines
+  inside a code fence within the `## Proof` section, a tilde fence with tildes
+  in its info string (`~~~ template ~~~`), a 4-space-indented fence, raw HTML
+  lookalikes of a heading or checkbox, and claims after a dangling `<!--` all
+  used to count while GitHub rendered none of them. The verifier now parses the
+  body once instead of scanning lines; see "Markdown and HTML parsing" below.
+  An unfinished comment or tag is reported as a gate error with the line
+  number, not as a crash.
 
-### Adversarial follow-up (same branch, two passes)
+**False rejections, now accepted:** a fence at a nested list item's content
+column, a closing fence indented more than three spaces (CommonMark does not
+treat it as a closer), and an unbalanced `<!--` inside inline code, which used
+to swallow the rest of the body so a PR that *discusses* comment stripping could
+not pass.
 
-A cross-model adversarial pass over the fixes above found that two of them were
-themselves wrong, and both are corrected here:
-
-- **Requiring `\d+` in the run-URL path made every other spelling fail open.**
-  `…/actions/runs/123.` did not match, so it fell into the generic-URL accept and
-  skipped the run lookup — and GFM strips a trailing period from a bare autolink,
-  so the body rendered a live link to the real run. A period ending a sentence is
-  ordinary authoring, not an attack. The id slot now captures anything and is
-  judged separately: readable ids are looked up, unreadable ones are errors.
-  Percent-encoding (`%31`, `actions%2Fruns`) and doubled slashes are normalised
-  the way github.com routes them, and a non-default port is rejected.
-- **Testing `line.includes("-->")` for comment state let a comment hide a whole
-  proof block.** `<!-- a --> <!--` contains `-->`, so comment mode was never
-  entered and the claims after the dangling opener were parsed as real, while
-  GitHub rendered none of them. The intermediate fix counted markers; the
-  parser pipeline below now rejects incomplete HTML before recovery can expose
-  the hidden claims.
-
-Three further holes in the same pass, all now closed: a tilde fence whose info
-string contains tildes (`~~~ template ~~~`) was misread as inline code, so its
-fenced claims stayed live; a 4-space-indented triple backtick was treated as a
-fence, blanking a later `## Proof` section and its claims; and lexical
-containment plus `existsSync` accepted a committed symlink pointing out of the
-checkout.
-
-A second adversarial pass over those corrections found that moving comment
-detection ahead of fence detection had reopened the hidden-block class through
-the other door (`` ``` <!-- `` followed by `-->` made a fenced, unrendered proof
-block read as live evidence). That intermediate ordering fix is superseded
-by structural parsing below. The same pass found that `git ls-files`
-takes a *pathspec*, so a lone `.` satisfied the tracked check; that artifacts
-must now be files and repository-relative; that a decoded `#` in an owner or
-repo name retargeted the API request at the repository object instead of the
-run; and that keying "git cannot answer" on an exit code made every git failure
-fail open.
+**Dependencies:** `unified`, `remark-parse`, `remark-rehype`, `rehype-raw` and
+`parse5` are now real, exactly pinned dependencies of `scripts/`. `remark` and
+`unist-util-visit`, previously declared and never imported, are gone.
 
 ### Markdown and HTML parsing
 
