@@ -1481,7 +1481,7 @@ describe("the gate validates the body GitHub renders", () => {
       servers.push(server);
       return stubUrl(server);
     }
-    const CONCEALING = "uses <details> or ruby markup, which can hide part of it";
+    const CONCEALING = "markup, which can hide or restyle part of it";
 
     // GitHub keeps <rp>, the fallback parenthesis of a ruby annotation, and
     // browsers do not display it. Read as part of the line, a hidden value in
@@ -1502,6 +1502,91 @@ describe("the gate validates the body GitHub renders", () => {
       });
     }
 
+    for (const [label, line] of [
+      ["a struck-through URL in front of a path", "- [x] runtime: ~~https://x.example~~ proof/fabricated-runtime.log"],
+      [
+        "a URL shrunk to a speck by nested <sup>/<sub>",
+        "- [x] runtime: <sup><sup><sub><sub>https://x.example</sub></sub></sup></sup> proof/fabricated-runtime.log",
+      ],
+      ["a struck-through n/a in front of a run link", `- [ ] tests: ~~n/a — x~~ [CI run on head](${run666})`],
+    ] as const) {
+      it(`rejects ${label}`, async () => {
+        const res = await verify(bodyWith(line), { GITHUB_API_URL: runs(), GITHUB_WORKSPACE: workspace() });
+        expect(res.exitCode).not.toBe(0);
+        expect(res.out).toContain(CONCEALING);
+      });
+    }
+
+    for (const [label, line] of [
+      ["a zero-width joiner in a run URL's host", `- [x] tests: https://github.com\u200C/florianhorner/demo/actions/runs/666`],
+      ["a right-to-left override", `- [ ] tests: \u202Bn/a — x\u202C [CI run](${run666})`],
+    ] as const) {
+      it(`rejects ${label}`, async () => {
+        const res = await verify(bodyWith(line), { GITHUB_API_URL: runs() });
+        expect(res.exitCode).not.toBe(0);
+        expect(res.out).toContain("invisible or text-direction characters");
+      });
+    }
+
+    it("accepts emoji, a footnote reference and emphasis on a proof line", async () => {
+      const res = await verify(
+        ["Fixes it.[^1]", "", "## Proof", "", "- [x] tests: ✔️ **TestThing** passes[^1]", "", "[^1]: Ran twice."].join("\n")
+      );
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+
+    it("accepts a commit SHA GitHub links on a proof line", async () => {
+      // GitHub renders a known SHA as <a><tt>c31eb57</tt></a>; tt is allowed.
+      const res = await verify(bodyWith("- [x] tests: TestThing on c31eb57"), {
+        PR_BASE_REPO_FULL_NAME: "florianhorner/gh-workflows",
+        PR_HEAD_REPO_FULL_NAME: "florianhorner/gh-workflows",
+        OWNED_REPOS: "florianhorner/gh-workflows",
+      });
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+
+    it("rejects a run link whose address cannot be parsed", async () => {
+      // No invisible character in the text: only the link target is broken.
+      const res = await verify(
+        bodyWith("- [x] tests: [CI run](https://github.com%E2%80%8C/florianhorner/demo/actions/runs/666)"),
+        { GITHUB_API_URL: runs() }
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("URL cannot be parsed");
+    });
+
+    it("looks up a run joined to another URL by a comma", async () => {
+      const res = await verify(
+        bodyWith(`- [x] tests: https://gist.github.com/florianhorner/0123abcd,${run666}`),
+        { GITHUB_API_URL: runs() }
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('CI run 666 conclusion is "failure"');
+    });
+
+    it("treats a plain link in a note as context", async () => {
+      const res = await verify(
+        bodyWith(
+          `- [x] tests: ${run1} (captured from http://localhost:8100/admin; checks: https://github.com/florianhorner/demo/commit/abc1234/checks)`
+        ),
+        { GITHUB_API_URL: runs() }
+      );
+      expect(res.exitCode).toBe(0);
+      expect(res.out).toContain("1 proof line(s) checked");
+    });
+
+    it("reads a bare www. value as the run it links to", async () => {
+      const res = await verify(bodyWith("- [x] tests: www.github.com/florianhorner/demo/actions/runs/666"), {
+        GITHUB_API_URL: runs(),
+        GITHUB_WORKSPACE: workspace(),
+      });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('CI run 666 conclusion is "failure"');
+      expect(res.out).not.toContain("File path");
+    });
+
     it("validates every URL a value shows, not only the first", async () => {
       const res = await verify(bodyWith(`- [x] tests: ${run1} \`${run666}\``), {
         GITHUB_API_URL: runs(),
@@ -1517,6 +1602,7 @@ describe("the gate validates the body GitHub renders", () => {
     ["trailing punctuation", "## Proof:"],
     ["a trailing braille blank", "## Proof\u2800"],
     ["a trailing Hangul filler, a letter that draws nothing", "## Proof\u3164"],
+    ["a suffix shrunk to a speck", "## Proof<sup><sup><sub><sub>s</sub></sub></sup></sup>"],
   ] as const) {
     it(`opens the section at a heading with ${label} and says it is not ## Proof`, async () => {
       const api = stubApi("failure", "cafebabe");

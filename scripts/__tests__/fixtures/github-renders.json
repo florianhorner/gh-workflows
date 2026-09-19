@@ -29,6 +29,11 @@
     "text": "<script>const marker = \"<!--\";</script>\n\n## Proof\n- [x] tests: TestThing",
     "html": "&lt;script&gt;const marker = \""
   },
+  "0a605962dabef553f26bbdd75aaaae913571ae086f896e92261ab664a237b12f": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [ ] tests: ~~n/a — x~~ [CI run on head](https://github.com/florianhorner/demo/actions/runs/666)\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Incomplete task\"> tests: <del>n/a — x</del> <a href=\"https://github.com/florianhorner/demo/actions/runs/666\">CI run on head</a></li>\n</ul>"
+  },
   "0ab78fa0ab2a79f8b118b5135e9cc240b6bf1e37a1afa8c375a226c0395e8905": {
     "context": "florianhorner/demo",
     "text": "## Ргооf\n\n- [x] tests: [CI green on head](https://github.com/florianhorner/demo/actions/runs/123)\n\n<details><summary>notes</summary>\n\n## Proof\n\n- [ ] tests: n/a — see above\n\n</details>",
@@ -159,10 +164,15 @@
     "text": "Some change.\n\n## Proof\n\n- [x] tests: https://github.com/florianhorner/demo/actions/runs/123456 [proof: tests]\n",
     "html": "<p>Some change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com/florianhorner/demo/actions/runs/123456\">https://github.com/florianhorner/demo/actions/runs/123456</a> [proof: tests]</li>\n</ul>"
   },
+  "2cac807f79e6993c208542f904e6fecc4f35bd3eb1158310de69a0d527ac8021": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: https://github.com‌/florianhorner/demo/actions/runs/666\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com%E2%80%8C/florianhorner/demo/actions/runs/666\" rel=\"nofollow\">https://github.com‌/florianhorner/demo/actions/runs/666</a></li>\n</ul>"
+  },
   "2e03ebbf32a0169e450a240d9e0b1a31828c1f1a5a70bf3e8fc9cd6547b6446b": {
     "context": "florianhorner/demo",
     "text": "Fixes the freeze.[^1]\n\n[^1]: Details\n\n    Also fixes the leak [proof: nonexistent_key]\n\n    - [x] runtime: proof/does-not-exist.txt\n\n## Proof\n\n- [x] tests: some_test",
-    "html": "<p>Fixes the freeze.<sup><a href=\"#user-content-fn-1-da4cfa7e8dcbccf95d85a099b2add3aa\" id=\"user-content-fnref-1-da4cfa7e8dcbccf95d85a099b2add3aa\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: some_test</li>\n</ul>\n<section data-footnotes=\"\" class=\"footnotes\"><h2 id=\"footnote-label\" class=\"sr-only\">Footnotes</h2>\n<ol>\n<li id=\"user-content-fn-1-da4cfa7e8dcbccf95d85a099b2add3aa\">\n<p>Details</p>\n<p>Also fixes the leak [proof: nonexistent_key]</p>\n<ul>\n<li><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: proof/does-not-exist.txt</li>\n</ul>\n<a href=\"#user-content-fnref-1-da4cfa7e8dcbccf95d85a099b2add3aa\" data-footnote-backref=\"\" aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a>\n</li>\n</ol>\n</section>"
+    "html": "<p>Fixes the freeze.<sup><a href=\"#user-content-fn-1-e6ac20c060348c8e87bae9937435f74e\" id=\"user-content-fnref-1-e6ac20c060348c8e87bae9937435f74e\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: some_test</li>\n</ul>\n<section data-footnotes=\"\" class=\"footnotes\"><h2 id=\"footnote-label\" class=\"sr-only\">Footnotes</h2>\n<ol>\n<li id=\"user-content-fn-1-e6ac20c060348c8e87bae9937435f74e\">\n<p>Details</p>\n<p>Also fixes the leak [proof: nonexistent_key]</p>\n<ul>\n<li><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: proof/does-not-exist.txt</li>\n</ul>\n<a href=\"#user-content-fnref-1-e6ac20c060348c8e87bae9937435f74e\" data-footnote-backref=\"\" aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a>\n</li>\n</ol>\n</section>"
   },
   "2ebd09aed9352179934566c7b6f80bbd39bfeda28a6c5362300dbc9883d85d75": {
     "context": "florianhorner/demo",
@@ -177,7 +187,7 @@
   "2f24db8022220178e085e1221e45041cb8c2ef80b025528bb394b8519055fad5": {
     "context": "florianhorner/demo",
     "text": "## Proof\n\n- [x] tests: TestThing[^ci]\n\n[^ci]: https://github.com/florianhorner/demo/actions/runs/123",
-    "html": "<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: TestThing<sup><a href=\"#user-content-fn-ci-a6b4eeac1e2e3668c0768e97f55ab550\" id=\"user-content-fnref-ci-a6b4eeac1e2e3668c0768e97f55ab550\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></li>\n</ul>\n<section data-footnotes=\"\" class=\"footnotes\"><h2 id=\"footnote-label\" class=\"sr-only\">Footnotes</h2>\n<ol>\n<li id=\"user-content-fn-ci-a6b4eeac1e2e3668c0768e97f55ab550\">\n<p><a href=\"https://github.com/florianhorner/demo/actions/runs/123\">https://github.com/florianhorner/demo/actions/runs/123</a> <a href=\"#user-content-fnref-ci-a6b4eeac1e2e3668c0768e97f55ab550\" data-footnote-backref=\"\" aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a></p>\n</li>\n</ol>\n</section>"
+    "html": "<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: TestThing<sup><a href=\"#user-content-fn-ci-c82e0dd3784935c03b7ae1f74875f5bc\" id=\"user-content-fnref-ci-c82e0dd3784935c03b7ae1f74875f5bc\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></li>\n</ul>\n<section data-footnotes=\"\" class=\"footnotes\"><h2 id=\"footnote-label\" class=\"sr-only\">Footnotes</h2>\n<ol>\n<li id=\"user-content-fn-ci-c82e0dd3784935c03b7ae1f74875f5bc\">\n<p><a href=\"https://github.com/florianhorner/demo/actions/runs/123\">https://github.com/florianhorner/demo/actions/runs/123</a> <a href=\"#user-content-fnref-ci-c82e0dd3784935c03b7ae1f74875f5bc\" data-footnote-backref=\"\" aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a></p>\n</li>\n</ol>\n</section>"
   },
   "32b95111fd25c36fdd3ae94b8cacc00bf54444bc1b8106b60062aa7e1663890a": {
     "context": "florianhorner/demo",
@@ -239,10 +249,20 @@
     "text": "`## Proof`\n\n- [x] tests: TestThing",
     "html": "<p><code class=\"notranslate\">## Proof</code></p>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: TestThing</li>\n</ul>"
   },
+  "426700c21cf4d8df65218fb85955ac2d80f12a6dec6692b3397e055c9fab87a7": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: https://gist.github.com/florianhorner/0123abcd,https://github.com/florianhorner/demo/actions/runs/666\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://gist.github.com/florianhorner/0123abcd,https://github.com/florianhorner/demo/actions/runs/666\">https://gist.github.com/florianhorner/0123abcd,https://github.com/florianhorner/demo/actions/runs/666</a></li>\n</ul>"
+  },
   "4326fbbf38f09d632f0ee44ee8c9c2697a741a3583b6dd780786e5c4a6cad5be": {
     "context": "florianhorner/demo",
     "text": "## Proof\n\n- [x] ci:\n  https://github.com/florianhorner/demo/actions/runs/123\n- [x] sep: x https://github.com/florianhorner/demo/actions/runs/123",
     "html": "<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> ci:<br>\n<a href=\"https://github.com/florianhorner/demo/actions/runs/123\">https://github.com/florianhorner/demo/actions/runs/123</a></li>\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> sep: x <a href=\"https://github.com/florianhorner/demo/actions/runs/123\">https://github.com/florianhorner/demo/actions/runs/123</a></li>\n</ul>"
+  },
+  "4355510760d613bcfc8e8957cb42d6196099fdd27313972f5b78f595e1f16c67": {
+    "context": "florianhorner/demo",
+    "text": "Fixes it.[^1]\n\n## Proof\n\n- [x] tests: ✔️ **TestThing** passes[^1]\n\n[^1]: Ran twice.",
+    "html": "<p>Fixes it.<sup><a href=\"#user-content-fn-1-e86ea387df8b6646b6528126d56aacd8\" id=\"user-content-fnref-1-e86ea387df8b6646b6528126d56aacd8\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: ✔️ <strong>TestThing</strong> passes<sup><a href=\"#user-content-fn-1-e86ea387df8b6646b6528126d56aacd8\" id=\"user-content-fnref-1-2-e86ea387df8b6646b6528126d56aacd8\" data-footnote-ref=\"\" aria-describedby=\"footnote-label\">1</a></sup></li>\n</ul>\n<section data-footnotes=\"\" class=\"footnotes\"><h2 id=\"footnote-label\" class=\"sr-only\">Footnotes</h2>\n<ol>\n<li id=\"user-content-fn-1-e86ea387df8b6646b6528126d56aacd8\">\n<p>Ran twice. <a href=\"#user-content-fnref-1-e86ea387df8b6646b6528126d56aacd8\" data-footnote-backref=\"\" aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a> <a href=\"#user-content-fnref-1-2-e86ea387df8b6646b6528126d56aacd8\" data-footnote-backref=\"\" aria-label=\"Back to reference 1-2\" class=\"data-footnote-backref\">↩<sup>2</sup></a></p>\n</li>\n</ol>\n</section>"
   },
   "45464340301ff5fb4eb2860741590e02392c6091724d6e3dc12f115f1a0c598e": {
     "context": "florianhorner/demo",
@@ -358,6 +378,11 @@
     "context": "florianhorner/demo",
     "text": "<code>\n\n## Proof\n- [x] tests: https://github.com/florianhorner/demo/actions/runs/123\n\n</code>",
     "html": "<code class=\"notranslate\">\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com/florianhorner/demo/actions/runs/123\">https://github.com/florianhorner/demo/actions/runs/123</a></li>\n</ul>\n</code>"
+  },
+  "634873d74df9a1577cf3c45c6f938a85eaef5e37e0070f9a505b2d6472f70162": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] runtime: ~~https://x.example~~ proof/fabricated-runtime.log\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: <del><a href=\"https://x.example\" rel=\"nofollow\">https://x.example</a></del> proof/fabricated-runtime.log</li>\n</ul>"
   },
   "681502f72051f302c22b4fb15fb973634cdb418c227ab9ace6e5f5bfa5557a03": {
     "context": "florianhorner/demo",
@@ -514,6 +539,11 @@
     "text": "A change.\n\n\n## Proof\n\n- [x] runtime: `__tests__/verify-proof-block.test.ts` [proof: runtime]\n",
     "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: <code class=\"notranslate\">__tests__/verify-proof-block.test.ts</code> [proof: runtime]</li>\n</ul>"
   },
+  "91efdd280c136a7408763cf96ab8019e596eca93da91842eb9504e8c6ddd284b": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: [CI run](https://github.com%E2%80%8C/florianhorner/demo/actions/runs/666)\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com%E2%80%8C/florianhorner/demo/actions/runs/666\" rel=\"nofollow\">CI run</a></li>\n</ul>"
+  },
   "937dcea13b6c363ac02e286813f42ccc5fba921e373d93447e26803879872a57": {
     "context": "florianhorner/demo",
     "text": "A change.\n\n\n## Proof\n\n- [x] tests: https://GitHub.com/florianhorner/demo/actions/runs/123 [proof: tests]\n",
@@ -588,6 +618,11 @@
     "context": "florianhorner/demo",
     "text": "<div title=\"<!--\">Notes</div>\n\n## Proof\n- [x] tests: TestThing",
     "html": "<div title=\"&lt;!--\">Notes</div>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: TestThing</li>\n</ul>"
+  },
+  "a394a0f13dbd860f696df1f57cba17afd70294c655e659a8c1462e85206b25db": {
+    "context": "florianhorner/gh-workflows",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: TestThing on c31eb57\n",
+    "html": "<p dir=\"auto\">A change.</p>\n<h2 dir=\"auto\">Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: TestThing on <a class=\"commit-link\" data-hovercard-type=\"commit\" data-hovercard-url=\"https://github.com/florianhorner/gh-workflows/commit/c31eb57750336751975fa839bd88cd9964c627f8/hovercard\" href=\"https://github.com/florianhorner/gh-workflows/commit/c31eb57750336751975fa839bd88cd9964c627f8\"><tt>c31eb57</tt></a></li>\n</ul>"
   },
   "a416a98f3d9d0d999d3feececd4af32137bcb0ada5f3630d56be576fc4f1ed0d": {
     "context": "florianhorner/demo",
@@ -694,6 +729,16 @@
     "text": "A change.\n\n\n## Proof\n\n- [x] runtime: proof/fabricated.txt [proof: runtime]\n",
     "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: proof/fabricated.txt [proof: runtime]</li>\n</ul>"
   },
+  "c1b041b0bcd47379db3f38a385f2246bb2f2dd113da072451d66dcf9b60b308c": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: https://github.com/florianhorner/demo/actions/runs/1 (captured from http://localhost:8100/admin; checks: https://github.com/florianhorner/demo/commit/abc1234/checks)\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com/florianhorner/demo/actions/runs/1\">https://github.com/florianhorner/demo/actions/runs/1</a> (captured from <a href=\"http://localhost:8100/admin\" rel=\"nofollow\">http://localhost:8100/admin</a>; checks: <a href=\"https://github.com/florianhorner/demo/commit/abc1234/checks\">https://github.com/florianhorner/demo/commit/abc1234/checks</a>)</li>\n</ul>"
+  },
+  "c2f5b0448e69e3117c3396bfde5d84fca9384ddd00cba760224cbc115341fc9f": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] tests: www.github.com/florianhorner/demo/actions/runs/666\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"http://www.github.com/florianhorner/demo/actions/runs/666\">www.github.com/florianhorner/demo/actions/runs/666</a></li>\n</ul>"
+  },
   "c3a1fe16b6974847814715a069b9a7a503c56c1da2577c8fa0ed503b98e45f10": {
     "context": "florianhorner/demo",
     "text": "A change.\n\n\n## Proof\n\n- [ ] tests: <ruby><rp>n/a — x</rp></ruby>[CI run on head](https://github.com/florianhorner/demo/actions/runs/666)\n",
@@ -709,6 +754,11 @@
     "text": "A change.\n\n\n## Proof\n\n- [x] tests: https://GITHUB.COM/florianhorner/demo/actions/runs/123 [proof: tests]\n",
     "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://GITHUB.COM/florianhorner/demo/actions/runs/123\">https://GITHUB.COM/florianhorner/demo/actions/runs/123</a> [proof: tests]</li>\n</ul>"
   },
+  "c639901fe682bc888dc86e614c5234a76883d035fe6dd8aade8c071b86a0f01f": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [ ] tests: ‫n/a — x‬ [CI run](https://github.com/florianhorner/demo/actions/runs/666)\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Incomplete task\"> tests: ‫n/a — x‬ <a href=\"https://github.com/florianhorner/demo/actions/runs/666\">CI run</a></li>\n</ul>"
+  },
   "c649f54618b65113c1a1e92ef224b2e2533cbbc254b1a7341d3c6efa4be146bf": {
     "context": "florianhorner/demo",
     "text": "A change with no evidence at all.\n\n``` <!--\n-->\n\n## Proof\n\n- [x] tests: FakeTest\n",
@@ -718,6 +768,11 @@
     "context": "florianhorner/demo",
     "text": "A change.\n\n\n## Proof\n\n- [x] runtime: etc-link/passwd [proof: runtime]\n",
     "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: etc-link/passwd [proof: runtime]</li>\n</ul>"
+  },
+  "ca1dcce1170f0618e3efdc260856db1fe9341e10099107ebc17f1aecde5bcd44": {
+    "context": "florianhorner/demo",
+    "text": "## Proof<sup><sup><sub><sub>s</sub></sub></sup></sup>\n\n- [x] tests: [CI green on head](https://github.com/florianhorner/demo/actions/runs/123)\n\n<details><summary>notes</summary>\n\n## Proof\n\n- [ ] tests: n/a — see above\n\n</details>",
+    "html": "<h2>Proof<sup><sup><sub><sub>s</sub></sub></sup></sup></h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> tests: <a href=\"https://github.com/florianhorner/demo/actions/runs/123\">CI green on head</a></li>\n</ul>\n<details><summary>notes</summary>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Incomplete task\"> tests: n/a — see above</li>\n</ul>\n</details>"
   },
   "cbbc3e8a28ed825ca54894178c4628c89a6fa2fef0f2ba06d32f55c12f538336": {
     "context": "florianhorner/demo",
@@ -903,6 +958,11 @@
     "context": "florianhorner/demo",
     "text": "<pre>\n\n## Proof\n- [x] tests: TestThing\n\n</pre>",
     "html": "<pre class=\"notranslate\">## Proof\n- [x] tests: TestThing\n\n</pre>"
+  },
+  "fb0ee4fe05afd6a284e462c08a2f8a0b1c6c89bf8fa4a95465fff27cffd6377c": {
+    "context": "florianhorner/demo",
+    "text": "A change.\n\n\n## Proof\n\n- [x] runtime: <sup><sup><sub><sub>https://x.example</sub></sub></sup></sup> proof/fabricated-runtime.log\n",
+    "html": "<p>A change.</p>\n<h2>Proof</h2>\n<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" id=\"\" disabled=\"\" class=\"task-list-item-checkbox\" aria-label=\"Completed task\" checked=\"\"> runtime: <sup><sup><sub><sub><a href=\"https://x.example\" rel=\"nofollow\">https://x.example</a></sub></sub></sup></sup> proof/fabricated-runtime.log</li>\n</ul>"
   },
   "fbaf94a369c7d508d4e88e12c4519c053c192d0cd9cc2c9ae157e2c1ec047e2a": {
     "context": "florianhorner/demo",

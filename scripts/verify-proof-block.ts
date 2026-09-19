@@ -373,28 +373,60 @@ function isCodeExample(node: HtmlNode): boolean {
  * run cited as `[CI run](…/actions/runs/1)` is looked up by its target, which is
  * where the rendered link sends the reader.
  */
-function lineOf(item: HtmlNode): { text: string; anchors: HtmlNode[]; concealing: boolean } {
+function lineOf(item: HtmlNode): { text: string; core: string; anchors: HtmlNode[]; foreign: string[] } {
   const text: string[] = [];
+  const core: string[] = [];
   const anchors: HtmlNode[] = [];
-  let concealing = false;
+  const foreign = new Set<string>();
+  const outside = new Set<HtmlNode>();
   for (const n of descendants(item, (n) => n.tagName === "ul" || n.tagName === "ol")) {
-    if (n.nodeName === "#text") text.push(n.value ?? "");
+    const beyond = n.parentNode !== undefined && n.parentNode !== null && outside.has(n.parentNode);
+    if (n.tagName !== undefined && (beyond || !allowedInLine(n))) {
+      outside.add(n);
+      if (!beyond) foreign.add(n.tagName);
+    }
+    if (n.nodeName === "#text") {
+      text.push(n.value ?? "");
+      if (!(n.parentNode && outside.has(n.parentNode))) core.push(n.value ?? "");
+    }
     if (n.tagName === "a" && attr(n, "href")) anchors.push(n);
-    if (n.tagName !== undefined && CONCEALING_TAGS.has(n.tagName)) concealing = true;
   }
-  return { text: collapse(text.join("")), anchors, concealing };
+  return { text: collapse(text.join("")), core: collapse(core.join("")), anchors, foreign: [...foreign] };
 }
 
 /**
- * Markup GitHub's sanitizer keeps that hides or overlays text: a collapsed
- * `<details>`, and ruby, whose `<rp>` fallback text browsers hide (inside
- * `<ruby>` always, outside it depending on the engine). On a proof line either
- * lets the gate read text the reviewer does not see — `<rp>https://x </rp>` in
- * front of a path stood in for the path, a hidden `n/a` excused a visible run
- * link. Proof lines have no use for it, so a line that contains any is an
- * error rather than a guess about what a browser shows.
+ * What a proof line may contain: text, links, code and emphasis, as Markdown
+ * writes them. Everything else GitHub's sanitizer keeps can hide, shrink,
+ * strike through or overlay text — `<rp>` fallback text and a collapsed
+ * `<details>` are hidden, `~~…~~` reads as "not this", eight nested `<sup>`/
+ * `<sub>` draw a URL two pixels tall — and each of those let the gate read a
+ * value, an `n/a` or a URL the reviewer does not see as the claim. Listing what
+ * is allowed, instead of what is not, is the only version of this that does not
+ * need a new entry for every trick.
  */
-const CONCEALING_TAGS = new Set(["details", "ruby", "rp"]);
+// `tt` is how GitHub renders an auto-linked commit SHA.
+const LINE_TAGS = new Set(["p", "input", "a", "code", "tt", "strong", "em", "b", "i", "br", "g-emoji"]);
+
+function allowedInLine(node: HtmlNode): boolean {
+  if (LINE_TAGS.has(node.tagName!)) return true;
+  // A footnote reference renders as <sup><a data-footnote-ref>n</a></sup>.
+  if (node.tagName === "sup") {
+    const kids = childrenOf(node).filter((c) => c.nodeName !== "#text" || (c.value ?? "").trim());
+    return kids.length === 1 && kids[0]!.tagName === "a" && attr(kids[0]!, "data-footnote-ref") !== undefined;
+  }
+  return false;
+}
+
+/**
+ * Invisible or direction-changing characters on a proof line: zero-width
+ * joiners and spaces, bidi controls that display a run link before an `n/a` the
+ * gate reads first, a joiner inside a URL's host. Emoji sequences use joiners
+ * and variation selectors legitimately and are exempt.
+ */
+function hasInvisible(text: string): boolean {
+  const withoutEmoji = text.replace(/\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/gu, "");
+  return /[\p{Cf}\p{Default_Ignorable_Code_Point}]/u.test(withoutEmoji);
+}
 
 function closestItem(node: HtmlNode): HtmlNode | null {
   for (let n = node.parentNode; n; n = n.parentNode) {
@@ -442,10 +474,10 @@ function parseRenderedBody(html: string): {
     // further down (say, inside a collapsed <details>) is the one validated. A
     // lookalike is then an error of its own.
     if (!proofSeen && node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
-      const shown = lineOf(node).text;
-      if (readsAsProof(shown)) {
+      const { text: shown, core, foreign } = lineOf(node);
+      if (readsAsProof(core)) {
         proofSeen = true;
-        if (node.tagName !== "h2" || shown !== "Proof") {
+        if (node.tagName !== "h2" || shown !== "Proof" || foreign.length > 0) {
           malformed.push(
             `The heading "${shown}" (${node.tagName}) reads as the Proof heading but is not "## Proof"; write it as ## Proof.`
           );
@@ -475,11 +507,18 @@ function parseRenderedBody(html: string): {
     const item = closestItem(box) ?? box.parentNode ?? box;
     if (seenItems.has(item)) continue;
     seenItems.add(item);
-    const { text, anchors, concealing } = lineOf(item);
+    const { text, anchors, foreign } = lineOf(item);
     for (const a of anchors) onLines.add(a);
-    if (concealing) {
+    if (foreign.length > 0) {
       malformed.push(
-        `Proof line uses <details> or ruby markup, which can hide part of it from the reader: "${text}". Write proof lines as plain text.`
+        `Proof line contains <${foreign.join(">, <")}> markup, which can hide or restyle part of it: "${text}". ` +
+          "A proof line may use only text, links, code and emphasis."
+      );
+      continue;
+    }
+    if (hasInvisible(text)) {
+      malformed.push(
+        `Proof line contains invisible or text-direction characters: "${text}". Remove them so the line reads as it is checked.`
       );
       continue;
     }
@@ -764,6 +803,11 @@ async function validateRunUrl(
         `[${key}] A check-run page cannot be verified; cite the Actions run (…/actions/runs/<id>) instead: ${shown}`
       );
       return;
+    case "not-url":
+      // Shown as a link but not a URL anything can open or look up — an
+      // invisible character in the host does that. Not something to wave on.
+      if (/^https?:\/\//i.test(shown)) errors.push(`[${key}] URL cannot be parsed: ${shown}`);
+      return;
   }
 }
 
@@ -785,8 +829,10 @@ async function validateUrlArtifact(
     case "insecure":
       errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
       return;
-    case "url":
     case "not-url":
+      await validateRunUrl(key, url, artifact, looked, errors);
+      return;
+    case "url":
       return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
   }
 }
@@ -808,22 +854,37 @@ async function validateArtifact(
   errors: string[]
 ): Promise<void> {
   const looked = new Set<string>();
+  // When the value itself is a URL, it is the artifact and the line's other
+  // links are notes: a run among them is still looked up, a check page is
+  // context. When the value is prose, a link is the artifact.
+  const valueIsUrl = /^(?:https?:\/\/|www\.)/i.test(stripArtifactDescription(value));
   for (const href of links) {
     const target = resolveHref(href);
-    await validateRunUrl(key, classifyArtifactUrl(target), target, looked, errors);
+    const url = classifyArtifactUrl(target);
+    if (valueIsUrl && url.kind === "check-page") continue;
+    await validateRunUrl(key, url, target, looked, errors);
   }
 
   // Strip an optional " — <description>" annotation so only the artifact
   // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
-  const artifact = stripArtifactDescription(value);
+  let artifact = stripArtifactDescription(value);
+  // A bare `www.` value is autolinked; read it as the URL it links to.
+  if (/^www\./i.test(artifact)) artifact = `https://${artifact}`;
 
-  // A URL cannot contain a space, so a value that starts with one is URLs and
-  // notes: `…/actions/runs/1 (head abc123, success)` is run 1 plus a note, not
-  // a run whose id is "1 (head abc123, success)". Every URL in it is judged; a
-  // second one is as visible as the first.
+  // A value that starts with a URL is that URL plus notes:
+  // `…/actions/runs/1 (head abc123, success)` is run 1, not a run whose id is
+  // "1 (head abc123, success)". Any other URL in the notes is split out even
+  // when no space separates it (GitHub autolinks `a,b` as one link that reads
+  // as two), and every run among them is looked up; a generic link in a note
+  // is context and is not judged.
   if (/^https?:\/\//i.test(artifact)) {
-    for (const token of artifact.split(/\s+/).filter((t) => /^https?:\/\//i.test(t))) {
-      await validateUrlArtifact(key, token, looked, errors);
+    const urls = artifact.split(/\s+/).flatMap((t) => t.split(/(?=https?:\/\/)/i)).filter((t) => /^https?:\/\//i.test(t));
+    await validateUrlArtifact(key, urls[0]!, looked, errors);
+    for (const note of urls.slice(1)) {
+      const url = classifyArtifactUrl(note);
+      if (url.kind.startsWith("ci-run") || url.kind === "not-url") {
+        await validateRunUrl(key, url, note, looked, errors);
+      }
     }
     return;
   }
