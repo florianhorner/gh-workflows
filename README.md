@@ -52,12 +52,12 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
-| Block present | The rendered body must contain a level-2 heading reading exactly `Proof`, however it is written (`## Proof`, setext, inside a list or quote) |
-| Every box is a proof line | Every checkbox after the first `Proof` heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value`; a box that does not is an error, never skipped |
+| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, invisible characters ignored — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof` with a soft hyphen) is an error, so it cannot open a section the gate skips while a real heading further down is the one validated |
+| Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
 | Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
 | Checked boxes have real artifacts | `https://` URL, test name, or repo-relative file path. `n/a` on a checked box is an error |
 | Unchecked boxes | Either `n/a` with a non-empty reason after `—`, `–` or `-` (spacing optional), or a real artifact, which is then validated like a checked one |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. Every link on a proof line that points at a run is looked up by its target, so `[CI run](…/actions/runs/1)`, a reference link and `<…/actions/runs/1>` are all checked |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. A URL value ends at its first space, so `…/runs/1 (head abc, success)` is run 1 with a note. Every link to a run anywhere in the Proof section is looked up by its target: on a proof line or off one (nested bullets, paragraphs, tables, footnotes), written as `[CI run](…)`, a reference link, `<…>` or a relative href (`/o/r/actions/runs/1`, `../actions/runs/1`), which is resolved the way the PR page resolves it. Links on an unchecked `n/a` line are context for the reason and are not looked up. A run cited several times is fetched once and reported under every line that cites it |
 | Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
 | Artifact URL scheme | `http://` is rejected |
 | File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
@@ -167,7 +167,7 @@ consumer no audit trail when the code underneath changes.
 - GitHub Actions run URL (`https://github.com/{owner}/{repo}/actions/runs/{id}`)
 - Gist URL with timestamped log
 - Release asset URL
-- File path in `.context/proof/` committed to the PR branch
+- A repository-relative file committed to the PR branch (a `proof/` directory is the convention, not a requirement)
 - Screenshot URL (for UI/HA dashboard changes)
 
 All URL forms must be `https://`. File paths must be repository-relative and
@@ -189,10 +189,11 @@ Every run sends the body to `https://api.github.com/markdown` to have it
 rendered, so it needs network access. The endpoint needs no token permission;
 without `GITHUB_TOKEN` the call is unauthenticated and limited to 60 an hour.
 
-Required env vars for full CI URL validation:
+Env vars for full validation of CI-run and file-path artifacts:
 
 ```
-GITHUB_TOKEN=...
+GITHUB_TOKEN=...                         # needs actions: read, for run lookups;
+                                         # the render call needs no permission
 PR_HEAD_SHA=<commit sha>
 PR_BASE_REF=main                         # base branch; the clean-integrate
                                          # witness anchors a merge's integrated
@@ -396,14 +397,22 @@ against it.
   them as checked boxes. Each is now validated, and a box that does not read
   `key: value` (`runtime:URL`, `e2e : URL`, `done`) is an error.
 - **Run links are looked up by their target.** A run cited as
-  `[CI run](…/actions/runs/1)`, a reference link or `<…/actions/runs/1>` used to
-  miss run recognition and fail as a missing file path; now the run is checked.
+  `[CI run](…/actions/runs/1)`, a reference link, `<…/actions/runs/1>` or a
+  relative href used to miss run recognition and fail as a missing file path;
+  now the run is checked, and so is a run linked from anywhere else in the
+  section: a nested bullet, a paragraph, a table, a footnote.
+- **A lookalike heading cannot redirect the gate.** `## Proof` with an invisible
+  soft hyphen, or `### Proof`, used to be passed over while a real `## Proof`
+  hidden in a collapsed `<details>` further down was validated instead.
 
 **Behaviour changes for existing bodies:** a file path is read as displayed, so
 a path Markdown reformats (`__tests__` renders as bold "tests") fails until it
-is put in backticks, and the error says so. A `Proof` heading written any way
-GitHub renders as a level-2 heading now opens the section. A failed claim under
-an earlier `Proof` heading is no longer ignored.
+is put in backticks, and the error says so. A checkbox after `## Proof` whose
+key has a space (`- [x] python compile: …`) used to be skipped and is now an
+error. A `Proof` heading written any way GitHub renders as a level-2 heading
+now opens the section, and a failed claim under an earlier `Proof` heading is
+no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
+as the run.
 
 **False rejections, now accepted:** a fence at a nested list item's content
 column, a closing fence indented more than three spaces (CommonMark does not
@@ -433,13 +442,18 @@ rather than patching its members one at a time.
 
 From the rendered HTML:
 
-- the section opens at the first `<h2>` whose text is exactly `Proof`;
+- the section opens at the first heading of any level whose text, with
+  compatibility forms folded and invisible characters dropped, is "proof" in
+  any case; unless it is an `<h2>` reading exactly `Proof`, that is an error;
 - every task-list checkbox after it is a proof line. GitHub's sanitizer strips
   raw `<input>` elements, so a checkbox can only come from task-list syntax;
 - a proof line's text is its list item without the lists nested under it, with
   whitespace collapsed; the key is the text before the first `: `;
-- `[proof: key]` tokens are read from all rendered text except code examples,
-  meaning a `<code>` or `<pre>` holding only inline content.
+- every link in the section that points at an Actions run is looked up, after
+  resolving it against `https://github.com/<base>/pull/`;
+- `[proof: key]` tokens are read from all rendered text, folded the same way as
+  headings, except code examples: a `<code>` or `<pre>` holding only inline
+  content.
 
 The HTML is parsed with `parse5` and walked iteratively, so a deeply nested
 body gets a verdict rather than a stack overflow.

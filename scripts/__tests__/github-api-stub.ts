@@ -7,8 +7,10 @@ import { dirname } from "node:path";
 // POST /markdown answers from renderings GitHub actually produced, recorded in
 // fixtures/github-renders.json. The verifier's whole premise is that it judges
 // the body GitHub displays, so a test that fed it hand-written HTML would test
-// the author's idea of GitHub instead. A body with no recording fails the test
-// loudly (the verifier cannot render, so it exits 1 and names the stub's reason).
+// the author's idea of GitHub instead. A body with no recording is answered
+// with a 422, which the verifier does not retry: it exits 1 at once and prints
+// the stub's reason. A test that asserts only a non-zero exit cannot tell that
+// apart from a real rejection, so every test asserts its message too.
 //
 // Re-record after adding or changing a test body:
 //
@@ -40,7 +42,7 @@ function renderKey(text: string, context: string): string {
 async function record(text: string, context: string, key: string): Promise<Response> {
   const token = process.env.GITHUB_RENDER_TOKEN;
   if (!token) {
-    return new Response("RECORD_GITHUB_RENDERS=1 needs GITHUB_RENDER_TOKEN", { status: 501 });
+    return new Response("RECORD_GITHUB_RENDERS=1 needs GITHUB_RENDER_TOKEN", { status: 422 });
   }
   const res = await fetch("https://api.github.com/markdown", {
     method: "POST",
@@ -79,7 +81,7 @@ async function renderMarkdown(req: Request): Promise<Response> {
   return new Response(
     `no recorded GitHub rendering for this body (${key.slice(0, 12)}); ` +
       'record it with RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test',
-    { status: 501 }
+    { status: 422 }
   );
 }
 
@@ -102,6 +104,22 @@ export function startApiStub(handler?: RouteHandler): ReturnType<typeof Bun.serv
       return new Response("not found", { status: 404 });
     },
   });
+}
+
+/**
+ * A handler that answers run lookups by id; any other id, or any other path,
+ * is a 404. `calls` counts lookups per id.
+ */
+export function runsById(runs: Record<string, { conclusion: string; head_sha: string }>) {
+  const calls: Record<string, number> = {};
+  const handler: RouteHandler = (_req, url) => {
+    const id = url.pathname.match(/\/actions\/runs\/(\d+)$/)?.[1];
+    if (id) calls[id] = (calls[id] ?? 0) + 1;
+    const run = id ? runs[id] : undefined;
+    if (!run) return new Response("not found", { status: 404 });
+    return new Response(JSON.stringify(run), { headers: { "content-type": "application/json" } });
+  };
+  return { handler, calls };
 }
 
 /** A handler that answers every run lookup with the same run. */

@@ -10,8 +10,9 @@
  * validates the returned HTML. That call needs network access and no token
  * permission; without GITHUB_TOKEN it is unauthenticated (60 requests/hour).
  *
- * Required env vars (when validating CI run URLs):
- *   GITHUB_TOKEN          - GitHub token with repo read access
+ * Env vars for full validation of CI-run and file-path artifacts:
+ *   GITHUB_TOKEN          - GitHub token with actions: read, for run lookups
+ *                           (the render call needs no permission)
  *   PR_HEAD_SHA           - SHA of the PR head commit
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
  *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"; the rendering
@@ -219,6 +220,9 @@ function readBody(): string {
 class RenderError extends Error {}
 
 const RENDER_ATTEMPTS = 3;
+// A hung request would otherwise leave the check pending until the job's own
+// timeout; each attempt gets this long.
+const RENDER_TIMEOUT_MS = 20_000;
 
 async function renderBody(body: string): Promise<string> {
   // The context repo only affects how `#123` and `@user` references link.
@@ -234,7 +238,12 @@ async function renderBody(body: string): Promise<string> {
   let failure = "";
   for (let attempt = 1; attempt <= RENDER_ATTEMPTS; attempt++) {
     try {
-      const res = await fetch(`${GITHUB_API_URL}/markdown`, { method: "POST", headers, body: payload });
+      const res = await fetch(`${GITHUB_API_URL}/markdown`, {
+        method: "POST",
+        headers,
+        body: payload,
+        signal: AbortSignal.timeout(RENDER_TIMEOUT_MS),
+      });
       if (res.ok) return await res.text();
       failure = `HTTP ${res.status}: ${(await res.text()).trim().slice(0, 200)}`;
       // Only a server error or a throttle can change on retry.
@@ -291,6 +300,14 @@ function attr(node: HtmlNode, name: string): string | undefined {
 const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
 
 /**
+ * Text as a reader takes it in: compatibility forms folded (fullwidth `［` is
+ * `[`) and invisible format characters dropped (a soft hyphen or zero-width
+ * space inside "Proof" or "[proof:" changes the string, not what anyone sees).
+ * Used to recognise headings and claim tokens, never to read artifact values.
+ */
+const readable = (text: string) => text.normalize("NFKC").replace(/\p{Cf}/gu, "");
+
+/**
  * Elements that separate text. Without a break at their edges the text of two
  * paragraphs joins, and `[proof:` at the end of one could pair with `key]` at
  * the start of the next.
@@ -324,15 +341,14 @@ function isCodeExample(node: HtmlNode): boolean {
  * run cited as `[CI run](…/actions/runs/1)` is looked up by its target, which is
  * where the rendered link sends the reader.
  */
-function lineOf(item: HtmlNode): { text: string; links: string[] } {
+function lineOf(item: HtmlNode): { text: string; anchors: HtmlNode[] } {
   const text: string[] = [];
-  const links: string[] = [];
+  const anchors: HtmlNode[] = [];
   for (const n of descendants(item, (n) => n.tagName === "ul" || n.tagName === "ol")) {
     if (n.nodeName === "#text") text.push(n.value ?? "");
-    const href = n.tagName === "a" ? attr(n, "href") : undefined;
-    if (href) links.push(href);
+    if (n.tagName === "a" && attr(n, "href")) anchors.push(n);
   }
-  return { text: collapse(text.join("")), links };
+  return { text: collapse(text.join("")), anchors };
 }
 
 function closestItem(node: HtmlNode): HtmlNode | null {
@@ -343,16 +359,20 @@ function closestItem(node: HtmlNode): HtmlNode | null {
 }
 
 const PROOF_LINE_RE = /^(\S+?):\s+(.*)$/;
+const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
 function parseRenderedBody(html: string): {
   proofLines: ProofLine[] | null;
   malformed: string[];
+  sectionLinks: string[];
   tokenText: string;
 } {
   const root = parseFragment(html) as unknown as HtmlNode;
   const tokenText: string[] = [];
   let proofSeen = false;
   const boxes: HtmlNode[] = [];
+  const sectionAnchors: HtmlNode[] = [];
+  const malformed: string[] = [];
 
   // Iterative pre-order walk; an `exit` frame closes a block element.
   const stack: { node: HtmlNode; inExample: boolean; exit?: boolean }[] = [
@@ -369,17 +389,30 @@ function parseRenderedBody(html: string): {
       if (!inExample) tokenText.push(node.value ?? "");
       continue;
     }
-    // The FIRST Proof heading opens the section. Every checkbox after it is a
-    // proof line, including any under a second Proof heading, so no box a
-    // reviewer can see is left out of validation.
-    if (!proofSeen && node.tagName === "h2") {
-      proofSeen = lineOf(node).text === "Proof";
+    // The FIRST heading that reads as "Proof" opens the section. Every checkbox
+    // after it is a proof line, including any under a second Proof heading, so
+    // no box a reviewer can see is left out of validation. "Reads as" is
+    // deliberately loose — any level, any case, invisible characters ignored —
+    // so a lookalike cannot open a section the gate skips while a real heading
+    // further down (say, inside a collapsed <details>) is the one validated. A
+    // lookalike is then an error of its own.
+    if (!proofSeen && node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
+      const shown = lineOf(node).text;
+      if (collapse(readable(shown)).toLowerCase() === "proof") {
+        proofSeen = true;
+        if (node.tagName !== "h2" || shown !== "Proof") {
+          malformed.push(
+            `The heading "${shown}" (${node.tagName}) reads as the Proof heading but is not "## Proof"; write it as ## Proof.`
+          );
+        }
+      }
     }
     // GitHub's sanitizer removes raw <input> elements, so every checkbox in the
     // rendered body comes from task-list syntax.
     if (proofSeen && node.tagName === "input" && attr(node, "type")?.toLowerCase() === "checkbox") {
       boxes.push(node);
     }
+    if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
     if (block) tokenText.push("\n");
     const example = inExample || isCodeExample(node);
     stack.push({ node, inExample, exit: true });
@@ -387,20 +420,22 @@ function parseRenderedBody(html: string): {
     for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example });
   }
 
-  if (!proofSeen) return { proofLines: null, malformed: [], tokenText: tokenText.join("") };
+  const joined = readable(tokenText.join(""));
+  if (!proofSeen) return { proofLines: null, malformed: [], sectionLinks: [], tokenText: joined };
 
   const proofLines: ProofLine[] = [];
-  const malformed: string[] = [];
+  const onLines = new Set<HtmlNode>();
   const seenItems = new Set<HtmlNode>();
   for (const box of boxes) {
     const item = closestItem(box) ?? box.parentNode ?? box;
     if (seenItems.has(item)) continue;
     seenItems.add(item);
-    const { text, links } = lineOf(item);
+    const { text, anchors } = lineOf(item);
+    for (const a of anchors) onLines.add(a);
     const match = text.match(PROOF_LINE_RE);
     if (!match) {
       malformed.push(
-        `Proof checkbox is not in "key: value" form: "${text}". Every checkbox after ## Proof is a proof line.`
+        `Proof checkbox is not in "key: value" form with a key that has no spaces (e.g. "tests: ..."): "${text}". Every checkbox after ## Proof is a proof line.`
       );
       continue;
     }
@@ -409,10 +444,14 @@ function parseRenderedBody(html: string): {
       checked: attr(box, "checked") !== undefined,
       value: stripTrailingProofTag(match[2]!.trim()),
       raw: text,
-      links,
+      links: anchors.map((a) => attr(a, "href")!),
     });
   }
-  return { proofLines, malformed, tokenText: tokenText.join("") };
+  // Links in the section that no proof line carries: nested bullets, paragraphs,
+  // tables, footnotes, a bullet with an emoji where the checkbox should be. A
+  // run linked there reads as evidence as much as one on a checkbox line does.
+  const sectionLinks = sectionAnchors.filter((a) => !onLines.has(a)).map((a) => attr(a, "href")!);
+  return { proofLines, malformed, sectionLinks, tokenText: joined };
 }
 
 /**
@@ -618,10 +657,26 @@ function realpathOrSelf(path: string): string {
 }
 
 /**
+ * Resolves an href the way the PR page does. GitHub keeps relative hrefs in the
+ * rendered body, so `[CI run](/o/r/actions/runs/1)` and `../actions/runs/1`
+ * open a run page from https://github.com/<base>/pull/<n>, and a classifier
+ * that only reads absolute URLs would wave them through.
+ */
+function resolveHref(href: string): string {
+  const repo = PR_BASE_REPO || PR_HEAD_REPO;
+  const page = repo ? `https://github.com/${repo}/pull/` : "https://github.com/";
+  try {
+    return new URL(href, page).href;
+  } catch {
+    return href;
+  }
+}
+
+/**
  * Validates a URL that looks like an Actions run and ignores any other kind.
- * `looked` holds the runs already asked about for this line, so a run cited
- * as both text and link is looked up once. Shared by artifact values and by
- * the links on a proof line.
+ * `looked` holds the runs this line (or the section outside the lines) has
+ * already reported, so a run that is both a line's text and its link is
+ * reported once. Shared by artifact values and by links.
  */
 async function validateRunUrl(
   key: string,
@@ -668,12 +723,17 @@ async function validateArtifact(
 ): Promise<void> {
   const looked = new Set<string>();
   for (const href of links) {
-    await validateRunUrl(key, classifyArtifactUrl(href), href, looked, errors);
+    const target = resolveHref(href);
+    await validateRunUrl(key, classifyArtifactUrl(target), target, looked, errors);
   }
 
   // Strip an optional " — <description>" annotation so only the artifact
   // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
-  const artifact = stripArtifactDescription(value);
+  let artifact = stripArtifactDescription(value);
+  // A URL cannot contain a space, so for a URL the artifact ends at the first
+  // one: `…/actions/runs/1 (head abc123, success)` is run 1 plus a note, not a
+  // run whose id is "1 (head abc123, success)".
+  if (/^https?:\/\//i.test(artifact)) artifact = artifact.split(/\s/)[0]!;
 
   const url = classifyArtifactUrl(artifact);
   switch (url.kind) {
@@ -801,6 +861,12 @@ function witnessCleanIntegrate(runHeadSha: string): WitnessResult {
   });
 }
 
+/**
+ * One lookup per run, however many lines cite it; every citing line still
+ * reports the run's problems under its own key.
+ */
+const runVerdicts = new Map<string, Promise<{ problems: string[]; notes: string[] }>>();
+
 async function validateCIRun(
   key: string,
   owner: string,
@@ -808,12 +874,30 @@ async function validateCIRun(
   runId: string,
   errors: string[]
 ): Promise<void> {
+  const id = `${owner}/${repo}/${runId}`.toLowerCase();
+  let verdict = runVerdicts.get(id);
+  if (!verdict) {
+    verdict = checkRun(owner, repo, runId);
+    runVerdicts.set(id, verdict);
+  }
+  const { problems, notes } = await verdict;
+  for (const problem of problems) errors.push(`[${key}] ${problem}`);
+  for (const note of notes) console.log(`ℹ [${key}] ${note}`);
+}
+
+async function checkRun(
+  owner: string,
+  repo: string,
+  runId: string
+): Promise<{ problems: string[]; notes: string[] }> {
+  const problems: string[] = [];
+  const notes: string[] = [];
   if (!GITHUB_TOKEN) {
     // No token: skip URL validation (local usage)
-    return;
+    return { problems, notes };
   }
   if (!PR_HEAD_SHA) {
-    return; // No SHA context: skip
+    return { problems, notes }; // No SHA context: skip
   }
 
   try {
@@ -829,10 +913,8 @@ async function validateCIRun(
     );
 
     if (!res.ok) {
-      errors.push(
-        `[${key}] CI run URL returned HTTP ${res.status}: ${owner}/${repo}/runs/${runId}`
-      );
-      return;
+      problems.push(`CI run URL returned HTTP ${res.status}: ${owner}/${repo}/runs/${runId}`);
+      return { problems, notes };
     }
 
     const data = (await res.json()) as {
@@ -841,9 +923,7 @@ async function validateCIRun(
     };
 
     if (data.conclusion !== "success") {
-      errors.push(
-        `[${key}] CI run ${runId} conclusion is "${data.conclusion}", expected "success".`
-      );
+      problems.push(`CI run ${runId} conclusion is "${data.conclusion}", expected "success".`);
     }
 
     if (data.head_sha !== PR_HEAD_SHA) {
@@ -854,18 +934,19 @@ async function validateCIRun(
       const witness = witnessCleanIntegrate(data.head_sha);
       if (!witness.accepted) {
         const detail = witness.detail ? ` — ${witness.detail}` : "";
-        errors.push(
-          `[${key}] CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale (${witness.reason})${detail}.`
+        problems.push(
+          `CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale (${witness.reason})${detail}.`
         );
       } else {
-        console.log(
-          `ℹ [${key}] CI run ${runId} ran on ${data.head_sha}, which this head integrates from ${PR_BASE_REF} without changing content — accepted.`
+        notes.push(
+          `CI run ${runId} ran on ${data.head_sha}, which this head integrates from ${PR_BASE_REF} without changing content — accepted.`
         );
       }
     }
   } catch (err) {
-    errors.push(`[${key}] Failed to fetch CI run: ${String(err)}`);
+    problems.push(`Failed to fetch CI run: ${String(err)}`);
   }
+  return { problems, notes };
 }
 
 // ---------------------------------------------------------------------------
@@ -913,7 +994,7 @@ async function main(): Promise<void> {
     console.error(`ERROR: ${err.message}`);
     process.exit(1);
   }
-  const { proofLines, malformed, tokenText } = parseRenderedBody(html);
+  const { proofLines, malformed, sectionLinks, tokenText } = parseRenderedBody(html);
   if (proofLines === null) {
     console.error(
       "ERROR: PR body does not contain a ## Proof section as GitHub renders it (a level-2 heading reading exactly \"Proof\")."
@@ -945,10 +1026,17 @@ async function main(): Promise<void> {
     );
   }
 
-  // 4. Validate each proof line
+  // 4. Validate each proof line, then any run linked elsewhere in the section.
+  //    Links on an unchecked `n/a` line are context for the reason given, not
+  //    evidence, and are not looked up.
   await Promise.all(
     proofLines.map((line) => validateProofLine(line, isUpstream, errors))
   );
+  const sectionLooked = new Set<string>();
+  for (const href of sectionLinks) {
+    const target = resolveHref(href);
+    await validateRunUrl("Proof section", classifyArtifactUrl(target), target, sectionLooked, errors);
+  }
 
   // 5. Validate inline [proof: key] tokens
   validateInlineTokens(tokenText, proofLines, errors);

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runResponse, startApiStub, stubUrl } from "./github-api-stub";
+import { runResponse, runsById, startApiStub, stubUrl } from "./github-api-stub";
 
 // Every case here is a way a PR body could satisfy the proof gate without the
 // evidence the gate exists to require. All of them are reachable from a body a
@@ -235,7 +235,9 @@ describe("a CI-run URL is recognised by its path, not by an exact host string", 
       )
     );
     expect(res.exitCode).not.toBe(0);
-    expect(res.out).toMatch(/host|github\.com/i);
+    // The exact message: the URL itself contains "github.com", so a looser
+    // match would pass on any rejection at all.
+    expect(res.out).toContain('must be on github.com, got host "github.com.example.test"');
   });
 
   it("still accepts a genuinely green run on the canonical host", async () => {
@@ -420,6 +422,7 @@ describe("a file-path artifact must be inside the PR checkout", () => {
       { GITHUB_WORKSPACE: workspace() }
     );
     expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("escapes the repository checkout: /etc/passwd");
   });
 
   it("rejects a traversal out of the checkout, as a traversal", async () => {
@@ -460,7 +463,7 @@ describe("n/a and unchecked values are judged, not waved through", () => {
       { OWNED_REPOS: "someone-else/demo" }
     );
     expect(res.exitCode).not.toBe(0);
-    expect(res.out).toMatch(/runtime/i);
+    expect(res.out).toContain("runtime: n/a is not allowed for cross-owner PRs");
   });
 
   it("rejects an n/a with no reason at all", async () => {
@@ -472,6 +475,7 @@ describe("n/a and unchecked values are judged, not waved through", () => {
   it("rejects an n/a whose separator is present but whose reason is empty", async () => {
     const res = await verify(bodyWith("- [ ] schema: n/a — [proof: schema]"));
     expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('[schema] Unchecked "n/a" needs a reason');
   });
 
   it("validates an unchecked box that carries a real artifact", async () => {
@@ -482,6 +486,7 @@ describe("n/a and unchecked values are judged, not waved through", () => {
       { GITHUB_WORKSPACE: workspace() }
     );
     expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("[runtime] File path escapes the repository checkout");
   });
 
   it("still accepts a well-formed n/a on an owned PR", async () => {
@@ -625,6 +630,7 @@ describe("a file-path artifact must be committed to the PR branch", () => {
     );
     expect(res.exitCode).not.toBe(0);
     expect(res.out).toContain("not committed to the PR branch");
+    expect(res.out).toContain("put paths in backticks");
   });
 
   it("accepts a file the PR actually committed", async () => {
@@ -1306,9 +1312,9 @@ describe("the gate validates the body GitHub renders", () => {
       ["## Proof", "", "- [x] tests: some_test", `- [x] runtime:${runUrl}`, `- [x] e2e : ${runUrl}`, "- [x] done"].join("\n")
     );
     expect(res.exitCode).not.toBe(0);
-    expect(res.out).toContain(`Proof checkbox is not in "key: value" form: "runtime:${runUrl}"`);
-    expect(res.out).toContain(`Proof checkbox is not in "key: value" form: "e2e : ${runUrl}"`);
-    expect(res.out).toContain('Proof checkbox is not in "key: value" form: "done"');
+    expect(res.out).toContain(`(e.g. "tests: ..."): "runtime:${runUrl}"`);
+    expect(res.out).toContain(`(e.g. "tests: ..."): "e2e : ${runUrl}"`);
+    expect(res.out).toContain('(e.g. "tests: ..."): "done"');
   });
 
   it("does not let raw <input> HTML forge a checkbox", async () => {
@@ -1347,10 +1353,192 @@ describe("the gate validates the body GitHub renders", () => {
     expect(res.out).not.toContain("Unexpected error");
   });
 
-  it("gives a verdict, not a stack overflow, on a deeply nested body", async () => {
+  it("reports what GitHub keeps of a body nested past its depth limit", async () => {
+    // GitHub stops nesting at 256 blockquotes and drops what lies deeper,
+    // including this Proof section.
     const res = await verify(">".repeat(20000) + " x\n\n## Proof\n\n- [x] tests: TestThing");
-    expect(res.out).not.toContain("Unexpected error");
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("does not contain a ## Proof section");
+  });
+
+  const runUrl2 = "https://github.com/florianhorner/demo/actions/runs/124";
+
+  for (const [label, link] of [
+    ["a root-relative link", "[CI run](/florianhorner/demo/actions/runs/123)"],
+    ["a protocol-relative link", "[CI run](//github.com/florianhorner/demo/actions/runs/123)"],
+    ["a link relative to the PR page", "[CI run](../actions/runs/123)"],
+    ["a raw HTML anchor", '<a href="/florianhorner/demo/actions/runs/123">CI run</a>'],
+  ] as const) {
+    it(`looks up a run cited through ${label}`, async () => {
+      // GitHub keeps relative hrefs in the rendered body, and on the PR page
+      // each of these opens run 123. Resolving only absolute URLs let a failed
+      // run through.
+      const api = stubApi("failure", "cafebabe");
+      const res = await verify(bodyWith(`- [x] runtime: ${link}`), { GITHUB_API_URL: api });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('[runtime] CI run 123 conclusion is "failure"');
+    });
+  }
+
+  it("looks up the run a link opens, not only the run its text names", async () => {
+    const runs = runsById({
+      "123": { conclusion: "success", head_sha: "cafebabe" },
+      "124": { conclusion: "failure", head_sha: "cafebabe" },
+    });
+    const server = startApiStub(runs.handler);
+    servers.push(server);
+    const res = await verify(bodyWith(`- [x] tests: [${runUrl}](${runUrl2})`), {
+      GITHUB_API_URL: stubUrl(server),
+    });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('CI run 124 conclusion is "failure"');
+  });
+
+  it("looks up each cited run once, however often a line names it", async () => {
+    const runs = runsById({ "123": { conclusion: "success", head_sha: "cafebabe" } });
+    const server = startApiStub(runs.handler);
+    servers.push(server);
+    const res = await verify(
+      ["## Proof", "", `- [x] tests: ${runUrl}`, `- [x] build: ${runUrl}`].join("\n"),
+      { GITHUB_API_URL: stubUrl(server) }
+    );
+    expect(res.exitCode).toBe(0);
+    expect(runs.calls["123"]).toBe(1);
+  });
+
+  it("reports a failed run once when it is both a line's text and its link", async () => {
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(bodyWith(`- [x] tests: ${runUrl}`), { GITHUB_API_URL: api });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out.match(/\[tests\] CI run 123 conclusion/g)?.length).toBe(1);
+  });
+
+  it("reads a run URL followed by a note as the run", async () => {
+    // `…/runs/123 (head cafebabe, success)`: a URL ends at the first space.
+    const api = stubApi("success", "cafebabe");
+    const res = await verify(bodyWith(`- [x] tests: ${runUrl} (head cafebabe, success)`), {
+      GITHUB_API_URL: api,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  it("opens the section at a lookalike heading and says it is not ## Proof", async () => {
+    // A soft hyphen after "Proof" is invisible. Matching the heading text
+    // exactly skipped this section and validated the real one hidden in a
+    // collapsed <details> below, while reviewers read the failed run above.
+    const api = stubApi("failure", "cafebabe");
+    const res = await verify(
+      [
+        "## Proof\u00AD", "", `- [x] runtime: ${runUrl}`, "",
+        "<details><summary>Notes</summary>", "", "## Proof", "", "- [x] tests: TestThing", "", "</details>",
+      ].join("\n"),
+      { GITHUB_API_URL: api }
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('reads as the Proof heading but is not "## Proof"');
+    expect(res.out).toContain('[runtime] CI run 123 conclusion is "failure"');
+  });
+
+  it("does not accept a Proof heading at another level", async () => {
+    const res = await verify("### Proof\n\n- [x] tests: TestThing");
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('The heading "Proof" (h3) reads as the Proof heading but is not "## Proof"');
+  });
+
+  for (const [label, section] of [
+    ["a nested bullet under a proof line", `- [x] runtime: CI green, run below\n  - ${runUrl}`],
+    ["a paragraph", `- [x] tests: TestThing\n\nCI: ${runUrl}`],
+    ["a table", `- [x] tests: TestThing\n\n| check | run |\n|---|---|\n| CI | ${runUrl} |`],
+    ["a footnote", `- [x] tests: TestThing[^ci]\n\n[^ci]: ${runUrl}`],
+    ["a bullet with an emoji for a checkbox", `- [x] tests: TestThing\n- :white_check_mark: runtime: ${runUrl}`],
+  ] as const) {
+    it(`looks up a run linked from ${label} in the Proof section`, async () => {
+      const api = stubApi("failure", "cafebabe");
+      const res = await verify(`## Proof\n\n${section}`, { GITHUB_API_URL: api });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('[Proof section] CI run 123 conclusion is "failure"');
+    });
+  }
+
+  it("does not look up a run cited as context on an unchecked n/a line", async () => {
+    // The render-only stub answers every run lookup with a 404, so a lookup
+    // would show up as an error.
+    const res = await verify(bodyWith(`- [ ] runtime: n/a — device lab down, see ${runUrl}`));
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  it("reads a claim token through an invisible character", async () => {
+    const res = await verify(bodyWith("- [x] tests: TestThing", "Fixes it [pro\u200Bof: missing]."));
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("Dangling [proof: missing]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The HTML walk itself. These feed hand-written HTML on purpose: they pin
+// defensive paths no GitHub rendering reaches today (a deep tree, a surviving
+// <template>, two boxes in one item), so a future renderer change cannot turn
+// them into a crash or a hidden checkbox.
+// ---------------------------------------------------------------------------
+
+describe("the rendered-HTML walk", () => {
+  function htmlApi(html: string): string {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) =>
+        new URL(req.url).pathname === "/markdown"
+          ? new Response(html, { headers: { "content-type": "text/html" } })
+          : new Response("not found", { status: 404 }),
+    });
+    servers.push(server);
+    return `http://127.0.0.1:${server.port}`;
+  }
+  const box = (text: string) =>
+    `<li class="task-list-item"><input type="checkbox" disabled checked> ${text}</li>`;
+
+  it("walks a 20,000-deep tree without overflowing the stack", async () => {
+    const html =
+      "<div>".repeat(20000) + "x" + "</div>".repeat(20000) +
+      `<h2>Proof</h2><ul>${box("runtime: proof/missing.txt")}</ul>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("File path does not exist: proof/missing.txt");
     expect(res.out).not.toContain("RangeError");
+  });
+
+  it("reads a checkbox inside a <template> element", async () => {
+    const html = `<h2>Proof</h2><template><ul>${box("runtime: proof/missing.txt")}</ul></template>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("File path does not exist: proof/missing.txt");
+  });
+
+  it("reads two boxes in one list item as one line", async () => {
+    const html =
+      '<h2>Proof</h2><ul><li><input type="checkbox" checked> tests: TestThing ' +
+      '<input type="checkbox" checked></li></ul>';
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  it("treats code with a line break as a code example", async () => {
+    const html = `<p><code>a<br>[proof: missing]</code></p><h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
+
+  it("does not join claim text across adjacent blocks", async () => {
+    // Without a break at block edges "[proof: te" + "sts]" reads as a valid
+    // claim for the key "tests".
+    const html = `<div>Fixes [proof: te</div><div>sts] it</div><h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("Dangling [proof: te");
   });
 });
 
@@ -1359,6 +1547,60 @@ describe("the gate validates the body GitHub renders", () => {
 // ---------------------------------------------------------------------------
 
 describe("guards the coverage audit found unpinned", () => {
+  function proxyTo(target: string, answer: (n: number, req: Request) => Response | null) {
+    const seen = { calls: 0, auth: [] as (string | null)[] };
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        seen.calls++;
+        seen.auth.push(req.headers.get("authorization"));
+        const early = answer(seen.calls, req);
+        if (early) return early;
+        const url = new URL(req.url);
+        return fetch(`${target}${url.pathname}`, {
+          method: req.method,
+          headers: req.headers,
+          body: await req.text(),
+        });
+      },
+    });
+    servers.push(server);
+    return { url: `http://127.0.0.1:${server.port}`, seen };
+  }
+
+  it("retries a render that fails with a server error, and then succeeds", async () => {
+    const proxy = proxyTo(renderOnlyApi(), (n) =>
+      n <= 2 ? new Response("upstream unavailable", { status: 500 }) : null
+    );
+    const res = await verify(bodyWith("- [x] tests: TestThing"), { GITHUB_API_URL: proxy.url });
+    expect(res.exitCode).toBe(0);
+    expect(proxy.seen.calls).toBe(3);
+  });
+
+  it("does not retry a render refused with a client error", async () => {
+    const proxy = proxyTo(renderOnlyApi(), () => new Response("bad request", { status: 400 }));
+    const res = await verify(bodyWith("- [x] tests: TestThing"), { GITHUB_API_URL: proxy.url });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("(HTTP 400: bad request)");
+    expect(proxy.seen.calls).toBe(1);
+  });
+
+  it("sends the token with the render call", async () => {
+    const proxy = proxyTo(renderOnlyApi(), () => null);
+    const res = await verify(bodyWith("- [x] tests: TestThing"), { GITHUB_API_URL: proxy.url });
+    expect(res.exitCode).toBe(0);
+    expect(proxy.seen.auth[0]).toBe("Bearer test-token");
+  });
+
+  it("names each malformed box instead of claiming there are none", async () => {
+    const res = await verify("## Proof\n\n- [x] done\n- [x] also done");
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('"key: value" form with a key that has no spaces');
+    expect(res.out).toContain('"also done"');
+    expect(res.out).not.toContain("contains no checkbox lines");
+  });
+
   it("rejects a generic artifact URL over plain http", async () => {
     const res = await verify(bodyWith("- [x] runtime: http://example.com/screenshot.png [proof: runtime]"));
     expect(res.exitCode).not.toBe(0);

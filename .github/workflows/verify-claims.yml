@@ -25,6 +25,9 @@ jobs:
   verify:
     name: Verify PR proof block
     runs-on: ubuntu-latest
+    # The job makes network calls (the body render, run lookups); a hung one
+    # should fail the check in minutes, not leave it pending for six hours.
+    timeout-minutes: 10
 
     # Skip draft PRs
     if: |
