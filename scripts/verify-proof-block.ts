@@ -1,16 +1,22 @@
 #!/usr/bin/env bun
 /**
- * Validates the ## Proof block in a PR body.
+ * Validates the ## Proof block in a PR body, as GitHub renders it.
  *
  * Usage:
  *   cat pr-body.md | bun verify-proof-block.ts
  *   bun verify-proof-block.ts --body-file pr-body.md
  *
+ * Every run sends the body to GitHub's Markdown API (POST /markdown) and
+ * validates the returned HTML. That call needs network access and no token
+ * permission; without GITHUB_TOKEN it is unauthenticated (60 requests/hour).
+ *
  * Required env vars (when validating CI run URLs):
  *   GITHUB_TOKEN          - GitHub token with repo read access
  *   PR_HEAD_SHA           - SHA of the PR head commit
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
- *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"
+ *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"; the rendering
+ *                            context (how `#123` references link). Falls back
+ *                            to PR_HEAD_REPO_FULL_NAME
  *   OWNED_REPOS            - comma-separated list of repos Florian owns
  *   PR_BASE_REF            - the PR's base branch, e.g. "main". Without it the
  *                            clean-integrate witness cannot anchor a merge and
@@ -28,10 +34,6 @@
 
 import { readFileSync, existsSync, realpathSync, statSync } from "fs";
 import { resolve, sep } from "path";
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkRehype from "remark-rehype";
-import rehypeRaw from "rehype-raw";
 import { parseFragment } from "parse5";
 import {
   cleanIntegrateWitness,
@@ -46,8 +48,9 @@ import {
 interface ProofLine {
   key: string;
   checked: boolean;
-  value: string; // everything after "key: "
+  value: string; // the rendered text after "key: "
   raw: string;
+  links: string[]; // hrefs of the links on the line
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ type ArtifactUrl =
   | { kind: "ci-run"; owner: string; repo: string; runId: string }
   | { kind: "ci-run-wrong-host"; host: string }
   | { kind: "ci-run-bad-id"; id: string }
+  | { kind: "ci-run-insecure" }
   | { kind: "insecure" }
   | { kind: "url" }
   | { kind: "not-url" };
@@ -151,7 +155,7 @@ function classifyArtifactUrl(value: string): ArtifactUrl {
     if (host !== "github.com" || parsed.port !== "") {
       return { kind: "ci-run-wrong-host", host: parsed.host.toLowerCase() };
     }
-    if (parsed.protocol !== "https:") return { kind: "insecure" };
+    if (parsed.protocol !== "https:") return { kind: "ci-run-insecure" };
     const id = runMatch[3]!.replace(AUTOLINK_TRAILING, "");
     if (!/^\d+$/.test(id)) return { kind: "ci-run-bad-id", id: runMatch[3]! };
     // owner/repo come out of the DECODED path and are interpolated into the API
@@ -192,196 +196,223 @@ function readBody(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: parse Markdown and HTML once, retaining source coordinates
+// Step 2: have GitHub render the body, then read the rendered HTML
 // ---------------------------------------------------------------------------
 
-// These are the shared structural fields used by both mdast and hast. Neither
-// tree's normalized text is an artifact: validation still receives source text.
-interface SyntaxNode {
-  type: string;
-  value?: string;
-  depth?: number;
-  tagName?: string;
-  children?: SyntaxNode[];
-  position?: {
-    start: { line: number; offset?: number };
-    end?: { offset?: number };
-  };
-}
-
-type SourceRange = [start: number, end: number];
-
-const markdownParser = unified()
-  .use(remarkParse)
-  .use(remarkRehype, { allowDangerousHtml: true })
-  .use(rehypeRaw);
-
-function walk(node: SyntaxNode, visit: (node: SyntaxNode) => boolean | void): void {
-  if (visit(node) === false) return;
-  for (const child of node.children ?? []) walk(child, visit);
-}
-
-function sourceRange(node: SyntaxNode): SourceRange | null {
-  const start = node.position?.start?.offset;
-  const end = node.position?.end?.offset;
-  return start !== undefined && end !== undefined && end >= start
-    ? [start, end]
-    : null;
-}
-
-/** Remove only parser-identified ranges; never interpret Markdown with regex. */
-function omitRanges(source: string, ranges: SourceRange[], blank = false): string {
-  let cursor = 0;
-  const out: string[] = [];
-  for (const [start, end] of [...ranges].sort((a, b) => a[0] - b[0])) {
-    if (end <= cursor) continue;
-    out.push(source.slice(cursor, Math.max(cursor, start)));
-    if (blank) {
-      out.push(source.slice(Math.max(cursor, start), end).replace(/[^\n]/g, " "));
-    }
-    cursor = end;
-  }
-  out.push(source.slice(cursor));
-  return out.join("");
-}
-
 /**
- * A Markdown node may only supply evidence if it remains an HTML element after
- * raw HTML is parsed. Source coordinates join the two trees, so raw <h2>/<li>
- * tags cannot invent Markdown proof entries. Reference checks include visible
- * HTML text, but never HTML attributes, comments, or code examples.
+ * The gate validates the document a reviewer sees, so it asks GitHub for it.
  *
- * rehype-raw recovers from incomplete raw tokens when it meets a structured
- * node. In particular, `<!-- a --> <!--` does NOT hide the following heading
- * there, although a browser consuming serialized HTML would still be inside
- * the comment. Reject incomplete HTML with parse5 before that recovery occurs.
- * This check is scoped to real HTML nodes: `<!--` in inline code or in a quoted
- * HTML attribute cannot accidentally change the document's comment state.
+ * Three earlier versions of this file emulated GitHub instead: a line scanner,
+ * then a patched line scanner, then remark + rehype-raw. Each one hid text in
+ * places GitHub shows it — a raw `<code>` or `<plaintext>` line, a `<!x`
+ * declaration, a footnote, an `<xmp>` block — because GitHub renders with
+ * cmark-gfm 0.29 and then sanitizes, while the emulation followed CommonMark
+ * 0.31 and browser HTML rules. Every disagreement was a way to show reviewers a
+ * checked box the gate never validated.
+ *
+ * `POST /markdown` in gfm mode is the renderer behind a PR's `body_html`
+ * (identical output, checked on this repo's PR #15), needs no token permission,
+ * and works with no token at all at 60 requests an hour. It is the only network
+ * call every run makes, so it is retried; a body that cannot be rendered is a
+ * failure, never a pass.
  */
-/**
- * A PR body the gate refuses to interpret. Reported like a missing ## Proof
- * section (one ERROR line plus the template hint), never as an uncaught
- * exception with a stack trace.
- */
-class ProofBodyError extends Error {}
+class RenderError extends Error {}
 
-function parseProofDocument(body: string): {
+const RENDER_ATTEMPTS = 3;
+
+async function renderBody(body: string): Promise<string> {
+  // The context repo only affects how `#123` and `@user` references link.
+  const context = PR_BASE_REPO || PR_HEAD_REPO;
+  const payload = JSON.stringify({ text: body, mode: "gfm", ...(context ? { context } : {}) });
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "Content-Type": "application/json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+
+  let failure = "";
+  for (let attempt = 1; attempt <= RENDER_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${GITHUB_API_URL}/markdown`, { method: "POST", headers, body: payload });
+      if (res.ok) return await res.text();
+      failure = `HTTP ${res.status}: ${(await res.text()).trim().slice(0, 200)}`;
+      // Only a server error or a throttle can change on retry.
+      if (res.status < 500 && res.status !== 429) break;
+    } catch (err) {
+      failure = String(err);
+    }
+    if (attempt < RENDER_ATTEMPTS) await Bun.sleep(500 * attempt);
+  }
+  throw new RenderError(
+    `could not render the PR body through GitHub's Markdown API (${failure}). ` +
+    "The gate validates the body as GitHub displays it and cannot run without that rendering."
+  );
+}
+
+// The parse5 default tree, reduced to the fields read here.
+interface HtmlNode {
+  nodeName: string;
+  tagName?: string;
+  value?: string;
+  attrs?: { name: string; value: string }[];
+  childNodes?: HtmlNode[];
+  content?: HtmlNode; // <template>
+  parentNode?: HtmlNode | null;
+}
+
+function childrenOf(node: HtmlNode): HtmlNode[] {
+  // A <template>'s children live in `content`. GitHub's sanitizer strips the
+  // element today; walking into it anyway means a future sanitizer change
+  // cannot hide a checkbox from the gate.
+  return [...(node.childNodes ?? []), ...(node.content?.childNodes ?? [])];
+}
+
+/**
+ * Descendants in document order, iteratively: a PR body can nest 30,000 levels
+ * deep, and a recursive walk turns that into a stack overflow instead of a
+ * verdict. `prune` skips a node together with everything under it.
+ */
+function* descendants(node: HtmlNode, prune: (n: HtmlNode) => boolean = () => false): Generator<HtmlNode> {
+  const stack = [...childrenOf(node)].reverse();
+  while (stack.length > 0) {
+    const n = stack.pop()!;
+    if (prune(n)) continue;
+    yield n;
+    const kids = childrenOf(n);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]!);
+  }
+}
+
+function attr(node: HtmlNode, name: string): string | undefined {
+  return node.attrs?.find((a) => a.name === name)?.value;
+}
+
+const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
+
+/**
+ * Elements that separate text. Without a break at their edges the text of two
+ * paragraphs joins, and `[proof:` at the end of one could pair with `key]` at
+ * the start of the next.
+ */
+const BLOCK_TAGS = new Set([
+  "address", "article", "aside", "blockquote", "br", "dd", "details", "div", "dl",
+  "dt", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
+  "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "summary",
+  "table", "td", "th", "tr", "ul",
+]);
+
+/**
+ * A `<code>` or `<pre>` element is a code example when it holds only inline
+ * content. That is what backtick spans, fenced blocks and indented blocks
+ * render to, and a `[proof: key]` inside one is the syntax being shown, not a
+ * claim. A raw `<code>` wrapped around Markdown blocks renders those blocks —
+ * paragraphs, lists, checkboxes — in a monospace font; that is prose a reviewer
+ * reads, so its tokens are claims like any other.
+ */
+function isCodeExample(node: HtmlNode): boolean {
+  if (node.tagName !== "code" && node.tagName !== "pre") return false;
+  for (const n of descendants(node)) {
+    if (n.tagName !== undefined && n.tagName !== "br" && BLOCK_TAGS.has(n.tagName)) return false;
+  }
+  return true;
+}
+
+/**
+ * The text of one proof line: its list item, without the lists nested under it
+ * (each nested checkbox is a proof line of its own). Links are collected so a
+ * run cited as `[CI run](…/actions/runs/1)` is looked up by its target, which is
+ * where the rendered link sends the reader.
+ */
+function lineOf(item: HtmlNode): { text: string; links: string[] } {
+  const text: string[] = [];
+  const links: string[] = [];
+  for (const n of descendants(item, (n) => n.tagName === "ul" || n.tagName === "ol")) {
+    if (n.nodeName === "#text") text.push(n.value ?? "");
+    const href = n.tagName === "a" ? attr(n, "href") : undefined;
+    if (href) links.push(href);
+  }
+  return { text: collapse(text.join("")), links };
+}
+
+function closestItem(node: HtmlNode): HtmlNode | null {
+  for (let n = node.parentNode; n; n = n.parentNode) {
+    if (n.tagName === "li") return n;
+  }
+  return null;
+}
+
+const PROOF_LINE_RE = /^(\S+?):\s+(.*)$/;
+
+function parseRenderedBody(html: string): {
   proofLines: ProofLine[] | null;
+  malformed: string[];
   tokenText: string;
 } {
-  // Normalize before parsing so both trees and every source slice agree on
-  // offsets, including bodies authored with CRLF in GitHub's editor.
-  const source = body.replace(/\r\n?/g, "\n");
-  const markdown = markdownParser.parse(source);
-  const headings: SyntaxNode[] = [];
-  const items: SyntaxNode[] = [];
-  const comments: SourceRange[] = [];
-  const excluded: SourceRange[] = [];
+  const root = parseFragment(html) as unknown as HtmlNode;
+  const tokenText: string[] = [];
+  let proofSeen = false;
+  const boxes: HtmlNode[] = [];
 
-  walk(markdown, (node) => {
-    const range = sourceRange(node);
-    if (node.type === "code" || node.type === "inlineCode") {
-      if (range) excluded.push(range);
-      return false;
+  // Iterative pre-order walk; an `exit` frame closes a block element.
+  const stack: { node: HtmlNode; inExample: boolean; exit?: boolean }[] = [
+    { node: root, inExample: false },
+  ];
+  while (stack.length > 0) {
+    const { node, inExample, exit } = stack.pop()!;
+    const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
+    if (exit) {
+      if (block) tokenText.push("\n");
+      continue;
     }
-    if (node.type === "html") {
-      const fragment = parseFragment(node.value ?? "", {
-        onParseError(error) {
-          if (error.code.startsWith("eof-")) {
-            throw new ProofBodyError(
-              "PR body does not contain a ## Proof section whose visibility can be verified: " +
-              `incomplete HTML at line ${node.position?.start.line} (${error.code}).`
-            );
-          }
-        },
-      });
-      if (range) {
-        excluded.push(range);
-        // Preserve the existing removal of comments from artifact lines, but
-        // leave actual HTML tags, link wrappers, and inline-code values intact.
-        if (
-          fragment.childNodes.some((child) => child.nodeName === "#comment") &&
-          fragment.childNodes.every((child) =>
-            child.nodeName === "#comment" ||
-            (child.nodeName === "#text" && "value" in child && !child.value.trim())
-          )
-        ) {
-          comments.push(range);
-        }
-      }
-      return false;
+    if (node.nodeName === "#text") {
+      if (!inExample) tokenText.push(node.value ?? "");
+      continue;
     }
-    if (node.type === "heading" && node.depth === 2) headings.push(node);
-    if (node.type === "listItem" && node.children?.[0]?.type === "paragraph") {
-      items.push(node);
+    // The FIRST Proof heading opens the section. Every checkbox after it is a
+    // proof line, including any under a second Proof heading, so no box a
+    // reviewer can see is left out of validation.
+    if (!proofSeen && node.tagName === "h2") {
+      proofSeen = lineOf(node).text === "Proof";
     }
-  });
-
-  const html = markdownParser.runSync(markdown);
-  const visibleHeadings = new Set<number>();
-  const visibleItems = new Set<number>();
-  const visibleText: string[] = [];
-  const literalElements = new Set([
-    "code", "pre", "script", "style", "textarea", "title", "iframe",
-    "noembed", "noframes", "xmp", "plaintext", "template", "noscript",
-  ]);
-  walk(html, (node) => {
-    const range = sourceRange(node);
-    if (node.type === "element" && literalElements.has(node.tagName ?? "")) {
-      if (!range) {
-        throw new ProofBodyError("Cannot determine the source range of an HTML code container.");
-      }
-      excluded.push(range);
-      visibleText.push("\n");
-      return false;
+    // GitHub's sanitizer removes raw <input> elements, so every checkbox in the
+    // rendered body comes from task-list syntax.
+    if (proofSeen && node.tagName === "input" && attr(node, "type")?.toLowerCase() === "checkbox") {
+      boxes.push(node);
     }
-    if (node.type === "element" && range) {
-      if (node.tagName === "h2") visibleHeadings.add(range[0]);
-      if (node.tagName === "li") visibleItems.add(range[0]);
-    }
-    if (node.type === "text") visibleText.push(node.value ?? "");
-  });
-
-  function sourceLine(node: SyntaxNode): string {
-    const offset = node.position!.start.offset!;
-    const start = source.lastIndexOf("\n", offset - 1) + 1;
-    const next = source.indexOf("\n", offset);
-    const end = next < 0 ? source.length : next;
-    const lineComments: SourceRange[] = comments
-      .filter(([a, b]) => a < end && b > start)
-      .map(([a, b]) => [Math.max(a, start) - start, Math.min(b, end) - start]);
-    return omitRanges(source.slice(start, end), lineComments);
+    if (block) tokenText.push("\n");
+    const example = inExample || isCodeExample(node);
+    stack.push({ node, inExample, exit: true });
+    const kids = childrenOf(node);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example });
   }
 
-  // Keep the exact source grammar and the last matching heading through EOF.
-  // Node slices alone would erase `>` / list prefixes and broaden that grammar.
-  const proofHeading = headings.filter((node) =>
-    visibleHeadings.has(node.position!.start.offset!) &&
-    /^##\s+Proof\s*$/.test(sourceLine(node).trim())
-  ).at(-1);
-  // Keep source spelling (including reference-link brackets) and also inspect
-  // HTML text. A raw <div> can contain visible tokens as well as hidden markup;
-  // excluding the entire raw node without this second projection hides claims.
-  // Both projections come from this parse, and validation deduplicates keys.
-  const sourceTokens = omitRanges(omitRanges(source, excluded, true), comments);
-  const tokenText = sourceTokens + "\n" + visibleText.join("");
-  if (!proofHeading) return { proofLines: null, tokenText };
+  if (!proofSeen) return { proofLines: null, malformed: [], tokenText: tokenText.join("") };
 
   const proofLines: ProofLine[] = [];
-  for (const node of items) {
-    const offset = node.position!.start.offset!;
-    if (offset <= proofHeading.position!.start.offset! || !visibleItems.has(offset)) continue;
-    const raw = sourceLine(node);
-    const match = raw.match(/^-\s+\[([ xX])\]\s+(\S+?):\s+(.*)$/);
-    if (!match) continue;
+  const malformed: string[] = [];
+  const seenItems = new Set<HtmlNode>();
+  for (const box of boxes) {
+    const item = closestItem(box) ?? box.parentNode ?? box;
+    if (seenItems.has(item)) continue;
+    seenItems.add(item);
+    const { text, links } = lineOf(item);
+    const match = text.match(PROOF_LINE_RE);
+    if (!match) {
+      malformed.push(
+        `Proof checkbox is not in "key: value" form: "${text}". Every checkbox after ## Proof is a proof line.`
+      );
+      continue;
+    }
     proofLines.push({
-      key: match[2]!,
-      checked: match[1]!.toLowerCase() === "x",
-      value: stripTrailingProofTag(match[3]!.trim()),
-      raw,
+      key: match[1]!,
+      checked: attr(box, "checked") !== undefined,
+      value: stripTrailingProofTag(match[2]!.trim()),
+      raw: text,
+      links,
     });
   }
-  return { proofLines, tokenText };
+  return { proofLines, malformed, tokenText: tokenText.join("") };
 }
 
 /**
@@ -402,7 +433,7 @@ function parseProofDocument(body: string): {
  *
  * Tag format mirrors the [proof: KEY] inline-token regex elsewhere in this
  * file: case-sensitive `proof:`, allow whitespace around the key.
- * Inline-token validation (validateInlineTokens) still scans the original
+ * Inline-token validation (validateInlineTokens) still scans the rendered
  * body text, so the self-reference tags are still counted there — stripping
  * here only affects artifact validation.
  */
@@ -449,8 +480,8 @@ const NA_PREFIX_RE = /^n\/a\b/i;
  * or `null` when the value is an `n/a` whose reason is not attached in a form
  * we recognise.
  *
- * A spaced ASCII hyphen counts as a separator here even though
- * stripArtifactDescription deliberately excludes it. The two are not the same
+ * An ASCII hyphen counts as a separator here, with or without spaces around
+ * it, even though stripArtifactDescription deliberately excludes it. The two are not the same
  * question: an `n/a` reason is prose, while a real artifact may be a file path
  * full of hyphens. Requiring an em-dash left the rule one keystroke from
  * unenforced — `n/a - no device` was silently accepted on a cross-owner PR.
@@ -486,6 +517,12 @@ function looksLikeFilePath(artifact: string): boolean {
  * Resolution is now only ever against GITHUB_WORKSPACE, which the workflow
  * points at the PR head checkout.
  */
+// The path is read from the rendered line, so `scripts/__tests__/x.ts` arrives
+// as `scripts/tests/x.ts` with "tests" in bold — which is also what the
+// reviewer sees. Say how to keep a path intact wherever a path is refused.
+const PATH_HINT =
+  "(read as GitHub displays it; put paths in backticks so Markdown formatting cannot change them)";
+
 function validateFilePath(key: string, artifact: string, errors: string[]): void {
   const workspace = process.env.GITHUB_WORKSPACE;
 
@@ -511,7 +548,7 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
     return;
   }
   if (!existsSync(full)) {
-    errors.push(`[${key}] File path does not exist: ${artifact}`);
+    errors.push(`[${key}] File path does not exist: ${artifact} ${PATH_HINT}`);
     return;
   }
 
@@ -556,7 +593,7 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
 
   if (answered || looksLikeRepo) {
     errors.push(
-      `[${key}] File path is not committed to the PR branch: ${artifact}`
+      `[${key}] File path is not committed to the PR branch: ${artifact} ${PATH_HINT}`
     );
     if (!answered) {
       console.error(
@@ -581,15 +618,59 @@ function realpathOrSelf(path: string): string {
 }
 
 /**
+ * Validates a URL that looks like an Actions run and ignores any other kind.
+ * `looked` holds the runs already asked about for this line, so a run cited
+ * as both text and link is looked up once. Shared by artifact values and by
+ * the links on a proof line.
+ */
+async function validateRunUrl(
+  key: string,
+  url: ArtifactUrl,
+  shown: string,
+  looked: Set<string>,
+  errors: string[]
+): Promise<void> {
+  switch (url.kind) {
+    case "ci-run": {
+      const run = `${url.owner}/${url.repo}/${url.runId}`.toLowerCase();
+      if (looked.has(run)) return;
+      looked.add(run);
+      await validateCIRun(key, url.owner, url.repo, url.runId, errors);
+      return;
+    }
+    case "ci-run-wrong-host":
+      errors.push(`[${key}] CI run URL must be on github.com, got host "${url.host}": ${shown}`);
+      return;
+    case "ci-run-bad-id":
+      errors.push(`[${key}] CI run URL has an unreadable run id "${url.id}": ${shown}`);
+      return;
+    case "ci-run-insecure":
+      errors.push(`[${key}] Artifact URL must use https, not http: ${shown}`);
+      return;
+  }
+}
+
+/**
  * Validates one artifact value — the part of a proof line that is supposed to
- * BE the evidence. Shared by the checked and the unchecked path so the two
- * cannot drift apart.
+ * BE the evidence — and every link on the line that points at an Actions run.
+ * Shared by the checked and the unchecked path so the two cannot drift apart.
+ *
+ * The links matter because the value is the rendered TEXT. `[CI run](…/runs/1)`
+ * renders as the text "CI run", which is prose, while the reader clicking it
+ * lands on run 1. So a run a line links to is looked up whatever the text says,
+ * and a run that is both the text and the link is looked up once.
  */
 async function validateArtifact(
   key: string,
   value: string,
+  links: string[],
   errors: string[]
 ): Promise<void> {
+  const looked = new Set<string>();
+  for (const href of links) {
+    await validateRunUrl(key, classifyArtifactUrl(href), href, looked, errors);
+  }
+
   // Strip an optional " — <description>" annotation so only the artifact
   // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
   const artifact = stripArtifactDescription(value);
@@ -597,17 +678,10 @@ async function validateArtifact(
   const url = classifyArtifactUrl(artifact);
   switch (url.kind) {
     case "ci-run":
-      await validateCIRun(key, url.owner, url.repo, url.runId, errors);
-      return;
     case "ci-run-wrong-host":
-      errors.push(
-        `[${key}] CI run URL must be on github.com, got host "${url.host}": ${artifact}`
-      );
-      return;
     case "ci-run-bad-id":
-      errors.push(
-        `[${key}] CI run URL has an unreadable run id "${url.id}": ${artifact}`
-      );
+    case "ci-run-insecure":
+      await validateRunUrl(key, url, artifact, looked, errors);
       return;
     case "insecure":
       errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
@@ -636,7 +710,7 @@ async function validateProofLine(
   isUpstream: boolean,
   errors: string[]
 ): Promise<void> {
-  const { key, checked, value } = line;
+  const { key, checked, value, links } = line;
 
   if (!checked) {
     if (NA_PREFIX_RE.test(value)) {
@@ -670,7 +744,7 @@ async function validateProofLine(
     // [proof: KEY] strip shortened the value to something the n/a classifier
     // no longer recognised. The classifier and the fallthrough disagreed, and
     // the strip moved the boundary between them.
-    await validateArtifact(key, value, errors);
+    await validateArtifact(key, value, links, errors);
     return;
   }
 
@@ -686,7 +760,7 @@ async function validateProofLine(
     return;
   }
 
-  await validateArtifact(key, value, errors);
+  await validateArtifact(key, value, links, errors);
 }
 
 /**
@@ -807,8 +881,8 @@ function validateInlineTokens(
   const seen = new Set<string>();
   const tokenRe = /\[proof:\s*([^\]]+)\]/g;
 
-  // Exclusions come from the same parsed document that authorized the lines.
-  // Raw token spelling is preserved; escaped or mismatched backticks are text.
+  // The text comes from the same rendering that produced the proof lines, with
+  // code examples already left out; escaped or mismatched backticks are text.
   let m: RegExpExecArray | null;
   while ((m = tokenRe.exec(tokenText)) !== null) {
     const ref = m[1].trim();
@@ -830,22 +904,19 @@ async function main(): Promise<void> {
   const body = readBody();
   const errors: string[] = [];
 
-  // 1. Find proof section
-  let parsed: ReturnType<typeof parseProofDocument>;
+  // 1. Render the body through GitHub and find the proof section in the result
+  let html: string;
   try {
-    parsed = parseProofDocument(body);
+    html = await renderBody(body);
   } catch (err) {
-    if (!(err instanceof ProofBodyError)) throw err;
+    if (!(err instanceof RenderError)) throw err;
     console.error(`ERROR: ${err.message}`);
-    console.error(
-      'Every PR must end with a ## Proof block. See https://github.com/florianhorner/gh-workflows for the template.'
-    );
     process.exit(1);
   }
-  const { proofLines, tokenText } = parsed;
+  const { proofLines, malformed, tokenText } = parseRenderedBody(html);
   if (proofLines === null) {
     console.error(
-      "ERROR: PR body does not contain a ## Proof section anchored to end-of-body."
+      "ERROR: PR body does not contain a ## Proof section as GitHub renders it (a level-2 heading reading exactly \"Proof\")."
     );
     console.error(
       'Every PR must end with a ## Proof block. See https://github.com/florianhorner/gh-workflows for the template.'
@@ -853,8 +924,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 2. Require at least one visible checkbox entry
-  if (proofLines.length === 0) {
+  // 2. Every checkbox after the heading must be a readable proof line, and
+  //    there must be at least one
+  errors.push(...malformed);
+  if (proofLines.length === 0 && malformed.length === 0) {
     errors.push(
       "## Proof section found but contains no checkbox lines. Add at least one proof entry."
     );

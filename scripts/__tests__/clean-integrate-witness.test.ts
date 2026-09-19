@@ -11,6 +11,7 @@ import {
   type GitRunner,
   type GitResult,
 } from "../clean-integrate-witness";
+import { runResponse, startApiStub, stubUrl } from "./github-api-stub";
 
 // Every case below builds a real repository and asks the real git. A fake
 // GitRunner would let these tests agree with a wrong mental model of merge-tree,
@@ -627,18 +628,10 @@ describe("validateCIRun wiring", () => {
     server = undefined;
   });
 
-  // 127.0.0.1, not the default wildcard: a test has no business listening on
-  // every interface of a shared runner.
+  // Serves the recorded body rendering and this run for every run lookup.
   function serveRun(headSha: string, conclusion = "success") {
-    server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      fetch: () =>
-        new Response(JSON.stringify({ conclusion, head_sha: headSha }), {
-          headers: { "content-type": "application/json" },
-        }),
-    });
-    return `http://127.0.0.1:${server.port}`;
+    server = startApiStub(runResponse(conclusion, headSha));
+    return stubUrl(server);
   }
 
   function bodyCiting(runId: string): string {

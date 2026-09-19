@@ -51,17 +51,19 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 
 | Rule | Detail |
 |------|--------|
-| Block present | PR body must contain `## Proof` at end-of-body |
-| Markdown structure | Headings and checkboxes must be real Markdown nodes that survive HTML parsing. Fenced or indented examples, raw HTML lookalikes, and commented-out claims do not count |
-| Checked boxes have real artifacts | `https://` URL, test name, repo-relative file path, or `n/a — <reason>` |
-| Unchecked boxes | Either `n/a — <reason>` with a non-empty reason, or a real artifact, which is then validated like a checked one. `—`, `–` and a spaced `-` all separate the reason |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`.,:;!~)`) ignored — so every spelling that renders as a link to the run is looked up rather than waved through |
+| Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
+| Block present | The rendered body must contain a level-2 heading reading exactly `Proof`, however it is written (`## Proof`, setext, inside a list or quote) |
+| Every box is a proof line | Every checkbox after the first `Proof` heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value`; a box that does not is an error, never skipped |
+| Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
+| Checked boxes have real artifacts | `https://` URL, test name, or repo-relative file path. `n/a` on a checked box is an error |
+| Unchecked boxes | Either `n/a` with a non-empty reason after `—`, `–` or `-` (spacing optional), or a real artifact, which is then validated like a checked one |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. Every link on a proof line that points at a run is looked up by its target, so `[CI run](…/actions/runs/1)`, a reference link and `<…/actions/runs/1>` are all checked |
 | Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
 | Artifact URL scheme | `http://` is rejected |
 | File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
-| Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) parse identically to LF |
+| Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) render identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
-| Inline `[proof: key]` tokens | Must match an existing proof line key, including references visible in raw HTML text. Code examples, HTML attributes, and comments are excluded |
+| Inline `[proof: key]` tokens | Every token in the rendered text must match a proof line key. Code examples (backtick spans, fenced and indented blocks) are excluded; a raw `<code>` wrapped around Markdown blocks renders as prose and is checked. Comments and HTML attributes are never rendered text |
 | Draft PRs | Exempt |
 | Bot authors | `dependabot[bot]`, `pre-commit-ci[bot]`, `github-actions[bot]` exempt |
 
@@ -183,6 +185,10 @@ cat your-pr-body.md | bun verify-proof-block.ts
 bun verify-proof-block.ts --body-file your-pr-body.md
 ```
 
+Every run sends the body to `https://api.github.com/markdown` to have it
+rendered, so it needs network access. The endpoint needs no token permission;
+without `GITHUB_TOKEN` the call is unauthenticated and limited to 60 an hour.
+
 Required env vars for full CI URL validation:
 
 ```
@@ -200,7 +206,10 @@ GITHUB_WORKSPACE=/path/to/a/full/clone   # the witness runs git here, and checks
                                          # failure. Unset, existence is not
                                          # checked at all, but an absolute or
                                          # escaping path is still rejected
-GITHUB_API_URL=https://api.github.com    # optional; override for GHES
+GITHUB_API_URL=https://api.github.com    # optional; where the body is rendered
+                                         # and runs are looked up. A hook for
+                                         # the test suite, not GHES support:
+                                         # run URLs must be on github.com
 PR_HEAD_REPO_FULL_NAME=florianhorner/your-repo
 PR_BASE_REPO_FULL_NAME=florianhorner/your-repo
 OWNED_REPOS=florianhorner/govee2mqtt,florianhorner/mammamiradio
@@ -212,6 +221,16 @@ OWNED_REPOS=florianhorner/govee2mqtt,florianhorner/mammamiradio
 cd scripts
 bun install
 bun test
+```
+
+The tests never call GitHub. A local stub answers `POST /markdown` with
+renderings GitHub produced, recorded in `scripts/__tests__/fixtures/github-renders.json`,
+so each case is judged against the HTML GitHub really returns for its body. A
+body without a recording fails its test and names the fix. After adding or
+changing a test body:
+
+```bash
+RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test
 ```
 
 ## `body-lint` — editorial boundary for PR bodies, issue bodies and changelogs
@@ -358,19 +377,33 @@ against it.
   name a tracked file: `git ls-files` is queried with a literal pathspec (a lone
   `.` used to satisfy it), directories are rejected, and when git cannot answer
   the check fails closed and says why.
-- **CRLF bodies parse.** `.` excludes `\r` and `$` was not multiline-anchored, so
+- **CRLF bodies are read.** `.` excludes `\r` and `$` was not multiline-anchored, so
   on a CRLF body every proof line was dropped while the heading survived — the
   error blamed a missing checkbox list. GitHub stores web-UI-authored and
   web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
   gate the moment someone fixes a typo in the description.
-- **Fenced, indented and commented-out claims are not evidence.** Checkbox lines
-  inside a code fence within the `## Proof` section, a tilde fence with tildes
-  in its info string (`~~~ template ~~~`), a 4-space-indented fence, raw HTML
-  lookalikes of a heading or checkbox, and claims after a dangling `<!--` all
-  used to count while GitHub rendered none of them. The verifier now parses the
-  body once instead of scanning lines; see "Markdown and HTML parsing" below.
-  An unfinished comment or tag is reported as a gate error with the line
-  number, not as a crash.
+- **The gate reads the body GitHub renders.** The line scanner and the parser
+  that briefly replaced it both disagreed with GitHub, and each disagreement
+  was a bypass: a checkbox inside a code fence, a tilde fence with tildes in its
+  info string, a 4-space-indented fence, raw HTML lookalikes and claims after a
+  dangling `<!--` counted while GitHub showed none of them; a raw `<code>` or
+  `<plaintext>` line, a `<!x` declaration, an `<xmp>` block or a footnote hid
+  boxes and claims GitHub shows. The body is now rendered by GitHub itself; see
+  "How the body is read" below.
+- **No box after `## Proof` is skipped.** `* [x]`, `+ [x]`, `1. [x]`, nested
+  boxes, a box whose URL sits on the next line, boxes under a second `Proof`
+  heading and boxes in footnotes all used to be ignored while GitHub rendered
+  them as checked boxes. Each is now validated, and a box that does not read
+  `key: value` (`runtime:URL`, `e2e : URL`, `done`) is an error.
+- **Run links are looked up by their target.** A run cited as
+  `[CI run](…/actions/runs/1)`, a reference link or `<…/actions/runs/1>` used to
+  miss run recognition and fail as a missing file path; now the run is checked.
+
+**Behaviour changes for existing bodies:** a file path is read as displayed, so
+a path Markdown reformats (`__tests__` renders as bold "tests") fails until it
+is put in backticks, and the error says so. A `Proof` heading written any way
+GitHub renders as a level-2 heading now opens the section. A failed claim under
+an earlier `Proof` heading is no longer ignored.
 
 **False rejections, now accepted:** a fence at a nested list item's content
 column, a closing fence indented more than three spaces (CommonMark does not
@@ -378,51 +411,53 @@ treat it as a closer), and an unbalanced `<!--` inside inline code, which used
 to swallow the rest of the body so a PR that *discusses* comment stripping could
 not pass.
 
-**Dependencies:** `unified`, `remark-parse`, `remark-rehype`, `rehype-raw` and
-`parse5` are now real, exactly pinned dependencies of `scripts/`. `remark` and
-`unist-util-visit`, previously declared and never imported, are gone.
+**Dependencies:** `parse5` is the only runtime dependency of `scripts/`, exactly
+pinned. `remark`, `remark-parse`, `unified` and `unist-util-visit`, declared on
+`main` and imported but never used, are gone.
 
-### Markdown and HTML parsing
+### How the body is read
 
-The verifier parses Markdown once with `unified` and `remark-parse`, converts
-it with `remark-rehype`, and resolves raw HTML with `rehype-raw`. A heading or
-checkbox can supply evidence only if it originates in Markdown and survives
-HTML parsing. Source positions connect the trees; artifact values come from
-original source lines, with the existing comment and trailing-tag removal.
-Markdown links and code-wrapped artifacts are not silently unwrapped.
+The verifier sends the PR body to GitHub's Markdown API (`POST /markdown`, mode
+`gfm`, with the base repository as context) and validates the HTML it gets back.
+That is the renderer behind a PR's `body_html`: for this repository's PR #15 the
+two are identical byte for byte. The endpoint needs no token permission, so
+callers grant nothing new. The call is retried on server errors and throttling;
+when it still fails, the check fails.
 
-This closes the scanner's nested-list fence, over-indented closing fence,
-indented fake-heading, and inline-comment-literal failures. Escaped or unequal
-backticks remain ordinary text, so they cannot conceal dangling proof tokens.
-Visible references inside raw HTML are checked too; attributes, comments, and
-code containers do not supply references.
+Earlier versions emulated GitHub instead: a line scanner, then
+`unified`/`remark-parse`/`rehype-raw`. GitHub renders with cmark-gfm on
+CommonMark 0.29 and then sanitizes the HTML; the emulation followed CommonMark
+0.31 and browser HTML rules. Wherever the two disagreed, the gate and the
+reviewer read different documents. Asking GitHub removes that whole class
+rather than patching its members one at a time.
 
-`rehype-raw` recovers from unfinished HTML tokens when it reaches a structured
-Markdown node. That recovery alone would reopen the `<!-- a --> <!--` bypass.
-Before conversion, `parse5` checks each actual HTML node and rejects incomplete
-comments, tags, and other end-of-input parse errors. Complete comments, literal
-comment markers inside attributes or code, and normal `<details>` markup remain
-supported. The verifier parses HTML without executing or displaying it.
+From the rendered HTML:
 
-The existing source grammar is preserved: select the last matching `## Proof`
-heading and validate checkbox entries through the end of the body, including
-entries after an unrelated later heading. Parsing failures reject the body.
+- the section opens at the first `<h2>` whose text is exactly `Proof`;
+- every task-list checkbox after it is a proof line. GitHub's sanitizer strips
+  raw `<input>` elements, so a checkbox can only come from task-list syntax;
+- a proof line's text is its list item without the lists nested under it, with
+  whitespace collapsed; the key is the text before the first `: `;
+- `[proof: key]` tokens are read from all rendered text except code examples,
+  meaning a `<code>` or `<pre>` holding only inline content.
+
+The HTML is parsed with `parse5` and walked iteratively, so a deeply nested
+body gets a verdict rather than a stack overflow.
 
 ### Known gaps
 
-The parser enforces CommonMark and HTML structure; it does not claim complete
-parity with GitHub's additional Markdown extensions or final HTML sanitization.
-Incomplete raw HTML fragments are rejected even if later fragments might let a
-browser recover; close each comment and tag within its Markdown HTML node.
+The gate trusts GitHub's Markdown API to render the body the way the PR page
+does. The two matched when checked; if GitHub's renderers ever diverge, the gate
+follows the API. It renders the body from the triggering event, which for an
+`edited` event is the new body. Local runs without `GITHUB_TOKEN` are limited
+to 60 renders an hour.
 
 **Also open, unchanged:** strict mode keys on the *head* repo rather than the
-base (`PR_BASE_REPO_FULL_NAME` is plumbed through the workflow and unused);
-nothing requires any given proof key to be present; the terminal
-`// Anything else: accept` still passes arbitrary prose, including a value with
-no `/` in it, which never reaches the file-path branch at all; and a run URL
-written as a markdown link (`[text](url)`) or an angle autolink (`<url>`) is not
-recognised as a run at all, so in CI it fails as a missing file path. All change
-semantics for existing PR bodies and are tracked separately.
+base (`PR_BASE_REPO_FULL_NAME` is only the rendering context); nothing requires
+any given proof key to be present; and the terminal `// Anything else: accept`
+still passes arbitrary prose, including a value with no `/` in it, which never
+reaches the file-path branch at all. Both change semantics for existing PR
+bodies and are tracked separately.
 
 ## License
 
