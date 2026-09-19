@@ -1469,6 +1469,100 @@ describe("the gate validates the body GitHub renders", () => {
     expect(res.out).toContain("1 proof line(s) checked");
   });
 
+  describe("a proof line cannot hide part of itself", () => {
+    const run1 = "https://github.com/florianhorner/demo/actions/runs/1";
+    const run666 = "https://github.com/florianhorner/demo/actions/runs/666";
+    function runs() {
+      const r = runsById({
+        "1": { conclusion: "success", head_sha: "cafebabe" },
+        "666": { conclusion: "failure", head_sha: "cafebabe" },
+      });
+      const server = startApiStub(r.handler);
+      servers.push(server);
+      return stubUrl(server);
+    }
+    const CONCEALING = "uses <details> or ruby markup, which can hide part of it";
+
+    // GitHub keeps <rp>, the fallback parenthesis of a ruby annotation, and
+    // browsers do not display it. Read as part of the line, a hidden value in
+    // front stood in for the visible one, and a hidden n/a excused a visible
+    // run link. Each of these renders as an ordinary-looking proof line.
+    for (const [label, line] of [
+      ["a hidden URL in front of a path", "- [x] runtime: <ruby><rp>https://x </rp></ruby>`proof/fabricated.txt`"],
+      ["a hidden green run in front of a failed one", `- [x] tests: <ruby><rp>${run1} </rp></ruby>\`${run666}\``],
+      ["a hidden path before an em dash", "- [x] tests: <ruby><rp>proof/real.txt — </rp></ruby>`proof/fake.txt`"],
+      ["a hidden n/a in front of a run link", `- [ ] tests: <ruby><rp>n/a — x</rp></ruby>[CI run on head](${run666})`],
+      ["an <rp> outside <ruby>, which some engines hide", "- [x] runtime: <rp>`proof/fake.txt`</rp>"],
+      ["a collapsed <details>", `- [ ] tests: <details><summary></summary>n/a — x</details>[CI run on head](${run666})`],
+    ] as const) {
+      it(`rejects ${label}`, async () => {
+        const res = await verify(bodyWith(line), { GITHUB_API_URL: runs(), GITHUB_WORKSPACE: workspace() });
+        expect(res.exitCode).not.toBe(0);
+        expect(res.out).toContain(CONCEALING);
+      });
+    }
+
+    it("validates every URL a value shows, not only the first", async () => {
+      const res = await verify(bodyWith(`- [x] tests: ${run1} \`${run666}\``), {
+        GITHUB_API_URL: runs(),
+      });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('CI run 666 conclusion is "failure"');
+    });
+  });
+
+  for (const [label, heading] of [
+    ["a combining grapheme joiner", "## Pro\u034Fof"],
+    ["Cyrillic lookalike letters", "## \u0420\u0433\u043E\u043Ef"],
+    ["trailing punctuation", "## Proof:"],
+    ["a trailing braille blank", "## Proof\u2800"],
+    ["a trailing Hangul filler, a letter that draws nothing", "## Proof\u3164"],
+  ] as const) {
+    it(`opens the section at a heading with ${label} and says it is not ## Proof`, async () => {
+      const api = stubApi("failure", "cafebabe");
+      const res = await verify(
+        [
+          heading, "", `- [x] tests: [CI green on head](${runUrl})`, "",
+          "<details><summary>notes</summary>", "", "## Proof", "", "- [ ] tests: n/a — see above", "", "</details>",
+        ].join("\n"),
+        { GITHUB_API_URL: api }
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain('reads as the Proof heading but is not "## Proof"');
+      expect(res.out).toContain('[tests] CI run 123 conclusion is "failure"');
+    });
+  }
+
+  it("rejects a check-run page cited as an artifact or linked in the section", async () => {
+    const res = await verify(
+      [
+        "## Proof", "", "- [x] tests: https://github.com/florianhorner/demo/runs/666", "",
+        "Checks: [all green](https://github.com/florianhorner/demo/commit/abc123/checks)",
+      ].join("\n")
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("[tests] A check-run page cannot be verified");
+    expect(res.out).toContain("[Proof section] A check-run page cannot be verified");
+  });
+
+  it("follows a www. run link to the https page instead of rejecting it", async () => {
+    const r = runsById({ "123": { conclusion: "success", head_sha: "cafebabe" } });
+    const server = startApiStub(r.handler);
+    servers.push(server);
+    const res = await verify(
+      "## Proof\n\n- [x] tests: TestThing\n\nCI: www.github.com/florianhorner/demo/actions/runs/123",
+      { GITHUB_API_URL: stubUrl(server) }
+    );
+    expect(res.exitCode).toBe(0);
+    expect(r.calls["123"]).toBe(1);
+  });
+
+  it("reads claim tokens in any case and spacing", async () => {
+    const res = await verify(bodyWith("- [x] tests: TestThing", "Fixes it [Proof: missing] and [ proof : missing ]."));
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out.match(/Dangling \[proof: missing\]/g)?.length).toBe(1);
+  });
+
   it("reads a claim token through an invisible character", async () => {
     const res = await verify(bodyWith("- [x] tests: TestThing", "Fixes it [pro\u200Bof: missing]."));
     expect(res.exitCode).not.toBe(0);

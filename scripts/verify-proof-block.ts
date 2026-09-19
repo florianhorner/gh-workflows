@@ -89,6 +89,12 @@ const PROOF_KEY_RE = /^[a-zA-Z_][\w:]*$/;
 // judge it separately, so an id we cannot read is an ERROR rather than a pass.
 const CI_RUN_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([^/]*)/;
 
+// Check-run pages: /{owner}/{repo}/runs/{job id} and /{owner}/{repo}/commit/{sha}/checks.
+// They show a job's result, but nothing here can look one up (that needs the
+// checks API and a permission callers do not grant), so citing one is an error
+// rather than a generic link.
+const CHECK_PAGE_PATH_RE = /^\/[^/]+\/[^/]+\/(?:runs\/[^/]+|commit\/[^/]+\/checks)/;
+
 // Trailing punctuation GFM's autolink extension excludes from a bare link, so
 // `…/runs/123.` at the end of a sentence renders as a link to run 123.
 const AUTOLINK_TRAILING = /[?!.,:;*_~)\]]+$/;
@@ -98,6 +104,7 @@ type ArtifactUrl =
   | { kind: "ci-run-wrong-host"; host: string }
   | { kind: "ci-run-bad-id"; id: string }
   | { kind: "ci-run-insecure" }
+  | { kind: "check-page" }
   | { kind: "insecure" }
   | { kind: "url" }
   | { kind: "not-url" };
@@ -173,6 +180,7 @@ function classifyArtifactUrl(value: string): ArtifactUrl {
     return { kind: "ci-run", owner, repo, runId: id };
   }
 
+  if (host === "github.com" && CHECK_PAGE_PATH_RE.test(path)) return { kind: "check-page" };
   if (parsed.protocol !== "https:") return { kind: "insecure" };
   return { kind: "url" };
 }
@@ -305,7 +313,31 @@ const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
  * space inside "Proof" or "[proof:" changes the string, not what anyone sees).
  * Used to recognise headings and claim tokens, never to read artifact values.
  */
-const readable = (text: string) => text.normalize("NFKC").replace(/\p{Cf}/gu, "");
+const readable = (text: string) =>
+  text.normalize("NFKC").replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
+
+// Letters from other scripts that are drawn like the ones in "proof". NFKC does
+// not fold these; the table is short because only five letters matter.
+const PROOF_LOOKALIKES: Record<string, string> = {
+  "\u0440": "p", "\u03C1": "p", // Cyrillic er, Greek rho
+  "\u0433": "r", // Cyrillic ghe
+  "\u043E": "o", "\u03BF": "o", "\u0585": "o", // Cyrillic o, Greek omicron, Armenian oh
+  "\u0192": "f", // Latin f with hook
+};
+
+/**
+ * Whether a heading reads as "Proof" to a reader: letters only, invisible
+ * characters dropped, case folded, lookalike letters mapped. `Proof:`,
+ * `Proof ✅`, `PROOF` and a Cyrillic `Ргооf` all do. Used only to decide where
+ * the section starts; the heading still has to be exactly `## Proof`.
+ */
+function readsAsProof(text: string): boolean {
+  const letters = [...readable(text).toLowerCase()]
+    .map((c) => PROOF_LOOKALIKES[c] ?? c)
+    .join("")
+    .replace(/[^\p{L}]/gu, "");
+  return letters === "proof";
+}
 
 /**
  * Elements that separate text. Without a break at their edges the text of two
@@ -341,15 +373,28 @@ function isCodeExample(node: HtmlNode): boolean {
  * run cited as `[CI run](…/actions/runs/1)` is looked up by its target, which is
  * where the rendered link sends the reader.
  */
-function lineOf(item: HtmlNode): { text: string; anchors: HtmlNode[] } {
+function lineOf(item: HtmlNode): { text: string; anchors: HtmlNode[]; concealing: boolean } {
   const text: string[] = [];
   const anchors: HtmlNode[] = [];
+  let concealing = false;
   for (const n of descendants(item, (n) => n.tagName === "ul" || n.tagName === "ol")) {
     if (n.nodeName === "#text") text.push(n.value ?? "");
     if (n.tagName === "a" && attr(n, "href")) anchors.push(n);
+    if (n.tagName !== undefined && CONCEALING_TAGS.has(n.tagName)) concealing = true;
   }
-  return { text: collapse(text.join("")), anchors };
+  return { text: collapse(text.join("")), anchors, concealing };
 }
+
+/**
+ * Markup GitHub's sanitizer keeps that hides or overlays text: a collapsed
+ * `<details>`, and ruby, whose `<rp>` fallback text browsers hide (inside
+ * `<ruby>` always, outside it depending on the engine). On a proof line either
+ * lets the gate read text the reviewer does not see — `<rp>https://x </rp>` in
+ * front of a path stood in for the path, a hidden `n/a` excused a visible run
+ * link. Proof lines have no use for it, so a line that contains any is an
+ * error rather than a guess about what a browser shows.
+ */
+const CONCEALING_TAGS = new Set(["details", "ruby", "rp"]);
 
 function closestItem(node: HtmlNode): HtmlNode | null {
   for (let n = node.parentNode; n; n = n.parentNode) {
@@ -398,7 +443,7 @@ function parseRenderedBody(html: string): {
     // lookalike is then an error of its own.
     if (!proofSeen && node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
       const shown = lineOf(node).text;
-      if (collapse(readable(shown)).toLowerCase() === "proof") {
+      if (readsAsProof(shown)) {
         proofSeen = true;
         if (node.tagName !== "h2" || shown !== "Proof") {
           malformed.push(
@@ -430,8 +475,14 @@ function parseRenderedBody(html: string): {
     const item = closestItem(box) ?? box.parentNode ?? box;
     if (seenItems.has(item)) continue;
     seenItems.add(item);
-    const { text, anchors } = lineOf(item);
+    const { text, anchors, concealing } = lineOf(item);
     for (const a of anchors) onLines.add(a);
+    if (concealing) {
+      malformed.push(
+        `Proof line uses <details> or ruby markup, which can hide part of it from the reader: "${text}". Write proof lines as plain text.`
+      );
+      continue;
+    }
     const match = text.match(PROOF_LINE_RE);
     if (!match) {
       malformed.push(
@@ -471,13 +522,13 @@ function parseRenderedBody(html: string): {
  * rejects the dirty string.
  *
  * Tag format mirrors the [proof: KEY] inline-token regex elsewhere in this
- * file: case-sensitive `proof:`, allow whitespace around the key.
+ * file: `proof:` in any case, whitespace allowed around the word and the key.
  * Inline-token validation (validateInlineTokens) still scans the rendered
  * body text, so the self-reference tags are still counted there — stripping
  * here only affects artifact validation.
  */
 function stripTrailingProofTag(value: string): string {
-  return value.replace(/\s*\[proof:\s*[^\]]+\]\s*$/, "").trim();
+  return value.replace(/\s*\[\s*proof\s*:\s*[^\]]+\]\s*$/i, "").trim();
 }
 
 /**
@@ -666,7 +717,13 @@ function resolveHref(href: string): string {
   const repo = PR_BASE_REPO || PR_HEAD_REPO;
   const page = repo ? `https://github.com/${repo}/pull/` : "https://github.com/";
   try {
-    return new URL(href, page).href;
+    const url = new URL(href, page);
+    // A bare `www.github.com/…` is autolinked as http://; github.com answers
+    // it with a redirect to the https page, so that is where the link leads.
+    if (url.protocol === "http:" && url.hostname.toLowerCase().replace(/^www\./, "") === "github.com") {
+      url.protocol = "https:";
+    }
+    return url.href;
   } catch {
     return href;
   }
@@ -702,6 +759,35 @@ async function validateRunUrl(
     case "ci-run-insecure":
       errors.push(`[${key}] Artifact URL must use https, not http: ${shown}`);
       return;
+    case "check-page":
+      errors.push(
+        `[${key}] A check-run page cannot be verified; cite the Actions run (…/actions/runs/<id>) instead: ${shown}`
+      );
+      return;
+  }
+}
+
+async function validateUrlArtifact(
+  key: string,
+  artifact: string,
+  looked: Set<string>,
+  errors: string[]
+): Promise<void> {
+  const url = classifyArtifactUrl(artifact);
+  switch (url.kind) {
+    case "ci-run":
+    case "ci-run-wrong-host":
+    case "ci-run-bad-id":
+    case "ci-run-insecure":
+    case "check-page":
+      await validateRunUrl(key, url, artifact, looked, errors);
+      return;
+    case "insecure":
+      errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
+      return;
+    case "url":
+    case "not-url":
+      return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
   }
 }
 
@@ -729,27 +815,21 @@ async function validateArtifact(
 
   // Strip an optional " — <description>" annotation so only the artifact
   // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
-  let artifact = stripArtifactDescription(value);
-  // A URL cannot contain a space, so for a URL the artifact ends at the first
-  // one: `…/actions/runs/1 (head abc123, success)` is run 1 plus a note, not a
-  // run whose id is "1 (head abc123, success)".
-  if (/^https?:\/\//i.test(artifact)) artifact = artifact.split(/\s/)[0]!;
+  const artifact = stripArtifactDescription(value);
 
-  const url = classifyArtifactUrl(artifact);
-  switch (url.kind) {
-    case "ci-run":
-    case "ci-run-wrong-host":
-    case "ci-run-bad-id":
-    case "ci-run-insecure":
-      await validateRunUrl(key, url, artifact, looked, errors);
-      return;
-    case "insecure":
-      errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
-      return;
-    case "url":
-      return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
-    case "not-url":
-      break;
+  // A URL cannot contain a space, so a value that starts with one is URLs and
+  // notes: `…/actions/runs/1 (head abc123, success)` is run 1 plus a note, not
+  // a run whose id is "1 (head abc123, success)". Every URL in it is judged; a
+  // second one is as visible as the first.
+  if (/^https?:\/\//i.test(artifact)) {
+    for (const token of artifact.split(/\s+/).filter((t) => /^https?:\/\//i.test(t))) {
+      await validateUrlArtifact(key, token, looked, errors);
+    }
+    return;
+  }
+  if (classifyArtifactUrl(artifact).kind !== "not-url") {
+    await validateUrlArtifact(key, artifact, looked, errors);
+    return;
   }
 
   // Test name? /^[a-zA-Z_][\w:]*$/
@@ -960,7 +1040,8 @@ function validateInlineTokens(
 ): void {
   const proofKeys = new Set(proofLines.map((l) => l.key));
   const seen = new Set<string>();
-  const tokenRe = /\[proof:\s*([^\]]+)\]/g;
+  // As loose as a reader: `[Proof: x]` and `[ proof : x ]` are claims too.
+  const tokenRe = /\[\s*proof\s*:\s*([^\]]+)\]/gi;
 
   // The text comes from the same rendering that produced the proof lines, with
   // code examples already left out; escaped or mismatched backticks are text.
