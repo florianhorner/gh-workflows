@@ -18,6 +18,14 @@ import { runResponse, runsById, startApiStub, stubUrl } from "./github-api-stub"
 // Test-only override for proving regressions against an immutable old parser.
 const SCRIPT = process.env.PROOF_TEST_SCRIPT ?? `${import.meta.dir}/../verify-proof-block.ts`;
 
+// Fixture repositories ignore the machine's git config, so a global hooks path,
+// template directory or signing setup cannot run, or wait for input, inside a
+// test. execFileSync blocks the event loop, so the timeout is git's own.
+const GIT_OPTS = {
+  env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+  timeout: 20_000,
+};
+
 let servers: ReturnType<typeof Bun.serve>[] = [];
 let dirs: string[] = [];
 
@@ -589,13 +597,13 @@ describe("the stripper reads the same document GitHub renders", () => {
 describe("a file-path artifact must be committed to the PR branch", () => {
   function gitRepo(): string {
     const d = workspace();
-    execFileSync("git", ["init", "-q"], { cwd: d });
+    execFileSync("git", ["init", "-q"], { cwd: d, ...GIT_OPTS });
     writeFileSync(join(d, "README.md"), "hi\n");
-    execFileSync("git", ["add", "README.md"], { cwd: d });
+    execFileSync("git", ["add", "README.md"], { cwd: d, ...GIT_OPTS });
     execFileSync(
       "git",
       ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
-      { cwd: d }
+      { cwd: d, ...GIT_OPTS }
     );
     return d;
   }
@@ -690,14 +698,14 @@ describe("a fence opener is a fence even when it carries a comment marker", () =
 describe("an artifact must name a committed file, not a container", () => {
   function gitRepoWithProof(): string {
     const d = workspace();
-    execFileSync("git", ["init", "-q"], { cwd: d });
+    execFileSync("git", ["init", "-q"], { cwd: d, ...GIT_OPTS });
     mkdirSync(join(d, "proof"), { recursive: true });
     writeFileSync(join(d, "proof", "real.txt"), "ok\n");
-    execFileSync("git", ["add", "proof/real.txt"], { cwd: d });
+    execFileSync("git", ["add", "proof/real.txt"], { cwd: d, ...GIT_OPTS });
     execFileSync(
       "git",
       ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
-      { cwd: d }
+      { cwd: d, ...GIT_OPTS }
     );
     return d;
   }
@@ -723,14 +731,14 @@ describe("an artifact must name a committed file, not a container", () => {
     rmSync(ws, { recursive: true, force: true });
     mkdirSync(ws, { recursive: true });
     dirs.push(ws);
-    execFileSync("git", ["init", "-q"], { cwd: ws });
+    execFileSync("git", ["init", "-q"], { cwd: ws, ...GIT_OPTS });
     mkdirSync(join(ws, "proof"), { recursive: true });
     writeFileSync(join(ws, "proof", "real.txt"), "ok\n");
-    execFileSync("git", ["add", "proof/real.txt"], { cwd: ws });
+    execFileSync("git", ["add", "proof/real.txt"], { cwd: ws, ...GIT_OPTS });
     execFileSync(
       "git",
       ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
-      { cwd: ws }
+      { cwd: ws, ...GIT_OPTS }
     );
     const res = await verify(
       bodyWith(`- [x] runtime: ${ws}/proof/real.txt [proof: runtime]`),
@@ -1746,7 +1754,9 @@ describe("the rendered-HTML walk", () => {
     expect(res.exitCode).not.toBe(0);
     expect(res.out).toContain("File path does not exist: proof/missing.txt");
     expect(res.out).not.toContain("RangeError");
-  });
+    // parse5 grows faster than linearly with depth; a slow shared runner must
+    // not turn this into a timeout.
+  }, 30_000);
 
   it("reads a checkbox inside a <template> element", async () => {
     const html = `<h2>Proof</h2><template><ul>${box("runtime: proof/missing.txt")}</ul></template>`;
