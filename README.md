@@ -58,7 +58,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
 | Checked boxes have real artifacts | `https://` URL, test name, or repo-relative file path. `n/a` on a checked box is an error |
 | Unchecked boxes | Either `n/a` with a non-empty reason after `—`, `–` or `-` (spacing optional), or a real artifact, which is then validated like a checked one |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below). The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. In a value that starts with a URL (or a bare `www.` address) that URL is the artifact and the rest is a note, so `…/runs/1 (head abc, success)` is run 1; any run in the note is still looked up, even one joined to another URL by a comma, while a plain link or check page there is context. A link whose address cannot be parsed is an error. A check-run page (`/o/r/runs/<job>`, `/o/r/commit/<sha>/checks`) is an error: nothing here can look one up, so cite the Actions run. Every link to a run anywhere in the Proof section is looked up by its target: on a proof line or off one (nested bullets, paragraphs, tables, footnotes), written as `[CI run](…)`, a reference link, `<…>` or a relative href (`/o/r/actions/runs/1`, `../actions/runs/1`), which is resolved the way the PR page resolves it. Links on an unchecked `n/a` line are context for the reason and are not looked up. A run cited several times is fetched once and reported under every line that cites it |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below), and must be in the PR's base repository or its head repository: a run anywhere else is an error, even a green one on the same commit. The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. In a value that starts with a URL (or a bare `www.` address) that URL is the artifact and the rest is a note, so `…/runs/1 (head abc, success)` is run 1; any run in the note is still looked up, even one joined to another URL by a comma, while a plain link or check page there is context. A link whose address cannot be parsed is an error. A check-run page (`/o/r/runs/<job>`, `/o/r/commit/<sha>/checks`) is an error: nothing here can look one up, so cite the Actions run. Every link to a run anywhere in the Proof section is looked up by its target: on a proof line or off one (nested bullets, paragraphs, tables, footnotes), written as `[CI run](…)`, a reference link, `<…>` or a relative href (`/o/r/actions/runs/1`, `../actions/runs/1`), which is resolved the way the PR page resolves it. Links on an unchecked `n/a` line are context for the reason and are not looked up. A run cited several times is fetched once and reported under every line that cites it |
 | Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
 | Artifact URL scheme | `http://` is rejected |
 | File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
@@ -421,6 +421,11 @@ against it.
   disclosures and a second Proof heading after a visible one. This prevents
   an unsupported visual lookalike from steering validation to a hidden
   canonical heading. Notes-only disclosures remain allowed.
+- **A cited run must belong to the PR.** A run was looked up in whatever
+  repository its URL named, so the PR's head commit pushed to any other public
+  repository, with an always-green workflow, produced a run that passed both
+  the `conclusion=success` and the head_sha check. A cited run must now be in
+  the PR's base repository or its head repository.
 - **Check-run pages are not generic links.** `…/runs/<job>` and
   `…/commit/<sha>/checks` show a result the gate cannot look up, so citing one is
   an error instead of a pass.
@@ -480,7 +485,8 @@ From the rendered HTML:
   contain only text, links, code, emphasis, emoji and footnote references, and
   no invisible or text-direction characters; anything else is an error;
 - every link in the section that points at an Actions run is looked up, after
-  resolving it against `https://github.com/<base>/pull/`;
+  resolving it against `https://github.com/<base>/pull/`, and must be in the
+  PR's base or head repository;
 - `[proof: key]` tokens are read from all rendered text, folded the same way as
   headings, except code examples: a `<code>` or `<pre>` holding only inline
   content.

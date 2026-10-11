@@ -1746,6 +1746,51 @@ describe("the rendered-HTML walk", () => {
     expect(res.out).toContain("1 proof line(s) checked");
   });
 
+  function htmlAndRuns(html: string, onRun: (path: string) => Response): string {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+        if (path === "/markdown") return new Response(html, { headers: { "content-type": "text/html" } });
+        return onRun(path);
+      },
+    });
+    servers.push(server);
+    return `http://127.0.0.1:${server.port}`;
+  }
+
+  it("accepts a cited run only from this PR's repository or its head repository", async () => {
+    // Any public repository can run the PR's head commit: push it there, add an
+    // always-green workflow, and head_sha and conclusion both check out.
+    const lookups: string[] = [];
+    const green = (path: string) => {
+      lookups.push(path);
+      return Response.json({ conclusion: "success", head_sha: "cafebabe" });
+    };
+    const citing = (repo: string) =>
+      `<h2>Proof</h2><ul>${box(`tests: <a href="https://github.com/${repo}/actions/runs/7">https://github.com/${repo}/actions/runs/7</a>`)}</ul>`;
+    const fork = { PR_BASE_REPO_FULL_NAME: "florianhorner/demo", PR_HEAD_REPO_FULL_NAME: "someone/fork" };
+
+    const [elsewhere, base, head] = await Promise.all([
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("attacker/anything"), green), ...fork }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("florianhorner/demo"), green), ...fork }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("Someone/Fork"), green), ...fork }),
+    ]);
+
+    expect(elsewhere.exitCode).not.toBe(0);
+    expect(elsewhere.out).toContain(
+      "CI run 7 is in attacker/anything, not in this PR's repository or its head repository (florianhorner/demo, someone/fork)"
+    );
+    expect(base.exitCode).toBe(0);
+    expect(head.exitCode).toBe(0);
+    // The foreign run is refused before anything asks the API about it.
+    expect(lookups.sort()).toEqual([
+      "/repos/Someone/Fork/actions/runs/7",
+      "/repos/florianhorner/demo/actions/runs/7",
+    ]);
+  });
+
   it("walks a 20,000-deep tree without overflowing the stack", async () => {
     const html =
       "<div>".repeat(20000) + "x" + "</div>".repeat(20000) +

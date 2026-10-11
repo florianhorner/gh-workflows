@@ -1054,6 +1054,19 @@ async function checkRun(
     return { problems, notes }; // No SHA context: skip
   }
 
+  // A run says something about this PR only if it ran in the PR's repository
+  // or in the one its head branch lives in. Any public repository can run the
+  // same commit: push it there, add an always-green workflow, and the run's
+  // head_sha and conclusion both check out.
+  const prRepos = [...new Set([PR_BASE_REPO, PR_HEAD_REPO].filter(Boolean))];
+  const citedRepo = `${owner}/${repo}`.toLowerCase();
+  if (prRepos.length > 0 && !prRepos.some((r) => r.toLowerCase() === citedRepo)) {
+    problems.push(
+      `CI run ${runId} is in ${owner}/${repo}, not in this PR's repository or its head repository (${prRepos.join(", ")}); cite a run from one of them.`
+    );
+    return { problems, notes };
+  }
+
   try {
     const res = await fetch(
       `${GITHUB_API_URL}/repos/${owner}/${repo}/actions/runs/${runId}`,
