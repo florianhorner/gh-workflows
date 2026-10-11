@@ -142,12 +142,18 @@ on:
     types: [opened, edited, synchronize, ready_for_review]
 jobs:
   verify:
+    permissions:
+      contents: read
+      actions: read
     uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@fde64f42deb15511c2c71cb9798c2d6685379e38 # v1.5
     with:
       owned_repos: "florianhorner/govee2mqtt,florianhorner/mammamiradio"
 ```
 
 That's it. The reusable workflow handles checkout, Bun setup, and parser execution.
+Keep the `permissions:` block: the reusable workflow needs `actions: read` to look
+up cited runs, and a called workflow cannot raise its caller's token. Under a
+restricted default token the run is refused before it starts.
 
 ### Pin to a SHA, not a tag
 
@@ -391,7 +397,8 @@ against it.
 - **The gate reads the body GitHub renders.** The line scanner and the parser
   that briefly replaced it both disagreed with GitHub, and each disagreement
   was a bypass: a checkbox inside a code fence, a tilde fence with tildes in its
-  info string, a 4-space-indented fence, raw HTML lookalikes and claims after a
+  info string, a 4-space-indented fence, a box or heading after a closing fence
+  indented more than three spaces, raw HTML lookalikes and claims after a
   dangling `<!--` counted while GitHub showed none of them; a raw `<code>` or
   `<plaintext>` line, a `<!x` declaration, an `<xmp>` block or a footnote hid
   boxes and claims GitHub shows. The body is now rendered by GitHub itself; see
@@ -445,10 +452,8 @@ outside the disclosure, even if it uses the `open` attribute; the same holds for
 `<rp>`, `<template>`, `<sup>` and `<sub>`.
 
 **False rejections, now accepted:** a fence at a nested list item's content
-column, a closing fence indented more than three spaces (CommonMark does not
-treat it as a closer), and an unbalanced `<!--` inside inline code, which used
-to swallow the rest of the body so a PR that *discusses* comment stripping could
-not pass.
+column, and an unbalanced `<!--` inside inline code, which used to swallow the
+rest of the body so a PR that *discusses* comment stripping could not pass.
 
 **Dependencies:** `parse5` is the only runtime dependency of `scripts/`, exactly
 pinned. `remark`, `remark-parse`, `unified` and `unist-util-visit`, declared on
@@ -464,7 +469,8 @@ the workflow's existing `contents: read`. GitHub documents additional
 `issues: read` or `pull-requests: read` access for some label rendering; the
 workflow does not grant those optional permissions. Public resources can be
 rendered without a token. The call is retried on server errors and throttling;
-when it still fails, the check fails.
+when it still fails, the check fails. The job stops after 10 minutes, so a hung
+call fails the check instead of leaving it pending.
 
 Earlier versions emulated GitHub instead: a line scanner, then
 `unified`/`remark-parse`/`rehype-raw`. GitHub renders with cmark-gfm on
