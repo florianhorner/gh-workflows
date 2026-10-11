@@ -16,8 +16,9 @@ import { dirname } from "node:path";
 //
 //   RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test
 //
-// Recording sends each test body to api.github.com/markdown. The endpoint needs
-// no token permission; the token only lifts the rate limit from 60 an hour.
+// Recording sends each test body to api.github.com/markdown. These fixtures use
+// public contexts; a token lifts the rate limit from 60 an hour. Private-resource
+// rendering needs contents: read, with extra read scopes for some labels.
 
 const FIXTURE = `${import.meta.dir}/fixtures/github-renders.json`;
 const RECORD = process.env.RECORD_GITHUB_RENDERS === "1";

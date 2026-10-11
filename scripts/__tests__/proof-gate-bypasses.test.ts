@@ -1099,7 +1099,7 @@ describe("CommonMark compatibility", () => {
     });
   }
 
-  it("accepts actual Markdown proof inside details separated by blank lines", async () => {
+  it("rejects actual Markdown proof inside details separated by blank lines", async () => {
     const api = stubApi("success", "cafebabe");
     const res = await verify(
       [
@@ -1108,8 +1108,8 @@ describe("CommonMark compatibility", () => {
       ].join("\n"),
       { GITHUB_API_URL: api }
     );
-    expect(res.exitCode).toBe(0);
-    expect(res.out).toContain("1 proof line(s) checked");
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("The Proof heading must be outside <details>");
   });
 
   for (const [label, prefix] of [
@@ -1678,6 +1678,65 @@ describe("the rendered-HTML walk", () => {
   }
   const box = (text: string) =>
     `<li class="task-list-item"><input type="checkbox" disabled checked> ${text}</li>`;
+
+  for (const [label, heading] of [
+    ["Coptic", "\u2CA2roof"],
+    ["small capitals", "\u1D18\u0280\u1D0F\u1D0F\uA730"],
+    ["Cherokee", "\u13E2roof"],
+  ] as const) {
+    it(`rejects a ${label} heading steering validation into collapsed details`, async () => {
+      // These letters are deliberately outside the lookalike table. The
+      // structural rule must reject the hidden canonical heading regardless.
+      const html =
+        `<h2>${heading}</h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
+        `<details><summary>Notes</summary><h2>Proof</h2><ul>${box("tests: TestThing")}</ul></details>`;
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("The Proof heading must be outside <details>");
+      expect(res.out).not.toContain("does not contain a ## Proof section");
+    });
+  }
+
+  for (const [label, wrapper] of [
+    ["initially open details", (html: string) => `<details open><summary>Proof</summary>${html}</details>`],
+    ["nested details", (html: string) => `<details><summary>Notes</summary><div><details><summary>More</summary>${html}</details></div></details>`],
+    ["template content inside details", (html: string) => `<details><summary>Notes</summary><template>${html}</template></details>`],
+  ] as const) {
+    it(`rejects a Proof heading in ${label}`, async () => {
+      const html = wrapper(`<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`);
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("The Proof heading must be outside <details>");
+    });
+  }
+
+  it("rejects a later hidden Proof heading after a visible Proof section", async () => {
+    const html =
+      `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>` +
+      `<details><summary>Notes</summary><h2>Proof</h2><ul>${box("schema: TestSchema")}</ul></details>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("The Proof heading must be outside <details>");
+  });
+
+  it("rejects a lookalike Proof heading inside details after visible proof", async () => {
+    const html =
+      `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>` +
+      "<details><summary>Notes</summary><h3>Proof:</h3></details>";
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("The Proof heading must be outside <details>");
+  });
+
+  it("allows collapsible notes before and after a visible Proof section", async () => {
+    const html =
+      "<details><summary>Notes</summary><h2>Background</h2><p>Context</p></details>" +
+      `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>` +
+      "<details><summary>More notes</summary><p>Context</p></details>";
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+    expect(res.exitCode).toBe(0);
+    expect(res.out).toContain("1 proof line(s) checked");
+  });
 
   it("walks a 20,000-deep tree without overflowing the stack", async () => {
     const html =

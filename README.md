@@ -52,7 +52,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
-| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error, so it cannot open a section the gate skips while a real heading further down is the one validated |
+| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. Every recognised Proof heading must be outside all `<details>` elements, including nested or initially open disclosures and later Proof headings; collapsible notes without a Proof heading remain allowed |
 | Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
 | Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
 | Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
@@ -187,14 +187,16 @@ bun verify-proof-block.ts --body-file your-pr-body.md
 ```
 
 Every run sends the body to `https://api.github.com/markdown` to have it
-rendered, so it needs network access. The endpoint needs no token permission;
-without `GITHUB_TOKEN` the call is unauthenticated and limited to 60 an hour.
+rendered, so it needs network access. [GitHub's Markdown API documentation](https://docs.github.com/en/rest/markdown/markdown)
+requires `contents: read` for private-resource rendering. Some labels may also
+need `issues: read` or `pull-requests: read`. Public-resource rendering can run
+without `GITHUB_TOKEN`, with the unauthenticated limit of 60 requests an hour.
 
 Env vars for full validation of CI-run and file-path artifacts:
 
 ```
-GITHUB_TOKEN=...                         # needs actions: read, for run lookups;
-                                         # the render call needs no permission
+GITHUB_TOKEN=...                         # actions: read for run lookups;
+                                         # contents: read for private rendering
 PR_HEAD_SHA=<commit sha>
 PR_BASE_REF=main                         # base branch; the clean-integrate
                                          # witness anchors a merge's integrated
@@ -225,11 +227,12 @@ bun install
 bun test
 ```
 
-The tests never call GitHub. A local stub answers `POST /markdown` with
-renderings GitHub produced, recorded in `scripts/__tests__/fixtures/github-renders.json`,
-so each case is judged against the HTML GitHub really returns for its body. A
-body without a recording fails its test and names the fix. After adding or
-changing a test body:
+Normal test runs never call GitHub. The Markdown compatibility tests use a
+local stub that answers `POST /markdown` with GitHub renderings recorded in
+`scripts/__tests__/fixtures/github-renders.json`. A body without a recording
+fails its test and names the fix. HTML-walk boundary tests also inject synthetic
+HTML; those cases are not recordings of GitHub output. After adding or changing
+a recorded test body:
 
 ```bash
 RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test
@@ -413,6 +416,11 @@ against it.
   hidden `n/a` excused a visible run link. A proof line may now contain only
   text, links, code, emphasis, emoji and footnote references, and no invisible
   or text-direction characters.
+- **A Proof heading cannot be hidden in a disclosure.** Every recognised Proof
+  heading must be outside `<details>`, including nested and initially open
+  disclosures and a second Proof heading after a visible one. This prevents
+  an unsupported visual lookalike from steering validation to a hidden
+  canonical heading. Notes-only disclosures remain allowed.
 - **Check-run pages are not generic links.** `…/runs/<job>` and
   `…/commit/<sha>/checks` show a result the gate cannot look up, so citing one is
   an error instead of a pass.
@@ -424,7 +432,8 @@ key has a space (`- [x] python compile: …`) used to be skipped and is now an
 error. A `Proof` heading written any way GitHub renders as a level-2 heading
 now opens the section, and a failed claim under an earlier `Proof` heading is
 no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
-as the run.
+as the run. A Proof section previously wrapped in `<details>` must be moved
+outside the disclosure, even if it uses the `open` attribute.
 
 **False rejections, now accepted:** a fence at a nested list item's content
 column, a closing fence indented more than three spaces (CommonMark does not
@@ -441,8 +450,11 @@ pinned. `remark`, `remark-parse`, `unified` and `unist-util-visit`, declared on
 The verifier sends the PR body to GitHub's Markdown API (`POST /markdown`, mode
 `gfm`, with the base repository as context) and validates the HTML it gets back.
 That is the renderer behind a PR's `body_html`: for this repository's PR #15 the
-two are identical byte for byte. The endpoint needs no token permission, so
-callers grant nothing new. The call is retried on server errors and throttling;
+two were identical byte for byte when checked. Private-resource rendering uses
+the workflow's existing `contents: read`. GitHub documents additional
+`issues: read` or `pull-requests: read` access for some label rendering; the
+workflow does not grant those optional permissions. Public resources can be
+rendered without a token. The call is retried on server errors and throttling;
 when it still fails, the check fails.
 
 Earlier versions emulated GitHub instead: a line scanner, then
@@ -458,6 +470,9 @@ From the rendered HTML:
   compatibility forms folded, default-ignorable characters dropped and a short
   table of Cyrillic and Greek lookalikes mapped, spell "proof" in any case;
   unless it is an `<h2>` reading exactly `Proof`, that is an error;
+- every recognised Proof heading must be outside all `<details>` elements,
+  whether it opens the section or appears later. The HTML walk carries
+  disclosure ancestry through nested elements and template content;
 - every task-list checkbox after it is a proof line. GitHub's sanitizer strips
   raw `<input>` elements, so a checkbox can only come from task-list syntax;
 - a proof line's text is its list item without the lists nested under it, with
@@ -478,16 +493,16 @@ body gets a verdict rather than a stack overflow.
 The gate trusts GitHub's Markdown API to render the body the way the PR page
 does. The two matched when checked; if GitHub's renderers ever diverge, the gate
 follows the API. It renders the body from the triggering event, which for an
-`edited` event is the new body. Local runs without `GITHUB_TOKEN` are limited
-to 60 renders an hour.
+`edited` event is the new body. Local runs without `GITHUB_TOKEN` can render
+public resources only and are limited to 60 renders an hour.
 
 Heading lookalikes are matched with a short table, not Unicode's full
 confusables data. A heading spelled with letters outside it (Coptic, small
-capitals, Cherokee, digits drawn like `o`) still reads as "Proof" to a person
-but not to the gate, so paired with a real `## Proof` hidden in a collapsed
-`<details>` it can steer the gate past the section a reviewer reads. Closing
-that needs a policy change, such as refusing a Proof heading inside
-`<details>`, and is left open. Claims inside a mermaid diagram or math are read as code and not checked.
+capitals, Cherokee, digits drawn like `o`) may still read as "Proof" to a person
+but is not recognised by the gate. It cannot supply the required canonical
+heading, and pairing it with a canonical heading inside `<details>` is now
+rejected. This does not make all visual lookalikes equivalent to `Proof`.
+Claims inside a mermaid diagram or math are read as code and not checked.
 A claim that points at an unchecked `n/a` line counts as backed.
 
 **Also open, unchanged:** strict mode keys on the *head* repo rather than the

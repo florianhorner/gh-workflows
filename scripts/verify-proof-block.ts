@@ -7,12 +7,13 @@
  *   bun verify-proof-block.ts --body-file pr-body.md
  *
  * Every run sends the body to GitHub's Markdown API (POST /markdown) and
- * validates the returned HTML. That call needs network access and no token
- * permission; without GITHUB_TOKEN it is unauthenticated (60 requests/hour).
+ * validates the returned HTML. Private-resource rendering needs contents: read;
+ * some labels also need issues: read or pull-requests: read. Public-resource
+ * rendering can run without GITHUB_TOKEN (60 requests/hour).
  *
  * Env vars for full validation of CI-run and file-path artifacts:
- *   GITHUB_TOKEN          - GitHub token with actions: read, for run lookups
- *                           (the render call needs no permission)
+ *   GITHUB_TOKEN          - GitHub token with actions: read for run lookups and
+ *                           contents: read for private-resource rendering
  *   PR_HEAD_SHA           - SHA of the PR head commit
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
  *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"; the rendering
@@ -220,10 +221,11 @@ function readBody(): string {
  * checked box the gate never validated.
  *
  * `POST /markdown` in gfm mode is the renderer behind a PR's `body_html`
- * (identical output, checked on this repo's PR #15), needs no token permission,
- * and works with no token at all at 60 requests an hour. It is the only network
- * call every run makes, so it is retried; a body that cannot be rendered is a
- * failure, never a pass.
+ * (identical output, checked on this repo's PR #15). Private-resource rendering
+ * needs contents: read; labels may also need issues: read or pull-requests:
+ * read. Public resources can be rendered without a token at 60 requests an
+ * hour. Every run makes this call, so it is retried; a body that cannot be
+ * rendered is a failure, never a pass.
  */
 class RenderError extends Error {}
 
@@ -452,11 +454,11 @@ function parseRenderedBody(html: string): {
   const malformed: string[] = [];
 
   // Iterative pre-order walk; an `exit` frame closes a block element.
-  const stack: { node: HtmlNode; inExample: boolean; exit?: boolean }[] = [
-    { node: root, inExample: false },
+  const stack: { node: HtmlNode; inExample: boolean; inDetails: boolean; exit?: boolean }[] = [
+    { node: root, inExample: false, inDetails: false },
   ];
   while (stack.length > 0) {
-    const { node, inExample, exit } = stack.pop()!;
+    const { node, inExample, inDetails, exit } = stack.pop()!;
     const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
     if (exit) {
       if (block) tokenText.push("\n");
@@ -472,15 +474,25 @@ function parseRenderedBody(html: string): {
     // deliberately loose — any level, any case, invisible characters ignored —
     // so a lookalike cannot open a section the gate skips while a real heading
     // further down (say, inside a collapsed <details>) is the one validated. A
-    // lookalike is then an error of its own.
-    if (!proofSeen && node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
+    // lookalike is then an error of its own. No Proof heading may live inside
+    // <details>, even after a visible section or in initially open details:
+    // readers can collapse it, and a hidden canonical heading could otherwise
+    // stand in for a visible lookalike outside our finite recognition table.
+    if (node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
       const { text: shown, core, foreign } = lineOf(node);
       if (readsAsProof(core)) {
-        proofSeen = true;
-        if (node.tagName !== "h2" || shown !== "Proof" || foreign.length > 0) {
+        if (inDetails) {
           malformed.push(
-            `The heading "${shown}" (${node.tagName}) reads as the Proof heading but is not "## Proof"; write it as ## Proof.`
+            "The Proof heading must be outside <details>; move the ## Proof block outside all collapsible sections."
           );
+        }
+        if (!proofSeen) {
+          proofSeen = true;
+          if (node.tagName !== "h2" || shown !== "Proof" || foreign.length > 0) {
+            malformed.push(
+              `The heading "${shown}" (${node.tagName}) reads as the Proof heading but is not "## Proof"; write it as ## Proof.`
+            );
+          }
         }
       }
     }
@@ -492,9 +504,10 @@ function parseRenderedBody(html: string): {
     if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
     if (block) tokenText.push("\n");
     const example = inExample || isCodeExample(node);
-    stack.push({ node, inExample, exit: true });
+    stack.push({ node, inExample, inDetails, exit: true });
     const kids = childrenOf(node);
-    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example });
+    const details = inDetails || node.tagName === "details";
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, inDetails: details });
   }
 
   const joined = readable(tokenText.join(""));

@@ -15,8 +15,9 @@ concurrency:
 # Least privilege. `contents: read` covers both checkouts; `actions: read` is
 # required because verify-proof-block.ts resolves CI-run proof URLs against
 # /repos/{owner}/{repo}/actions/runs/{id}. The body itself is rendered with
-# POST /markdown, which needs no permission. Callers can reduce this further but
-# cannot elevate it.
+# POST /markdown, which uses `contents: read` for private resources. Some label
+# rendering may additionally need issue or pull-request read access; those
+# permissions are not granted here. Callers cannot elevate this permission set.
 permissions:
   contents: read
   actions: read
