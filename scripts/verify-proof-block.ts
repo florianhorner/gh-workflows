@@ -461,6 +461,13 @@ const VISIBLE_CONTAINERS = new Set([
   "a", "b", "em", "i", "strong", "tt", "u",
 ]);
 
+/**
+ * Allowed containers GitHub draws smaller: its stylesheet sets `<code>`, `<tt>`
+ * and `<pre>` to 85% of their parent, so each nested level shrinks a heading
+ * again. One level (a stray `<code>` in the prose) is readable; more is not.
+ */
+const SHRINKING_CONTAINERS = new Set(["code", "pre", "tt"]);
+
 function parseRenderedBody(html: string): {
   proofLines: ProofLine[] | null;
   malformed: string[];
@@ -476,12 +483,17 @@ function parseRenderedBody(html: string): {
 
   // Iterative pre-order walk; an `exit` frame closes a block element.
   // `container` names the outermost element around the node that a Proof
-  // heading may not sit in (see VISIBLE_CONTAINERS), if any.
-  const stack: { node: HtmlNode; inExample: boolean; container: string | null; exit?: boolean }[] = [
-    { node: root, inExample: false, container: null },
-  ];
+  // heading may not sit in (see VISIBLE_CONTAINERS), if any; `shrunk` counts
+  // the SHRINKING_CONTAINERS around it.
+  const stack: {
+    node: HtmlNode;
+    inExample: boolean;
+    container: string | null;
+    shrunk: number;
+    exit?: boolean;
+  }[] = [{ node: root, inExample: false, container: null, shrunk: 0 }];
   while (stack.length > 0) {
-    const { node, inExample, container, exit } = stack.pop()!;
+    const { node, inExample, container, shrunk, exit } = stack.pop()!;
     const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
     if (exit) {
       if (block) tokenText.push("\n");
@@ -514,6 +526,10 @@ function parseRenderedBody(html: string): {
           malformed.push(
             `The Proof heading must not be inside <${container}>; write ## Proof in the body itself (a list item or a quote is fine). If the body mentions <${container}> as text, put it in backticks.`
           );
+        } else if (shrunk > 1) {
+          malformed.push(
+            "The Proof heading must not be inside more than one <code>, <tt> or <pre>: GitHub draws each level smaller. If the body mentions these tags as text, put them in backticks."
+          );
         }
         if (!proofSeen) {
           proofSeen = true;
@@ -533,11 +549,14 @@ function parseRenderedBody(html: string): {
     if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
     if (block) tokenText.push("\n");
     const example = inExample || isCodeExample(node);
-    stack.push({ node, inExample, container, exit: true });
+    stack.push({ node, inExample, container, shrunk, exit: true });
     const kids = childrenOf(node);
     const within =
       container ?? (node.tagName !== undefined && !VISIBLE_CONTAINERS.has(node.tagName) ? node.tagName : null);
-    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, container: within });
+    const smaller = shrunk + (node.tagName !== undefined && SHRINKING_CONTAINERS.has(node.tagName) ? 1 : 0);
+    for (let i = kids.length - 1; i >= 0; i--) {
+      stack.push({ node: kids[i]!, inExample: example, container: within, shrunk: smaller });
+    }
   }
 
   const joined = readable(tokenText.join(""));

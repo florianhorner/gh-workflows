@@ -52,7 +52,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
-| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. A heading reads as Proof by its whole text, including text inside markup a proof line may not carry (`## <ins>Proof</ins>`). Every recognised Proof heading, whether it opens the section or appears later, must sit in the body itself, a list item, a quote, an alert or a table, or inside visible formatting (`<b>`, `<em>`, a link and the like, which an unclosed tag earlier in the body wraps around everything after it). Any other element around it is an error: `<details>` (nested or initially open too), ruby, `<template>`, `<sup>`, `<sub>`, `<small>`, `<del>`, `<s>`, `<span>`, a footnote and the rest. Collapsible notes without a Proof heading remain allowed |
+| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. A heading reads as Proof by its whole text, including text inside markup a proof line may not carry (`## <ins>Proof</ins>`). Every recognised Proof heading, whether it opens the section or appears later, must sit in the body itself, a list item, a quote, an alert or a table, or inside visible formatting (`<b>`, `<em>`, a link and the like, which an unclosed tag earlier in the body wraps around everything after it), with at most one `<code>`, `<tt>` or `<pre>` around it because GitHub draws each level smaller. Any other element around it is an error: `<details>` (nested or initially open too), ruby, `<template>`, `<sup>`, `<sub>`, `<small>`, `<del>`, `<s>`, `<span>`, a footnote and the rest. Collapsible notes without a Proof heading remain allowed |
 | Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
 | Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
 | Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
@@ -429,7 +429,8 @@ against it.
   itself, a list item, quote, alert or table, or visible formatting such as
   `<b>` or a link, and so must a second Proof heading after a visible one. `<details>` (nested and initially open ones
   included), ruby fallback text, `<template>`, nested `<sup>`, `<sub>` or
-  `<small>`, `<del>`, a footnote or any other element around it is an error;
+  `<small>`, `<del>`, a footnote, more than one level of `<code>`, `<tt>` or
+  `<pre>`, or any other element around it is an error;
   the message says to backtick a tag the prose mentions.
   A heading counts as Proof by its whole text, so `## <ins>Proof</ins>` can no
   longer be passed over either. This prevents a visible lookalike from steering
@@ -497,7 +498,8 @@ From the rendered HTML:
 - a heading is recognised by its whole text, markup included; every recognised
   Proof heading, whether it opens the section or appears later, may have only
   lists, quotes, divs, code blocks, tables and visible formatting (`a`, `b`,
-  `em`, `i`, `strong`, `tt`, `u`) around it. The HTML walk carries
+  `em`, `i`, `strong`, `tt`, `u`) around it, and at most one `code`, `tt` or
+  `pre`. The HTML walk carries
   that ancestry through nested elements and template content;
 - every task-list checkbox after it is a proof line. GitHub's sanitizer strips
   raw `<input>` elements, so a checkbox can only come from task-list syntax;

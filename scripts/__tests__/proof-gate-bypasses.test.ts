@@ -1778,16 +1778,36 @@ describe("the rendered-HTML walk", () => {
     });
   }
 
-  for (const tag of ["a", "b", "em", "i", "strong", "tt", "u"]) {
+  for (const tag of ["a", "b", "code", "em", "i", "strong", "tt", "u"]) {
     it(`accepts a Proof heading that an unclosed <${tag}> above it wraps`, async () => {
       // A tag named in the prose without backticks stays open, and HTML reopens
-      // it around every later block, the Proof heading included.
+      // it around every later block, the Proof heading included. This is the
+      // shape GitHub returns (recorded for <code>): closed at the end of the
+      // paragraph, reopened once around what follows.
       const html =
-        `<p>Replaces the <${tag}> wrapper in the header.</p>` +
+        `<p>Replaces the <${tag}> wrapper in the header.</${tag}></p>` +
         `<${tag}><h2>Proof</h2><ul>${box("tests: TestThing")}</ul></${tag}>`;
       const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
       expect(res.out).toContain("1 proof line(s) checked");
       expect(res.exitCode).toBe(0);
+    });
+  }
+
+  for (const [label, wrap] of [
+    ["two <code>", (html: string) => `<code><code>${html}</code></code>`],
+    ["<code> in <tt>", (html: string) => `<tt><code>${html}</code></tt>`],
+    ["twenty <code>", (html: string) => "<code>".repeat(20) + html + "</code>".repeat(20)],
+    ["<code> in <pre>", (html: string) => `<pre><code>${html}</code></pre>`],
+  ] as const) {
+    it(`rejects a Proof heading drawn smaller by ${label}`, async () => {
+      // GitHub draws <code>, <tt> and <pre> at 85% of their parent, so nesting
+      // shrinks a heading out of sight while every container is allowed.
+      const html =
+        `<h2>\u2CA2roof</h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
+        wrap(`<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`);
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain("The Proof heading must not be inside more than one <code>, <tt> or <pre>");
     });
   }
 
