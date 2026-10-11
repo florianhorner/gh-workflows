@@ -1747,23 +1747,42 @@ describe("the rendered-HTML walk", () => {
   });
 
   for (const [tag, wrap] of [
-    ["rp", (html: string) => `<ruby>x<rp>${html}</rp><rt>y</rt></ruby>`],
+    ["ruby", (html: string) => `<ruby>x<rp>${html}</rp><rt>y</rt></ruby>`],
     ["template", (html: string) => `<template>${html}</template>`],
     ["sup", (html: string) => "<sup>".repeat(8) + html + "</sup>".repeat(8)],
     ["sub", (html: string) => `<sub>${html}</sub>`],
+    ["small", (html: string) => "<small>".repeat(24) + html + "</small>".repeat(24)],
+    ["del", (html: string) => `<del>${html}</del>`],
+    ["section", (html: string) => `<section data-footnotes class="footnotes">${html}</section>`],
   ] as const) {
     it(`rejects a heading steering validation into <${tag}>`, async () => {
-      // Ruby fallback text and template content are never drawn, and nested
-      // <sup>/<sub> shrink a heading to nothing: the same steering as a
-      // collapsed <details>, through a different container.
+      // Ruby fallback text and template content are never drawn, nested
+      // <sup>, <sub> or <small> shrink a heading to nothing, and a struck or
+      // footnoted one is easy to pass over: the same steering as a collapsed
+      // <details>, through a different container.
       const html =
-        `<h2>Ⲣroof</h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
+        `<h2>\u2CA2roof</h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
         wrap(`<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`);
       const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
       expect(res.exitCode).not.toBe(0);
-      expect(res.out).toContain(`The Proof heading must be outside <${tag}>, which hides or shrinks it`);
+      expect(res.out).toContain(`The Proof heading must not be inside <${tag}>`);
     });
   }
+
+  it("accepts a Proof heading in a list item, a quote or an alert", async () => {
+    const section = `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`;
+    const [listed, quoted, alert] = await Promise.all([
+      verify("(body)", { GITHUB_API_URL: htmlApi(`<ul><li>${section}</li></ul>`) }),
+      verify("(body)", { GITHUB_API_URL: htmlApi(`<blockquote>${section}</blockquote>`) }),
+      verify("(body)", {
+        GITHUB_API_URL: htmlApi(`<div class="markdown-alert markdown-alert-note"><p class="markdown-alert-title">Note</p>${section}</div>`),
+      }),
+    ]);
+    for (const res of [listed, quoted, alert]) {
+      expect(res.out).toContain("1 proof line(s) checked");
+      expect(res.exitCode).toBe(0);
+    }
+  });
 
   it("reads a heading as Proof by what it shows, even through markup a proof line may not carry", async () => {
     // `<ins>` keeps "Proof" on screen. The gate used to read only the text

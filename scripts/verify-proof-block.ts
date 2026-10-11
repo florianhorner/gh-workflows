@@ -443,12 +443,17 @@ const PROOF_LINE_RE = /^(\S+?):\s+(.*)$/;
 const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
 /**
- * Containers that hide or shrink what they hold: `<details>` (collapsed, or
- * collapsible when open), `<rp>` (ruby fallback text, not drawn), `<template>`
- * (never drawn) and `<sup>`/`<sub>` (nested, text two pixels tall). A Proof
- * heading in one of them is one the reviewer cannot see.
+ * The only elements a Proof heading may sit in. Everything else GitHub's
+ * sanitizer keeps can hide it (`<details>`, `<rp>`, `<template>`), shrink it
+ * (nested `<sup>`, `<sub>`, `<small>`, `<rt>`) or strike it through, and a
+ * heading the reviewer cannot see could stand in for a visible lookalike.
+ * Like the proof-line rule, this lists what is allowed: GitHub renders a
+ * Markdown heading at the top level, in a list item, a quote or an alert.
  */
-const HIDING_TAGS = new Set(["details", "rp", "template", "sup", "sub"]);
+const VISIBLE_CONTAINERS = new Set([
+  "blockquote", "code", "dd", "div", "dl", "dt", "li", "ol", "pre", "table",
+  "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+]);
 
 function parseRenderedBody(html: string): {
   proofLines: ProofLine[] | null;
@@ -463,13 +468,14 @@ function parseRenderedBody(html: string): {
   const sectionAnchors: HtmlNode[] = [];
   const malformed: string[] = [];
 
-  // Iterative pre-order walk; an `exit` frame closes a block element. `hidden`
-  // names the outermost hiding container around the node, if any.
-  const stack: { node: HtmlNode; inExample: boolean; hidden: string | null; exit?: boolean }[] = [
-    { node: root, inExample: false, hidden: null },
+  // Iterative pre-order walk; an `exit` frame closes a block element.
+  // `container` names the outermost element around the node that a Proof
+  // heading may not sit in (see VISIBLE_CONTAINERS), if any.
+  const stack: { node: HtmlNode; inExample: boolean; container: string | null; exit?: boolean }[] = [
+    { node: root, inExample: false, container: null },
   ];
   while (stack.length > 0) {
-    const { node, inExample, hidden, exit } = stack.pop()!;
+    const { node, inExample, container, exit } = stack.pop()!;
     const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
     if (exit) {
       if (block) tokenText.push("\n");
@@ -485,22 +491,22 @@ function parseRenderedBody(html: string): {
     // deliberately loose — any level, any case, invisible characters ignored —
     // so a lookalike cannot open a section the gate skips while a real heading
     // further down (say, inside a collapsed <details>) is the one validated. A
-    // lookalike is then an error of its own. A heading reads as Proof by what it
-    // shows, not only by the text outside markup a proof line may not carry:
-    // `## <ins>Proof</ins>` is a Proof heading to a reviewer. No Proof heading
-    // may sit in a hiding container (HIDING_TAGS), even after a visible
-    // section or in initially open details: a hidden canonical heading could
-    // otherwise stand in for a visible lookalike outside our finite table.
+    // lookalike is then an error of its own. Its whole text counts, so markup a
+    // proof line may not carry (`## <ins>Proof</ins>`) does not hide the word.
+    // No Proof heading may sit in anything but a visible container, even after
+    // a visible section or in initially open details: a canonical heading the
+    // reviewer cannot see could otherwise stand in for a visible lookalike
+    // outside our finite table.
     if (node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
       const { text: shown, core, foreign } = lineOf(node);
       if (readsAsProof(core) || readsAsProof(shown)) {
-        if (hidden === "details") {
+        if (container === "details") {
           malformed.push(
             "The Proof heading must be outside <details>; move the ## Proof block outside all collapsible sections."
           );
-        } else if (hidden) {
+        } else if (container) {
           malformed.push(
-            `The Proof heading must be outside <${hidden}>, which hides or shrinks it; move the ## Proof block into the visible body.`
+            `The Proof heading must not be inside <${container}>; write ## Proof in the body itself (a list item or a quote is fine).`
           );
         }
         if (!proofSeen) {
@@ -521,10 +527,11 @@ function parseRenderedBody(html: string): {
     if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
     if (block) tokenText.push("\n");
     const example = inExample || isCodeExample(node);
-    stack.push({ node, inExample, hidden, exit: true });
+    stack.push({ node, inExample, container, exit: true });
     const kids = childrenOf(node);
-    const within = hidden ?? (node.tagName !== undefined && HIDING_TAGS.has(node.tagName) ? node.tagName : null);
-    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, hidden: within });
+    const within =
+      container ?? (node.tagName !== undefined && !VISIBLE_CONTAINERS.has(node.tagName) ? node.tagName : null);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, container: within });
   }
 
   const joined = readable(tokenText.join(""));
