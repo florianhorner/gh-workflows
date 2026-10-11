@@ -1746,6 +1746,38 @@ describe("the rendered-HTML walk", () => {
     expect(res.out).toContain("1 proof line(s) checked");
   });
 
+  for (const [tag, wrap] of [
+    ["rp", (html: string) => `<ruby>x<rp>${html}</rp><rt>y</rt></ruby>`],
+    ["template", (html: string) => `<template>${html}</template>`],
+    ["sup", (html: string) => "<sup>".repeat(8) + html + "</sup>".repeat(8)],
+    ["sub", (html: string) => `<sub>${html}</sub>`],
+  ] as const) {
+    it(`rejects a heading steering validation into <${tag}>`, async () => {
+      // Ruby fallback text and template content are never drawn, and nested
+      // <sup>/<sub> shrink a heading to nothing: the same steering as a
+      // collapsed <details>, through a different container.
+      const html =
+        `<h2>Ⲣroof</h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
+        wrap(`<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`);
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain(`The Proof heading must be outside <${tag}>, which hides or shrinks it`);
+    });
+  }
+
+  it("reads a heading as Proof by what it shows, even through markup a proof line may not carry", async () => {
+    // `<ins>` keeps "Proof" on screen. The gate used to read only the text
+    // outside such markup, found nothing, and opened the section at the
+    // canonical heading below, so the claim under the visible one went unread.
+    const html =
+      `<h2><ins>Proof</ins></h2><ul>${box("runtime: proof/missing.txt")}</ul>` +
+      `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`;
+    const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html), GITHUB_WORKSPACE: workspace() });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain('The heading "Proof" (h2) reads as the Proof heading but is not "## Proof"');
+    expect(res.out).toContain("File path does not exist: proof/missing.txt");
+  });
+
   function htmlAndRuns(html: string, onRun: (path: string) => Response): string {
     const server = Bun.serve({
       port: 0,

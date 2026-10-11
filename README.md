@@ -52,7 +52,7 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 | Rule | Detail |
 |------|--------|
 | Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
-| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. Every recognised Proof heading must be outside all `<details>` elements, including nested or initially open disclosures and later Proof headings; collapsible notes without a Proof heading remain allowed |
+| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. A heading reads as Proof by the text it shows, including text inside markup a proof line may not carry (`## <ins>Proof</ins>`). Every recognised Proof heading, whether it opens the section or appears later, must be outside every element that hides or shrinks it: `<details>` (nested or initially open too), ruby fallback `<rp>`, `<template>`, `<sup>` and `<sub>`. Collapsible notes without a Proof heading remain allowed |
 | Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
 | Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
 | Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
@@ -416,11 +416,13 @@ against it.
   hidden `n/a` excused a visible run link. A proof line may now contain only
   text, links, code, emphasis, emoji and footnote references, and no invisible
   or text-direction characters.
-- **A Proof heading cannot be hidden in a disclosure.** Every recognised Proof
-  heading must be outside `<details>`, including nested and initially open
-  disclosures and a second Proof heading after a visible one. This prevents
-  an unsupported visual lookalike from steering validation to a hidden
-  canonical heading. Notes-only disclosures remain allowed.
+- **A Proof heading cannot be hidden.** Every recognised Proof heading must be
+  outside `<details>` (nested and initially open ones included), ruby fallback
+  `<rp>`, `<template>`, `<sup>` and `<sub>`, and so must a second Proof heading
+  after a visible one. A heading counts as Proof by the text it shows, so
+  `## <ins>Proof</ins>` can no longer be passed over either. This prevents a
+  visible lookalike from steering validation to a hidden canonical heading.
+  Notes-only disclosures remain allowed.
 - **A cited run must belong to the PR.** A run was looked up in whatever
   repository its URL named, so the PR's head commit pushed to any other public
   repository, with an always-green workflow, produced a run that passed both
@@ -438,7 +440,8 @@ error. A `Proof` heading written any way GitHub renders as a level-2 heading
 now opens the section, and a failed claim under an earlier `Proof` heading is
 no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
 as the run. A Proof section previously wrapped in `<details>` must be moved
-outside the disclosure, even if it uses the `open` attribute.
+outside the disclosure, even if it uses the `open` attribute; the same holds for
+`<rp>`, `<template>`, `<sup>` and `<sub>`.
 
 **False rejections, now accepted:** a fence at a nested list item's content
 column, a closing fence indented more than three spaces (CommonMark does not
@@ -475,9 +478,10 @@ From the rendered HTML:
   compatibility forms folded, default-ignorable characters dropped and a short
   table of Cyrillic and Greek lookalikes mapped, spell "proof" in any case;
   unless it is an `<h2>` reading exactly `Proof`, that is an error;
-- every recognised Proof heading must be outside all `<details>` elements,
-  whether it opens the section or appears later. The HTML walk carries
-  disclosure ancestry through nested elements and template content;
+- a heading is recognised by the text it shows, markup included; every
+  recognised Proof heading must be outside `<details>`, `<rp>`, `<template>`,
+  `<sup>` and `<sub>`, whether it opens the section or appears later. The HTML
+  walk carries that ancestry through nested elements and template content;
 - every task-list checkbox after it is a proof line. GitHub's sanitizer strips
   raw `<input>` elements, so a checkbox can only come from task-list syntax;
 - a proof line's text is its list item without the lists nested under it, with
@@ -506,8 +510,10 @@ Heading lookalikes are matched with a short table, not Unicode's full
 confusables data. A heading spelled with letters outside it (Coptic, small
 capitals, Cherokee, digits drawn like `o`) may still read as "Proof" to a person
 but is not recognised by the gate. It cannot supply the required canonical
-heading, and pairing it with a canonical heading inside `<details>` is now
-rejected. This does not make all visual lookalikes equivalent to `Proof`.
+heading, and pairing it with a canonical heading in a hiding container is
+rejected. Paired with a visible canonical `## Proof` further down, the boxes under
+the lookalike are not validated: the reviewer sees two Proof sections and only
+the second one is checked.
 Claims inside a mermaid diagram or math are read as code and not checked.
 A claim that points at an unchecked `n/a` line counts as backed.
 

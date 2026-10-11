@@ -330,8 +330,9 @@ const PROOF_LOOKALIKES: Record<string, string> = {
 /**
  * Whether a heading reads as "Proof" to a reader: letters only, invisible
  * characters dropped, case folded, lookalike letters mapped. `Proof:`,
- * `Proof ✅`, `PROOF` and a Cyrillic `Ргооf` all do. Used only to decide where
- * the section starts; the heading still has to be exactly `## Proof`.
+ * `Proof ✅`, `PROOF` and a Cyrillic `Ргооf` all do. Decides where the section
+ * starts and which headings must be visible; the first one still has to be
+ * exactly `## Proof`.
  */
 function readsAsProof(text: string): boolean {
   const letters = [...readable(text).toLowerCase()]
@@ -440,6 +441,14 @@ function closestItem(node: HtmlNode): HtmlNode | null {
 const PROOF_LINE_RE = /^(\S+?):\s+(.*)$/;
 const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
+/**
+ * Containers that hide or shrink what they hold: `<details>` (collapsed, or
+ * collapsible when open), `<rp>` (ruby fallback text, not drawn), `<template>`
+ * (never drawn) and `<sup>`/`<sub>` (nested, text two pixels tall). A Proof
+ * heading in one of them is one the reviewer cannot see.
+ */
+const HIDING_TAGS = new Set(["details", "rp", "template", "sup", "sub"]);
+
 function parseRenderedBody(html: string): {
   proofLines: ProofLine[] | null;
   malformed: string[];
@@ -453,12 +462,13 @@ function parseRenderedBody(html: string): {
   const sectionAnchors: HtmlNode[] = [];
   const malformed: string[] = [];
 
-  // Iterative pre-order walk; an `exit` frame closes a block element.
-  const stack: { node: HtmlNode; inExample: boolean; inDetails: boolean; exit?: boolean }[] = [
-    { node: root, inExample: false, inDetails: false },
+  // Iterative pre-order walk; an `exit` frame closes a block element. `hidden`
+  // names the outermost hiding container around the node, if any.
+  const stack: { node: HtmlNode; inExample: boolean; hidden: string | null; exit?: boolean }[] = [
+    { node: root, inExample: false, hidden: null },
   ];
   while (stack.length > 0) {
-    const { node, inExample, inDetails, exit } = stack.pop()!;
+    const { node, inExample, hidden, exit } = stack.pop()!;
     const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
     if (exit) {
       if (block) tokenText.push("\n");
@@ -474,16 +484,22 @@ function parseRenderedBody(html: string): {
     // deliberately loose — any level, any case, invisible characters ignored —
     // so a lookalike cannot open a section the gate skips while a real heading
     // further down (say, inside a collapsed <details>) is the one validated. A
-    // lookalike is then an error of its own. No Proof heading may live inside
-    // <details>, even after a visible section or in initially open details:
-    // readers can collapse it, and a hidden canonical heading could otherwise
-    // stand in for a visible lookalike outside our finite recognition table.
+    // lookalike is then an error of its own. A heading reads as Proof by what it
+    // shows, not only by the text outside markup a proof line may not carry:
+    // `## <ins>Proof</ins>` is a Proof heading to a reviewer. No Proof heading
+    // may sit in a hiding container (HIDING_TAGS), even after a visible
+    // section or in initially open details: a hidden canonical heading could
+    // otherwise stand in for a visible lookalike outside our finite table.
     if (node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
       const { text: shown, core, foreign } = lineOf(node);
-      if (readsAsProof(core)) {
-        if (inDetails) {
+      if (readsAsProof(core) || readsAsProof(shown)) {
+        if (hidden === "details") {
           malformed.push(
             "The Proof heading must be outside <details>; move the ## Proof block outside all collapsible sections."
+          );
+        } else if (hidden) {
+          malformed.push(
+            `The Proof heading must be outside <${hidden}>, which hides or shrinks it; move the ## Proof block into the visible body.`
           );
         }
         if (!proofSeen) {
@@ -504,10 +520,10 @@ function parseRenderedBody(html: string): {
     if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
     if (block) tokenText.push("\n");
     const example = inExample || isCodeExample(node);
-    stack.push({ node, inExample, inDetails, exit: true });
+    stack.push({ node, inExample, hidden, exit: true });
     const kids = childrenOf(node);
-    const details = inDetails || node.tagName === "details";
-    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, inDetails: details });
+    const within = hidden ?? (node.tagName !== undefined && HIDING_TAGS.has(node.tagName) ? node.tagName : null);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i]!, inExample: example, hidden: within });
   }
 
   const joined = readable(tokenText.join(""));
