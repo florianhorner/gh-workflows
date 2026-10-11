@@ -506,9 +506,8 @@ describe("n/a and unchecked values are judged, not waved through", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Markdown-stripper holes found by adversarial review of the fix itself.
-//    Each of these was a way to make the gate read a different document than
-//    the one GitHub renders.
+// 7. Markdown-stripper holes in the first fix. Each of these was a way to
+//    make the gate read a different document than the one GitHub renders.
 // ---------------------------------------------------------------------------
 
 describe("the stripper reads the same document GitHub renders", () => {
@@ -664,8 +663,8 @@ describe("a file-path artifact must be committed to the PR branch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9. Second adversarial pass, over the corrections themselves. The first
-//    correction moved comment detection ahead of fence detection and thereby
+// 9. Holes in the corrections themselves. The first correction moved
+//    comment detection ahead of fence detection and thereby
 //    reopened the same hidden-block class through the other door, so these
 //    pin the ORDER and the remaining artifact-shape holes.
 // ---------------------------------------------------------------------------
@@ -714,7 +713,7 @@ describe("an artifact must name a committed file, not a container", () => {
     it(`rejects "${dir}" instead of letting a directory satisfy the tracked check`, async () => {
       // `git ls-files --error-unmatch` takes a PATHSPEC and succeeds for
       // anything covering at least one tracked file, so a single dot cleared
-      // the check the README calls the strongest part of this gate.
+      // the tracked-file check on its own.
       const res = await verify(
         bodyWith(`- [x] runtime: ${dir} [proof: runtime]`),
         { GITHUB_WORKSPACE: gitRepoWithProof() }
@@ -1997,7 +1996,7 @@ describe("the rendered-HTML walk", () => {
 // 11. Guards that nothing pinned: each could be deleted with the suite green.
 // ---------------------------------------------------------------------------
 
-describe("guards the coverage audit found unpinned", () => {
+describe("guards no other test pinned", () => {
   function proxyTo(target: string, answer: (n: number, req: Request) => Response | null) {
     const seen = { calls: 0, auth: [] as (string | null)[] };
     const server = Bun.serve({
