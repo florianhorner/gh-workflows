@@ -115,7 +115,8 @@ ancestry with git, so the reusable workflow checks the PR head out with full
 history and passes the base ref on your behalf; callers need no change. That
 deep fetch is only paid when the body cites a CI run at all — on a large repo it
 is the expensive part of the job, and a body with no run URL never asks git
-anything.
+about history. (A file-path proof line asks git only whether the file is
+tracked, which a shallow checkout can answer.)
 
 ### Proof block template (own-repo PR)
 
@@ -368,8 +369,9 @@ against it.
   rendered a live link to the same run page. `http://` is now rejected, and a
   run-shaped path on a lookalike host or a non-default port is an error rather
   than a generic artifact. The run-id slot captures anything and is judged
-  separately: readable ids are looked up, unreadable ones (`…/runs/123.` with
-  the period GFM strips from an autolink) are errors. Percent-encoding and
+  separately: the punctuation GFM strips from the end of an autolink is
+  ignored, so `…/runs/123.` is looked up as run 123, and an id that is still
+  not digits (`…/runs/12a`) is an error. Percent-encoding and
   doubled slashes are normalised the way github.com routes them, and a decoded
   `#` in an owner or repo name cannot retarget the API request.
 - **The unchecked branch is exhaustive.** `if (value && value !== "n/a") return;`
@@ -458,8 +460,8 @@ now opens the section, and a failed claim under an earlier `Proof` heading is
 no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
 as the run. A Proof section previously wrapped in `<details>` must be moved
 outside the disclosure, even if it uses the `open` attribute, and so must one
-in any element other than a list, quote, alert or table. A run in a fork PR's
-head repository no longer counts as proof.
+in any element other than those listed under "How the body is read" below. A
+run in a fork PR's head repository no longer counts as proof.
 
 **False rejections, now accepted:** a fence at a nested list item's content
 column, and an unbalanced `<!--` inside inline code, which used to swallow the

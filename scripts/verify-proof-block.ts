@@ -25,7 +25,9 @@
  *                            clean-integrate witness cannot anchor a merge and
  *                            refuses, so an integrated branch reads as stale.
  *   GITHUB_WORKSPACE       - a full clone of the PR head; the witness runs git
- *                            here. Also the "we are in CI" signal that makes a
+ *                            here. File-path artifacts resolve only against it
+ *                            and, in a git checkout, must be tracked in it.
+ *                            Also the "we are in CI" signal that makes a
  *                            missing file-path artifact a hard failure.
  *
  * Optional:

@@ -46,10 +46,12 @@ jobs:
             const fs = require("fs");
             fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
             core.info(`PR body length: ${body.length} chars`);
-            // The clean-integrate witness is the only thing here that reads git,
-            // and it is only ever consulted for a cited CI-run URL. No such URL
-            // means no git question, so the full history is dead weight — on a
-            // large consumer that is a ~570 MB fetch added to a 20 s job.
+            // The clean-integrate witness is the only thing here that reads git
+            // history, and it is only ever consulted for a cited CI-run URL. No
+            // such URL means no history question, so the full history is dead
+            // weight — on a large consumer that is a ~570 MB fetch added to a
+            // 20 s job. (A file-path proof line asks git only whether the file
+            // is tracked, which a shallow checkout answers.)
             //
             // Getting this wrong is safe in both directions: a false positive
             // costs one needless deep fetch, and a false negative leaves a
