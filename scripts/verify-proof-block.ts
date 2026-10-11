@@ -453,6 +453,12 @@ const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 const VISIBLE_CONTAINERS = new Set([
   "blockquote", "code", "dd", "div", "dl", "dt", "li", "ol", "pre", "table",
   "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+  // GitHub's wrapper around every rendered table.
+  "markdown-accessiblity-table",
+  // Visible formatting. HTML reopens an unclosed <b>, <a>, … around every later
+  // block, so a tag mentioned in the prose without backticks ends up wrapping
+  // the Proof heading.
+  "a", "b", "em", "i", "strong", "tt", "u",
 ]);
 
 function parseRenderedBody(html: string): {
@@ -506,7 +512,7 @@ function parseRenderedBody(html: string): {
           );
         } else if (container) {
           malformed.push(
-            `The Proof heading must not be inside <${container}>; write ## Proof in the body itself (a list item or a quote is fine).`
+            `The Proof heading must not be inside <${container}>; write ## Proof in the body itself (a list item or a quote is fine). If the body mentions <${container}> as text, put it in backticks.`
           );
         }
         if (!proofSeen) {

@@ -1769,16 +1769,44 @@ describe("the rendered-HTML walk", () => {
     });
   }
 
-  it("accepts a Proof heading in a list item, a quote or an alert", async () => {
+  for (const tag of ["span", "mark", "kbd", "s", "ins", "abbr", "figure"]) {
+    it(`rejects a Proof heading inside <${tag}>, which is not on the allowed list`, async () => {
+      const html = `<${tag}><h2>Proof</h2><ul>${box("tests: TestThing")}</ul></${tag}>`;
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+      expect(res.exitCode).not.toBe(0);
+      expect(res.out).toContain(`The Proof heading must not be inside <${tag}>`);
+    });
+  }
+
+  for (const tag of ["a", "b", "em", "i", "strong", "tt", "u"]) {
+    it(`accepts a Proof heading that an unclosed <${tag}> above it wraps`, async () => {
+      // A tag named in the prose without backticks stays open, and HTML reopens
+      // it around every later block, the Proof heading included.
+      const html =
+        `<p>Replaces the <${tag}> wrapper in the header.</p>` +
+        `<${tag}><h2>Proof</h2><ul>${box("tests: TestThing")}</ul></${tag}>`;
+      const res = await verify("(body)", { GITHUB_API_URL: htmlApi(html) });
+      expect(res.out).toContain("1 proof line(s) checked");
+      expect(res.exitCode).toBe(0);
+    });
+  }
+
+  it("accepts a Proof heading in a list item, a quote, an alert or a table", async () => {
     const section = `<h2>Proof</h2><ul>${box("tests: TestThing")}</ul>`;
-    const [listed, quoted, alert] = await Promise.all([
+    const [listed, quoted, alert, table] = await Promise.all([
       verify("(body)", { GITHUB_API_URL: htmlApi(`<ul><li>${section}</li></ul>`) }),
       verify("(body)", { GITHUB_API_URL: htmlApi(`<blockquote>${section}</blockquote>`) }),
       verify("(body)", {
         GITHUB_API_URL: htmlApi(`<div class="markdown-alert markdown-alert-note"><p class="markdown-alert-title">Note</p>${section}</div>`),
       }),
+      // GitHub wraps every table it renders in <markdown-accessiblity-table>.
+      verify("(body)", {
+        GITHUB_API_URL: htmlApi(
+          `<markdown-accessiblity-table><table role="table"><tbody><tr><td>${section}</td></tr></tbody></table></markdown-accessiblity-table>`
+        ),
+      }),
     ]);
-    for (const res of [listed, quoted, alert]) {
+    for (const res of [listed, quoted, alert, table]) {
       expect(res.out).toContain("1 proof line(s) checked");
       expect(res.exitCode).toBe(0);
     }
