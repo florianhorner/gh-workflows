@@ -380,7 +380,8 @@ against it.
   both passed. Resolution is now only ever against `GITHUB_WORKSPACE`, through
   `realpath`, so a committed symlink pointing out is rejected too. The path must
   name a tracked file: `git ls-files` is queried with a literal pathspec (a lone
-  `.` used to satisfy it), directories are rejected, and when git cannot answer
+  `.`, or an untracked file named `*` beside a tracked one, used to satisfy it),
+  directories are rejected, and when git cannot answer
   the check fails closed and says why.
 - **CRLF bodies are read.** `.` excludes `\r` and `$` was not multiline-anchored, so
   on a CRLF body every proof line was dropped while the heading survived — the

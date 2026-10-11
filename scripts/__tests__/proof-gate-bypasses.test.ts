@@ -1778,6 +1778,30 @@ describe("the rendered-HTML walk", () => {
     expect(res.out).toContain("File path does not exist: proof/missing.txt");
   });
 
+  it("checks a file artifact against git as a literal path, not a pathspec", async () => {
+    // An untracked file named `*` next to a tracked one matched it as a glob.
+    const ws = workspace();
+    mkdirSync(join(ws, "proof"), { recursive: true });
+    writeFileSync(join(ws, "proof", "real.txt"), "ok\n");
+    writeFileSync(join(ws, "proof", "*"), "not committed\n");
+    execFileSync("git", ["init", "-q"], { cwd: ws, ...GIT_OPTS });
+    execFileSync("git", ["add", "proof/real.txt"], { cwd: ws, ...GIT_OPTS });
+    execFileSync(
+      "git",
+      ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
+      { cwd: ws, ...GIT_OPTS }
+    );
+    const verdict = (artifact: string) =>
+      verify("(body)", {
+        GITHUB_API_URL: htmlApi(`<h2>Proof</h2><ul>${box(`runtime: <code>${artifact}</code>`)}</ul>`),
+        GITHUB_WORKSPACE: ws,
+      });
+    const [glob, real] = await Promise.all([verdict("proof/*"), verdict("proof/real.txt")]);
+    expect(glob.exitCode).not.toBe(0);
+    expect(glob.out).toContain("File path is not committed to the PR branch: proof/*");
+    expect(real.exitCode).toBe(0);
+  });
+
   function htmlAndRuns(html: string, onRun: (path: string) => Response): string {
     const server = Bun.serve({
       port: 0,

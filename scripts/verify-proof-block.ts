@@ -734,7 +734,9 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
   // so `_gh_workflows/scripts/__tests__/...` and `_gh_workflows/scripts/
   // node_modules/<anything>` are inside the workspace yet in no PR commit.
   const git = makeGitRunner(workspace);
-  if (git(["ls-files", "--error-unmatch", "--", artifact]).ok) return;
+  // --literal-pathspecs: an untracked file named `*` or `:(glob)x` must not
+  // match a tracked sibling.
+  if (git(["--literal-pathspecs", "ls-files", "--error-unmatch", "--", artifact]).ok) return;
 
   // git said no. Distinguish "untracked" from "cannot answer": a workspace that
   // is not a git checkout (local usage, tests) leaves existence as the only
