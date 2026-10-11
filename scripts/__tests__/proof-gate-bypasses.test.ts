@@ -1909,6 +1909,25 @@ describe("the rendered-HTML walk", () => {
     expect(lookups).toHaveLength(4);
   });
 
+  it("decides a run's repository by the API's answer, and uses the head repository only without a base", async () => {
+    const answering = (repository: string) => () =>
+      Response.json({ conclusion: "success", head_sha: "cafebabe", repository: { full_name: repository } });
+    const citing = (repo: string) =>
+      `<h2>Proof</h2><ul>${box(`tests: <a href="https://github.com/${repo}/actions/runs/7">https://github.com/${repo}/actions/runs/7</a>`)}</ul>`;
+    const headOnly = { PR_BASE_REPO_FULL_NAME: "", PR_HEAD_REPO_FULL_NAME: "florianhorner/demo" };
+    const [moved, viaHead, notHead] = await Promise.all([
+      // The URL names this PR's repository, but the API says the run is elsewhere.
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("florianhorner/demo"), answering("someone/fork")) }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("florianhorner/demo"), answering("florianhorner/demo")), ...headOnly }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("attacker/anything"), answering("attacker/anything")), ...headOnly }),
+    ]);
+    expect(moved.exitCode).not.toBe(0);
+    expect(moved.out).toContain("CI run 7 ran in someone/fork, not in this PR's repository florianhorner/demo");
+    expect(viaHead.exitCode).toBe(0);
+    expect(notHead.exitCode).not.toBe(0);
+    expect(notHead.out).toContain("CI run 7 ran in attacker/anything, not in this PR's repository florianhorner/demo");
+  });
+
   it("walks a 20,000-deep tree without overflowing the stack", async () => {
     const html =
       "<div>".repeat(20000) + "x" + "</div>".repeat(20000) +

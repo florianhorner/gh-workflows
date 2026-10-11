@@ -441,8 +441,9 @@ against it.
   the `conclusion=success` and the head_sha check. A cited run must now have
   run in the PR's own repository, by the API's account of it. A fork PR's head
   repository does not count: its author controls its workflows, and the
-  checks of a fork PR run in the repository it merges into. With neither
-  repository variable set, a run cannot be attributed and is an error.
+  checks of a fork PR run in the repository it merges into. When runs are
+  looked up (`GITHUB_TOKEN` and `PR_HEAD_SHA` set) and neither repository
+  variable is, a run cannot be attributed and is an error.
 - **Check-run pages are not generic links.** `…/runs/<job>` and
   `…/commit/<sha>/checks` show a result the gate cannot look up, so citing one is
   an error instead of a pass.
@@ -530,6 +531,9 @@ is not recognised by the gate. It cannot supply the required canonical heading,
 and pairing it with a canonical heading the reviewer cannot see is rejected. Paired with a visible canonical `## Proof` further down, the boxes under
 the lookalike are not validated: the reviewer sees two Proof sections and only
 the second one is checked.
+A cited run is tied to the PR's repository and head commit, not to a workflow
+that tests the claim: a green run of any workflow on that commit counts,
+including one the PR itself adds or changes.
 Claims inside a mermaid diagram or math are read as code and not checked.
 A claim that points at an unchecked `n/a` line counts as backed.
 
