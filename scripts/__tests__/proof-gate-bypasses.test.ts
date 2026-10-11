@@ -1816,35 +1816,50 @@ describe("the rendered-HTML walk", () => {
     return `http://127.0.0.1:${server.port}`;
   }
 
-  it("accepts a cited run only from this PR's repository or its head repository", async () => {
-    // Any public repository can run the PR's head commit: push it there, add an
-    // always-green workflow, and head_sha and conclusion both check out.
+  it("accepts a cited run only from this PR's own repository", async () => {
+    // Any other repository can run the PR's head commit: push it there, add an
+    // always-green workflow, and head_sha and conclusion both check out. That
+    // includes a fork PR's head repository, whose workflows its author controls.
     const lookups: string[] = [];
-    const green = (path: string) => {
+    const green = (repository?: string) => (path: string) => {
       lookups.push(path);
-      return Response.json({ conclusion: "success", head_sha: "cafebabe" });
+      return Response.json({
+        conclusion: "success",
+        head_sha: "cafebabe",
+        ...(repository ? { repository: { full_name: repository } } : {}),
+      });
     };
     const citing = (repo: string) =>
       `<h2>Proof</h2><ul>${box(`tests: <a href="https://github.com/${repo}/actions/runs/7">https://github.com/${repo}/actions/runs/7</a>`)}</ul>`;
     const fork = { PR_BASE_REPO_FULL_NAME: "florianhorner/demo", PR_HEAD_REPO_FULL_NAME: "someone/fork" };
 
-    const [elsewhere, base, head] = await Promise.all([
-      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("attacker/anything"), green), ...fork }),
-      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("florianhorner/demo"), green), ...fork }),
-      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("Someone/Fork"), green), ...fork }),
+    const [elsewhere, head, base, renamed, unknown] = await Promise.all([
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("attacker/anything"), green()), ...fork }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("someone/fork"), green()), ...fork }),
+      verify("(body)", { GITHUB_API_URL: htmlAndRuns(citing("Florianhorner/Demo"), green()), ...fork }),
+      // An old URL of a renamed repository redirects to the same run; the API's
+      // answer names the repository as it is now.
+      verify("(body)", {
+        GITHUB_API_URL: htmlAndRuns(citing("florianhorner/old-demo"), green("florianhorner/demo")),
+        ...fork,
+      }),
+      verify("(body)", {
+        GITHUB_API_URL: htmlAndRuns(citing("florianhorner/demo"), green()),
+        PR_BASE_REPO_FULL_NAME: "",
+        PR_HEAD_REPO_FULL_NAME: "",
+      }),
     ]);
 
     expect(elsewhere.exitCode).not.toBe(0);
-    expect(elsewhere.out).toContain(
-      "CI run 7 is in attacker/anything, not in this PR's repository or its head repository (florianhorner/demo, someone/fork)"
-    );
+    expect(elsewhere.out).toContain("CI run 7 ran in attacker/anything, not in this PR's repository florianhorner/demo");
+    expect(head.exitCode).not.toBe(0);
+    expect(head.out).toContain("CI run 7 ran in someone/fork, not in this PR's repository florianhorner/demo");
     expect(base.exitCode).toBe(0);
-    expect(head.exitCode).toBe(0);
-    // The foreign run is refused before anything asks the API about it.
-    expect(lookups.sort()).toEqual([
-      "/repos/Someone/Fork/actions/runs/7",
-      "/repos/florianhorner/demo/actions/runs/7",
-    ]);
+    expect(renamed.exitCode).toBe(0);
+    expect(unknown.exitCode).not.toBe(0);
+    expect(unknown.out).toContain("CI run 7 cannot be attributed: PR_BASE_REPO_FULL_NAME is not set");
+    // A run that cannot be attributed is not looked up.
+    expect(lookups).toHaveLength(4);
   });
 
   it("walks a 20,000-deep tree without overflowing the stack", async () => {

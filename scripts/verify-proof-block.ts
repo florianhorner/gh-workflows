@@ -17,8 +17,9 @@
  *   PR_HEAD_SHA           - SHA of the PR head commit
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
  *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"; the rendering
- *                            context (how `#123` references link). Falls back
- *                            to PR_HEAD_REPO_FULL_NAME
+ *                            context (how `#123` references link) and the
+ *                            repository a cited run must have run in. Falls
+ *                            back to PR_HEAD_REPO_FULL_NAME
  *   OWNED_REPOS            - comma-separated list of repos Florian owns
  *   PR_BASE_REF            - the PR's base branch, e.g. "main". Without it the
  *                            clean-integrate witness cannot anchor a merge and
@@ -1072,15 +1073,16 @@ async function checkRun(
     return { problems, notes }; // No SHA context: skip
   }
 
-  // A run says something about this PR only if it ran in the PR's repository
-  // or in the one its head branch lives in. Any public repository can run the
-  // same commit: push it there, add an always-green workflow, and the run's
-  // head_sha and conclusion both check out.
-  const prRepos = [...new Set([PR_BASE_REPO, PR_HEAD_REPO].filter(Boolean))];
-  const citedRepo = `${owner}/${repo}`.toLowerCase();
-  if (prRepos.length > 0 && !prRepos.some((r) => r.toLowerCase() === citedRepo)) {
+  // A run says something about this PR only if it ran in the PR's own
+  // repository. Any other repository can run the same commit: push it there,
+  // add an always-green workflow, and head_sha and conclusion both check out.
+  // That includes the head repository of a fork PR, whose author controls its
+  // workflows; checks for a fork PR run in the base repository. With no
+  // repository to compare against, the run cannot be attributed: fail closed.
+  const prRepo = PR_BASE_REPO || PR_HEAD_REPO;
+  if (!prRepo) {
     problems.push(
-      `CI run ${runId} is in ${owner}/${repo}, not in this PR's repository or its head repository (${prRepos.join(", ")}); cite a run from one of them.`
+      `CI run ${runId} cannot be attributed: PR_BASE_REPO_FULL_NAME is not set, so the PR's repository is unknown.`
     );
     return { problems, notes };
   }
@@ -1105,7 +1107,18 @@ async function checkRun(
     const data = (await res.json()) as {
       conclusion: string | null;
       head_sha: string;
+      repository?: { full_name?: string };
     };
+
+    // The API's answer names the repository, so an old URL of a renamed or
+    // transferred repository, which redirects to the same run, still counts.
+    const runRepo = data.repository?.full_name ?? `${owner}/${repo}`;
+    if (runRepo.toLowerCase() !== prRepo.toLowerCase()) {
+      problems.push(
+        `CI run ${runId} ran in ${runRepo}, not in this PR's repository ${prRepo}; cite a run of this PR's checks.`
+      );
+      return { problems, notes };
+    }
 
     if (data.conclusion !== "success") {
       problems.push(`CI run ${runId} conclusion is "${data.conclusion}", expected "success".`);
