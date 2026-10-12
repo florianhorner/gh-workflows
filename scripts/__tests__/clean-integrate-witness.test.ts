@@ -457,6 +457,25 @@ describe("verify-claims.yml", () => {
     expect(depth).toContain("'1'");
   });
 
+  it("deepens the checkout for every run spelling the verifier reads", () => {
+    // A shallow checkout turns a cleanly integrated run into a stale one, so
+    // the pre-check must not miss a spelling the verifier looks up.
+    const fetchBody = steps.find((s) => s.name === "Fetch PR body");
+    const src = String(fetchBody!.with.script).match(/const citesCiRun = (\/.+\/[a-z]*)\.test\(body\);/)?.[1];
+    expect(src).toBeDefined();
+    const citesCiRun = new Function(`return ${src}`)() as RegExp;
+    for (const body of [
+      "https://github.com/o/r/actions/runs/123",
+      "https://github.com/o/r/actions/runs/%31%32",
+      "https://github.com/o/r/actions//runs//123",
+      "https://github.com/o/r/actions%2Fruns%2F123",
+      "[CI run](../actions/runs/1)",
+    ]) {
+      expect(citesCiRun.test(body)).toBe(true);
+    }
+    expect(citesCiRun.test("No run is cited; actions and runs appear only in prose.")).toBe(false);
+  });
+
   it("decides that depth before the checkout runs", () => {
     const names = steps.map((s) => s.name ?? s.uses);
     expect(names.indexOf("Fetch PR body")).toBeLessThan(names.indexOf("Checkout PR head"));

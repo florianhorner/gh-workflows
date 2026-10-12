@@ -1868,7 +1868,7 @@ describe("the rendered-HTML walk", () => {
     expect(real.exitCode).toBe(0);
   });
 
-  function htmlAndRuns(html: string, onRun: (path: string) => Response): string {
+  function htmlAndRuns(html: string, onRun: (path: string) => Response | Promise<Response>): string {
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -1926,6 +1926,48 @@ describe("the rendered-HTML walk", () => {
     expect(unknown.out).toContain("CI run 7 cannot be attributed: PR_BASE_REPO_FULL_NAME is not set");
     // A run that cannot be attributed is not looked up.
     expect(lookups).toHaveLength(4);
+  });
+
+  it("gives up on a run lookup that never answers, and says so", async () => {
+    // Without a per-request limit a hung lookup held the check until the job
+    // timeout, which reports a generic failure instead of the citing line.
+    const html = `<h2>Proof</h2><ul>${box('tests: <a href="https://github.com/florianhorner/demo/actions/runs/7">https://github.com/florianhorner/demo/actions/runs/7</a>')}</ul>`;
+    const res = await verify("(body)", {
+      GITHUB_API_URL: htmlAndRuns(html, () => new Promise<Response>(() => {})),
+      PROOF_FETCH_TIMEOUT_MS: "300",
+    });
+    expect(res.exitCode).not.toBe(0);
+    expect(res.out).toContain("[tests] Failed to fetch CI run:");
+    expect(res.out).not.toContain("Unexpected error");
+  });
+
+  it("requires the file a committed symlink points at to be committed too", async () => {
+    // git tracks a symlink as a link, but the file a reviewer opens is its
+    // target, which can be anything in the workspace.
+    const ws = workspace();
+    mkdirSync(join(ws, "proof"), { recursive: true });
+    writeFileSync(join(ws, "proof", "real.txt"), "ok\n");
+    writeFileSync(join(ws, "build-output.txt"), "not committed\n");
+    symlinkSync("../build-output.txt", join(ws, "proof", "to-untracked.txt"));
+    symlinkSync("real.txt", join(ws, "proof", "to-tracked.txt"));
+    execFileSync("git", ["init", "-q"], { cwd: ws, ...GIT_OPTS });
+    execFileSync("git", ["add", "proof/real.txt", "proof/to-untracked.txt", "proof/to-tracked.txt"], { cwd: ws, ...GIT_OPTS });
+    execFileSync(
+      "git",
+      ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "chore: init"],
+      { cwd: ws, ...GIT_OPTS }
+    );
+    const verdict = (artifact: string) =>
+      verify("(body)", {
+        GITHUB_API_URL: htmlApi(`<h2>Proof</h2><ul>${box(`runtime: <code>${artifact}</code>`)}</ul>`),
+        GITHUB_WORKSPACE: ws,
+      });
+    const [untracked, tracked] = await Promise.all([verdict("proof/to-untracked.txt"), verdict("proof/to-tracked.txt")]);
+    expect(untracked.exitCode).not.toBe(0);
+    expect(untracked.out).toContain(
+      "File path proof/to-untracked.txt points at build-output.txt, which is not committed to the PR branch"
+    );
+    expect(tracked.exitCode).toBe(0);
   });
 
   it("decides a run's repository by the API's answer, and uses the head repository only without a base", async () => {

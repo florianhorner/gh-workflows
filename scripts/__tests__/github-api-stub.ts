@@ -47,9 +47,11 @@ async function record(text: string, context: string, key: string): Promise<Respo
   }
   const res = await fetch("https://api.github.com/markdown", {
     method: "POST",
+    // The same request the verifier sends, so a recording is what production gets.
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     body: JSON.stringify({ text, mode: "gfm", ...(context ? { context } : {}) }),

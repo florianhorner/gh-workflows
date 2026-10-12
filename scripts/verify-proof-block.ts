@@ -35,10 +35,12 @@
  *                            the test suite can point at a local stub; see the
  *                            note at its definition for why it is not GHES
  *                            support.
+ *   PROOF_FETCH_TIMEOUT_MS - per-request limit for every GitHub call in ms,
+ *                            default 20000. Exists so tests can shorten it.
  */
 
 import { readFileSync, existsSync, realpathSync, statSync } from "fs";
-import { resolve, sep } from "path";
+import { relative, resolve, sep } from "path";
 import { parseFragment } from "parse5";
 import {
   cleanIntegrateWitness,
@@ -234,8 +236,9 @@ class RenderError extends Error {}
 
 const RENDER_ATTEMPTS = 3;
 // A hung request would otherwise leave the check pending until the job's own
-// timeout; each attempt gets this long.
-const RENDER_TIMEOUT_MS = 20_000;
+// timeout; each request to GitHub (every render attempt, every run lookup)
+// gets this long. PROOF_FETCH_TIMEOUT_MS shortens it in tests.
+const FETCH_TIMEOUT_MS = Number(process.env.PROOF_FETCH_TIMEOUT_MS) || 20_000;
 
 async function renderBody(body: string): Promise<string> {
   // The context repo only affects how `#123` and `@user` references link.
@@ -255,7 +258,7 @@ async function renderBody(body: string): Promise<string> {
         method: "POST",
         headers,
         body: payload,
-        signal: AbortSignal.timeout(RENDER_TIMEOUT_MS),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (res.ok) return await res.text();
       failure = `HTTP ${res.status}: ${(await res.text()).trim().slice(0, 200)}`;
@@ -771,7 +774,18 @@ function validateFilePath(key: string, artifact: string, errors: string[]): void
   const git = makeGitRunner(workspace);
   // --literal-pathspecs: an untracked file named `*` or `:(glob)x` must not
   // match a tracked sibling.
-  if (git(["--literal-pathspecs", "ls-files", "--error-unmatch", "--", artifact]).ok) return;
+  const tracked = (path: string) => git(["--literal-pathspecs", "ls-files", "--error-unmatch", "--", path]).ok;
+  // A committed symlink is tracked as a link; the file a reviewer opens is its
+  // target, which may be anything in the workspace (the nested gh-workflows
+  // checkout, a build output). The target has to be committed too.
+  const target = relative(root, full).split(sep).join("/");
+  if (tracked(artifact)) {
+    if (target === artifact.replace(/^\.\//, "") || tracked(target)) return;
+    errors.push(
+      `[${key}] File path ${artifact} points at ${target}, which is not committed to the PR branch ${PATH_HINT}`
+    );
+    return;
+  }
 
   // git said no. Distinguish "untracked" from "cannot answer": a workspace that
   // is not a git checkout (local usage, tests) leaves existence as the only
@@ -1130,6 +1144,7 @@ async function checkRun(
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
         },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       }
     );
 
