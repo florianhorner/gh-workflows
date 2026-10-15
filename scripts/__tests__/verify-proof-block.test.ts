@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { $ } from "bun";
+import { describe, it, expect } from "bun:test";
+import { unlink } from "node:fs/promises";
+import { startApiStub, stubUrl } from "./github-api-stub";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,8 +18,13 @@ async function runParser(
   body: string,
   env: Record<string, string> = {}
 ): Promise<RunResult> {
-  const tmp = `/tmp/proof-test-${Date.now()}.md`;
+  // randomUUID, not Date.now(): two fixtures written in the same millisecond
+  // collided silently.
+  const tmp = `/tmp/proof-test-${crypto.randomUUID()}.md`;
   await Bun.write(tmp, body);
+  // The verifier renders every body through GitHub's Markdown API; the stub
+  // answers from recorded renderings (see github-api-stub.ts).
+  const api = env.GITHUB_API_URL ? undefined : startApiStub();
 
   try {
     const proc = Bun.spawn(
@@ -32,6 +38,7 @@ async function runParser(
           PR_BASE_REPO_FULL_NAME: "",
           OWNED_REPOS: "",
           ...env,
+          ...(api ? { GITHUB_API_URL: stubUrl(api) } : {}),
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -46,8 +53,12 @@ async function runParser(
 
     return { exitCode, stdout, stderr };
   } finally {
-    // cleanup
-    try { Bun.file(tmp).slice(0, 0); } catch {}
+    // Actually delete it. The old `Bun.file(tmp).slice(0, 0)` constructed a
+    // Blob slice and removed nothing, so every run since this suite was
+    // written leaked a fixture into /tmp (702 of them by the time anyone
+    // counted).
+    await unlink(tmp).catch(() => {});
+    api?.stop(true);
   }
 }
 
@@ -262,7 +273,8 @@ describe("verify-proof-block", () => {
 
   it("strips trailing [proof: KEY] tag from a file-path artifact", async () => {
     // Use this test file's own path so existsSync() succeeds at the
-    // workspace root.
+    // workspace root. The backticks keep GitHub from rendering `__tests__`
+    // as bold "tests", which would change the path the verifier reads.
     const FILE_PATH_BODY = `
 ## Summary
 
@@ -273,7 +285,7 @@ Bootstrap. [proof: runtime]
 - [x] build: TestBuild [proof: build]
 - [x] tests: TestFoo [proof: tests]
 - [x] lint: TestLint [proof: lint]
-- [x] runtime: scripts/__tests__/verify-proof-block.test.ts [proof: runtime]
+- [x] runtime: \`scripts/__tests__/verify-proof-block.test.ts\` [proof: runtime]
 - [ ] schema: n/a — no changes [proof: schema]
 `.trim();
 
@@ -383,7 +395,7 @@ Bootstrap. [proof: runtime]
 - [x] build: TestBuild [proof: build]
 - [x] tests: TestFoo [proof: tests]
 - [x] lint: TestLint [proof: lint]
-- [x] runtime: scripts/__tests__/verify-proof-block.test.ts — parity check confirms the file exists [proof: runtime]
+- [x] runtime: \`scripts/__tests__/verify-proof-block.test.ts\` — parity check confirms the file exists [proof: runtime]
 - [ ] schema: n/a — no changes [proof: schema]
 `.trim();
 
@@ -426,7 +438,7 @@ Bootstrap. [proof: runtime]
 - [x] build: TestBuild [proof: build]
 - [x] tests: TestFoo [proof: tests]
 - [x] lint: TestLint [proof: lint]
-- [x] runtime: scripts/__tests__/verify-proof-block.test.ts [proof: runtime]
+- [x] runtime: \`scripts/__tests__/verify-proof-block.test.ts\` [proof: runtime]
 - [ ] schema: n/a — no schema changes in this PR [proof: schema]
 `.trim();
 

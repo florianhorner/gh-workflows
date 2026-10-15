@@ -14,8 +14,10 @@ concurrency:
 
 # Least privilege. `contents: read` covers both checkouts; `actions: read` is
 # required because verify-proof-block.ts resolves CI-run proof URLs against
-# /repos/{owner}/{repo}/actions/runs/{id}. Callers can reduce this further but
-# cannot elevate it.
+# /repos/{owner}/{repo}/actions/runs/{id}. The body itself is rendered with
+# POST /markdown, which uses `contents: read` for private resources. Some label
+# rendering may additionally need issue or pull-request read access; those
+# permissions are not granted here. Callers cannot elevate this permission set.
 permissions:
   contents: read
   actions: read
@@ -24,6 +26,9 @@ jobs:
   verify:
     name: Verify PR proof block
     runs-on: ubuntu-latest
+    # The job makes network calls (the body render, run lookups); a hung one
+    # should fail the check in minutes, not leave it pending for six hours.
+    timeout-minutes: 10
 
     # Skip draft PRs
     if: |
@@ -41,16 +46,20 @@ jobs:
             const fs = require("fs");
             fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
             core.info(`PR body length: ${body.length} chars`);
-            // The clean-integrate witness is the only thing here that reads git,
-            // and it is only ever consulted for a cited CI-run URL. No such URL
-            // means no git question, so the full history is dead weight — on a
-            // large consumer that is a ~570 MB fetch added to a 20 s job.
+            // The clean-integrate witness is the only thing here that reads git
+            // history, and it is only ever consulted for a cited CI-run URL. No
+            // such URL means no history question, so the full history is dead
+            // weight — on a large consumer that is a ~570 MB fetch added to a
+            // 20 s job. (A file-path proof line asks git only whether the file
+            // is tracked, which a shallow checkout answers.)
             //
             // Getting this wrong is safe in both directions: a false positive
             // costs one needless deep fetch, and a false negative leaves a
             // shallow clone in which the witness fails closed, i.e. the strict
             // pre-change behaviour. It can never turn a refusal into an accept.
-            const citesCiRun = /\/actions\/runs\/\d+/.test(body);
+            // Broad on purpose: the verifier also reads a percent-encoded id or
+            // slash and a doubled slash as a run.
+            const citesCiRun = /actions(?:\/|%2f)+runs(?:\/|%2f)+[^\s)\]]/i.test(body);
             core.info(`Cites a CI run URL: ${citesCiRun}`);
             core.setOutput("cites_ci_run", String(citesCiRun));
 

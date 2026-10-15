@@ -11,6 +11,7 @@ import {
   type GitRunner,
   type GitResult,
 } from "../clean-integrate-witness";
+import { runResponse, startApiStub, stubUrl } from "./github-api-stub";
 
 // Every case below builds a real repository and asks the real git. A fake
 // GitRunner would let these tests agree with a wrong mental model of merge-tree,
@@ -456,6 +457,25 @@ describe("verify-claims.yml", () => {
     expect(depth).toContain("'1'");
   });
 
+  it("deepens the checkout for every run spelling the verifier reads", () => {
+    // A shallow checkout turns a cleanly integrated run into a stale one, so
+    // the pre-check must not miss a spelling the verifier looks up.
+    const fetchBody = steps.find((s) => s.name === "Fetch PR body");
+    const src = String(fetchBody!.with.script).match(/const citesCiRun = (\/.+\/[a-z]*)\.test\(body\);/)?.[1];
+    expect(src).toBeDefined();
+    const citesCiRun = new Function(`return ${src}`)() as RegExp;
+    for (const body of [
+      "https://github.com/o/r/actions/runs/123",
+      "https://github.com/o/r/actions/runs/%31%32",
+      "https://github.com/o/r/actions//runs//123",
+      "https://github.com/o/r/actions%2Fruns%2F123",
+      "[CI run](../actions/runs/1)",
+    ]) {
+      expect(citesCiRun.test(body)).toBe(true);
+    }
+    expect(citesCiRun.test("No run is cited; actions and runs appear only in prose.")).toBe(false);
+  });
+
   it("decides that depth before the checkout runs", () => {
     const names = steps.map((s) => s.name ?? s.uses);
     expect(names.indexOf("Fetch PR body")).toBeLessThan(names.indexOf("Checkout PR head"));
@@ -627,18 +647,10 @@ describe("validateCIRun wiring", () => {
     server = undefined;
   });
 
-  // 127.0.0.1, not the default wildcard: a test has no business listening on
-  // every interface of a shared runner.
+  // Serves the recorded body rendering and this run for every run lookup.
   function serveRun(headSha: string, conclusion = "success") {
-    server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      fetch: () =>
-        new Response(JSON.stringify({ conclusion, head_sha: headSha }), {
-          headers: { "content-type": "application/json" },
-        }),
-    });
-    return `http://127.0.0.1:${server.port}`;
+    server = startApiStub(runResponse(conclusion, headSha));
+    return stubUrl(server);
   }
 
   function bodyCiting(runId: string): string {

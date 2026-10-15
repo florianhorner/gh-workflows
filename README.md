@@ -51,12 +51,20 @@ Every PR body must end with a `## Proof` block listing artifacts for each claim.
 
 | Rule | Detail |
 |------|--------|
-| Block present | PR body must contain `## Proof` at end-of-body |
-| Not in code fence / HTML comment | Fake `## Proof` in fenced blocks is ignored |
-| Checked boxes have real artifacts | URL, test name, file path, or `n/a — <reason>` |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below) |
+| Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
+| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. A heading reads as Proof by its whole text, including text inside markup a proof line may not carry (`## <ins>Proof</ins>`). Every recognised Proof heading, whether it opens the section or appears later, must sit in the body itself, a list item, a quote, an alert or a table, or inside visible formatting (`<b>`, `<em>`, a link and the like, which an unclosed tag earlier in the body wraps around everything after it), with at most one `<code>`, `<tt>` or `<pre>` around it because GitHub draws each level smaller. Any other element around it is an error: `<details>` (nested or initially open too), ruby, `<template>`, `<sup>`, `<sub>`, `<small>`, `<del>`, `<s>`, `<span>`, a footnote and the rest. Collapsible notes without a Proof heading remain allowed |
+| Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
+| Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
+| Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
+| Checked boxes have real artifacts | `https://` URL, test name, or repo-relative file path. `n/a` on a checked box is an error |
+| Unchecked boxes | Either `n/a` with a non-empty reason after `—`, `–` or `-` (spacing optional), or a real artifact, which is then validated like a checked one |
+| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below), and must have run in the PR's own repository, the one it merges into, as the API reports it: a run anywhere else is an error, even a green one on the same commit, and so is one in a fork PR's head repository, whose workflows the PR author controls. An old URL of a renamed repository still counts. The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. In a value that starts with a URL (or a bare `www.` address) that URL is the artifact and the rest is a note, so `…/runs/1 (head abc, success)` is run 1; any run in the note is still looked up, even one joined to another URL by a comma, while a plain link or check page there is context. A link whose address cannot be parsed is an error. A check-run page (`/o/r/runs/<job>`, `/o/r/commit/<sha>/checks`) is an error: nothing here can look one up, so cite the Actions run. Every link to a run anywhere in the Proof section is looked up by its target: on a proof line or off one (nested bullets, paragraphs, tables, footnotes), written as `[CI run](…)`, a reference link, `<…>` or a relative href (`/o/r/actions/runs/1`, `../actions/runs/1`), which is resolved the way the PR page resolves it. Links on an unchecked `n/a` line are context for the reason and are not looked up. A run cited several times is fetched once and reported under every line that cites it |
+| Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
+| Artifact URL scheme | `http://` is rejected |
+| File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, and so must the file a committed symlink points at, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
+| Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) render identically to LF |
 | Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
-| Inline `[proof: key]` tokens | Must match an existing proof line key |
+| Inline `[proof: key]` tokens | Every token in the rendered text must match a proof line key; `proof:` is read in any case and with any spacing (`[Proof: x]`, `[ proof : x ]`). Code examples (backtick spans, fenced and indented blocks) are excluded; a raw `<code>` wrapped around Markdown blocks renders as prose and is checked. Comments and HTML attributes are never rendered text |
 | Draft PRs | Exempt |
 | Bot authors | `dependabot[bot]`, `pre-commit-ci[bot]`, `github-actions[bot]` exempt |
 
@@ -107,7 +115,8 @@ ancestry with git, so the reusable workflow checks the PR head out with full
 history and passes the base ref on your behalf; callers need no change. That
 deep fetch is only paid when the body cites a CI run at all — on a large repo it
 is the expensive part of the job, and a body with no run URL never asks git
-anything.
+about history. (A file-path proof line asks git only whether the file is
+tracked, which a shallow checkout can answer.)
 
 ### Proof block template (own-repo PR)
 
@@ -134,12 +143,18 @@ on:
     types: [opened, edited, synchronize, ready_for_review]
 jobs:
   verify:
+    permissions:
+      contents: read
+      actions: read
     uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@fde64f42deb15511c2c71cb9798c2d6685379e38 # v1.5
     with:
       owned_repos: "florianhorner/govee2mqtt,florianhorner/mammamiradio"
 ```
 
 That's it. The reusable workflow handles checkout, Bun setup, and parser execution.
+Keep the `permissions:` block: the reusable workflow needs `actions: read` to look
+up cited runs, and a called workflow cannot raise its caller's token. Under a
+restricted default token the run is refused before it starts.
 
 ### Pin to a SHA, not a tag
 
@@ -160,8 +175,13 @@ consumer no audit trail when the code underneath changes.
 - GitHub Actions run URL (`https://github.com/{owner}/{repo}/actions/runs/{id}`)
 - Gist URL with timestamped log
 - Release asset URL
-- File path in `.context/proof/` committed to the PR branch
+- A repository-relative file committed to the PR branch (a `proof/` directory is the convention, not a requirement)
 - Screenshot URL (for UI/HA dashboard changes)
+
+All URL forms must be `https://`. File paths must be repository-relative and
+**committed** — they are resolved against the PR checkout (`GITHUB_WORKSPACE`)
+and checked against `git ls-files`, so an uncommitted file sitting in the
+checkout is an error, as is a path that escapes it.
 
 ### Running the parser locally
 
@@ -173,24 +193,40 @@ cat your-pr-body.md | bun verify-proof-block.ts
 bun verify-proof-block.ts --body-file your-pr-body.md
 ```
 
-Required env vars for full CI URL validation:
+Every run sends the body to `https://api.github.com/markdown` to have it
+rendered, so it needs network access. [GitHub's Markdown API documentation](https://docs.github.com/en/rest/markdown/markdown)
+requires `contents: read` for private-resource rendering. Some labels may also
+need `issues: read` or `pull-requests: read`. Public-resource rendering can run
+without `GITHUB_TOKEN`, with the unauthenticated limit of 60 requests an hour.
+
+Env vars for full validation of CI-run and file-path artifacts:
 
 ```
-GITHUB_TOKEN=...
+GITHUB_TOKEN=...                         # actions: read for run lookups;
+                                         # contents: read for private rendering
 PR_HEAD_SHA=<commit sha>
 PR_BASE_REF=main                         # base branch; the clean-integrate
                                          # witness anchors a merge's integrated
                                          # parent to it and refuses without it
 GITHUB_WORKSPACE=/path/to/a/full/clone   # the witness runs git here, and checks
                                          # this checkout is actually PR_HEAD_SHA.
-                                         # NOTE: this is also the "we are in CI"
-                                         # signal for file-path proof lines, so
-                                         # setting it locally makes a missing
-                                         # proof file a hard failure
-GITHUB_API_URL=https://api.github.com    # optional; override for GHES
+                                         # NOTE: this is also the ONLY root that
+                                         # file-path proof lines resolve against,
+                                         # and the "we are in CI" signal that
+                                         # makes a missing proof file a hard
+                                         # failure. Unset, existence is not
+                                         # checked at all, but an absolute or
+                                         # escaping path is still rejected
+GITHUB_API_URL=https://api.github.com    # optional; where the body is rendered
+                                         # and runs are looked up. A hook for
+                                         # the test suite, not GHES support:
+                                         # run URLs must be on github.com
 PR_HEAD_REPO_FULL_NAME=florianhorner/your-repo
-PR_BASE_REPO_FULL_NAME=florianhorner/your-repo
+PR_BASE_REPO_FULL_NAME=florianhorner/your-repo   # a cited run must have run here
+                                                 # (falls back to the head repo)
 OWNED_REPOS=florianhorner/govee2mqtt,florianhorner/mammamiradio
+PROOF_FETCH_TIMEOUT_MS=20000             # optional: per-request limit for every
+                                         # GitHub call; tests shorten it
 ```
 
 ### Running tests
@@ -199,6 +235,17 @@ OWNED_REPOS=florianhorner/govee2mqtt,florianhorner/mammamiradio
 cd scripts
 bun install
 bun test
+```
+
+Normal test runs never call GitHub. The Markdown compatibility tests use a
+local stub that answers `POST /markdown` with GitHub renderings recorded in
+`scripts/__tests__/fixtures/github-renders.json`. A body without a recording
+fails its test and names the fix. HTML-walk boundary tests also inject synthetic
+HTML; those cases are not recordings of GitHub output. After adding or changing
+a recorded test body:
+
+```bash
+RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test
 ```
 
 ## `body-lint` — editorial boundary for PR bodies, issue bodies and changelogs
@@ -306,6 +353,204 @@ the reason named. The reusable workflow's PR-head checkout moved to
 
 Both fixes are backwards-compatible — no template change required, no
 function signature change, no tag scheme change.
+
+### Unreleased — the gate fails closed and reads the body GitHub renders
+
+A set of inputs made the validator exit 0 when it should have exited 1, and a
+smaller set made it exit 1 on valid markdown. Each was reproduced against the
+previous parser before being fixed, and each has a regression test that fails
+against it.
+
+**Fail-open inputs, now rejected:**
+
+- **CI-run URLs are recognised by canonical host, not by exact string.** The old
+  pattern was host-exact, case-sensitive and `https`-only, and the generic
+  `^https?://` accept sat directly behind it returning unconditionally. So
+  `https://GitHub.com/o/r/actions/runs/1` skipped the `conclusion=success` and
+  head_sha checks entirely — one capital letter — while the PR body still
+  rendered a live link to the same run page. `http://` is now rejected, and a
+  run-shaped path on a lookalike host or a non-default port is an error rather
+  than a generic artifact. The run-id slot captures anything and is judged
+  separately: the punctuation GFM strips from the end of an autolink is
+  ignored, so `…/runs/123.` is looked up as run 123, and an id that is still
+  not digits (`…/runs/12a`) is an error. Percent-encoding and
+  doubled slashes are normalised the way github.com routes them, and a decoded
+  `#` in an owner or repo name cannot retarget the API request.
+- **The unchecked branch is exhaustive.** `if (value && value !== "n/a") return;`
+  was a silent accept that skipped every check. Once the `[proof: KEY]` strip
+  shortened `n/a — [proof: runtime]` to `n/a —`, the `n/a` classifier stopped
+  recognising it and it fell into that hole, taking the cross-owner `runtime: n/a`
+  prohibition with it. An `n/a` now needs a non-empty reason, a spaced ASCII
+  hyphen counts as a separator, and an unchecked box carrying a real artifact is
+  validated instead of waved through.
+- **File paths are confined to the checkout.** `existsSync(value)` was tried bare
+  first, i.e. against the process cwd — which under the reusable workflow is the
+  nested gh-workflows checkout, so `__tests__/...` or `node_modules/<anything>`
+  satisfied "committed to the PR branch". There was no containment check at all
+  despite the code claiming one, so `/etc/passwd` and `../../../../etc/hosts`
+  both passed. Resolution is now only ever against `GITHUB_WORKSPACE`, through
+  `realpath`, so a committed symlink pointing out is rejected too. The path must
+  name a tracked file: `git ls-files` is queried with a literal pathspec (a lone
+  `.`, or an untracked file named `*` beside a tracked one, used to satisfy it),
+  directories are rejected, and when git cannot answer
+  the check fails closed and says why.
+- **CRLF bodies are read.** `.` excludes `\r` and `$` was not multiline-anchored, so
+  on a CRLF body every proof line was dropped while the heading survived — the
+  error blamed a missing checkbox list. GitHub stores web-UI-authored and
+  web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
+  gate the moment someone fixes a typo in the description.
+- **The gate reads the body GitHub renders.** The line scanner and the parser
+  that briefly replaced it both disagreed with GitHub, and each disagreement
+  was a bypass: a checkbox inside a code fence, a tilde fence with tildes in its
+  info string, a 4-space-indented fence, a box or heading after a closing fence
+  indented more than three spaces, raw HTML lookalikes and claims after a
+  dangling `<!--` counted while GitHub showed none of them; a raw `<code>` or
+  `<plaintext>` line, a `<!x` declaration, an `<xmp>` block or a footnote hid
+  boxes and claims GitHub shows. The body is now rendered by GitHub itself; see
+  "How the body is read" below.
+- **No box after `## Proof` is skipped.** `* [x]`, `+ [x]`, `1. [x]`, nested
+  boxes, a box whose URL sits on the next line, boxes under a second `Proof`
+  heading and boxes in footnotes all used to be ignored while GitHub rendered
+  them as checked boxes. Each is now validated, and a box that does not read
+  `key: value` (`runtime:URL`, `e2e : URL`, `done`) is an error.
+- **Run links are looked up by their target.** A run cited as
+  `[CI run](…/actions/runs/1)`, a reference link, `<…/actions/runs/1>` or a
+  relative href used to miss run recognition and fail as a missing file path;
+  now the run is checked, and so is a run linked from anywhere else in the
+  section: a nested bullet, a paragraph, a table, a footnote.
+- **A lookalike heading cannot redirect the gate.** `## Proof` with an invisible
+  soft hyphen or combining joiner, `### Proof`, `## Proof:` or a Cyrillic
+  `Ргооf` used to be passed over while a real `## Proof` hidden in a collapsed
+  `<details>` further down was validated instead.
+- **A proof line cannot hide part of itself.** GitHub keeps markup that hides
+  or shrinks text: `<rp>` fallback text, a collapsed `<details>`, a URL struck
+  through or nested eight `<sup>`/`<sub>` deep until it is two pixels tall.
+  Hidden text in front of a value stood in for the visible artifact, and a
+  hidden `n/a` excused a visible run link. A proof line may now contain only
+  text, links, code, emphasis, emoji and footnote references, and no invisible
+  or text-direction characters.
+- **A Proof heading cannot be hidden.** A Proof heading may sit only in the body
+  itself, a list item, quote, alert or table, or visible formatting such as
+  `<b>` or a link, and so must a second Proof heading after a visible one. `<details>` (nested and initially open ones
+  included), ruby fallback text, `<template>`, nested `<sup>`, `<sub>` or
+  `<small>`, `<del>`, a footnote, more than one level of `<code>`, `<tt>` or
+  `<pre>`, or any other element around it is an error;
+  the message says to backtick a tag the prose mentions.
+  A heading counts as Proof by its whole text, so `## <ins>Proof</ins>` can no
+  longer be passed over either. This prevents a visible lookalike from steering
+  validation to a canonical heading the reviewer cannot see. Notes-only
+  disclosures remain allowed.
+- **A cited run must belong to the PR.** A run was looked up in whatever
+  repository its URL named, so the PR's head commit pushed to any other public
+  repository, with an always-green workflow, produced a run that passed both
+  the `conclusion=success` and the head_sha check. A cited run must now have
+  run in the PR's own repository, by the API's account of it. A fork PR's head
+  repository does not count: its author controls its workflows, and the
+  checks of a fork PR run in the repository it merges into. When runs are
+  looked up (`GITHUB_TOKEN` and `PR_HEAD_SHA` set) and neither repository
+  variable is, a run cannot be attributed and is an error.
+- **Check-run pages are not generic links.** `…/runs/<job>` and
+  `…/commit/<sha>/checks` show a result the gate cannot look up, so citing one is
+  an error instead of a pass.
+
+**Behaviour changes for existing bodies:** a file path is read as displayed, so
+a path Markdown reformats (`__tests__` renders as bold "tests") fails until it
+is put in backticks, and the error says so. A checkbox after `## Proof` whose
+key has a space (`- [x] python compile: …`) used to be skipped and is now an
+error. A `Proof` heading written any way GitHub renders as a level-2 heading
+now opens the section, and a failed claim under an earlier `Proof` heading is
+no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
+as the run. A Proof section previously wrapped in `<details>` must be moved
+outside the disclosure, even if it uses the `open` attribute, and so must one
+in any element other than those listed under "How the body is read" below. A
+run in a fork PR's head repository no longer counts as proof.
+
+**False rejections, now accepted:** a fence at a nested list item's content
+column, and an unbalanced `<!--` inside inline code, which used to swallow the
+rest of the body so a PR that *discusses* comment stripping could not pass.
+
+**Dependencies:** `parse5` is the only runtime dependency of `scripts/`, exactly
+pinned. `remark`, `remark-parse`, `unified` and `unist-util-visit`, declared on
+`main` and imported but never used, are gone.
+
+### How the body is read
+
+The verifier sends the PR body to GitHub's Markdown API (`POST /markdown`, mode
+`gfm`, with the base repository as context) and validates the HTML it gets back.
+That is the renderer behind a PR's `body_html`: for this repository's PR #15 the
+two were identical byte for byte when checked. Private-resource rendering uses
+the workflow's existing `contents: read`. GitHub documents additional
+`issues: read` or `pull-requests: read` access for some label rendering; the
+workflow does not grant those optional permissions. Public resources can be
+rendered without a token. The call is retried on server errors and throttling;
+when it still fails, the check fails. The job stops after 10 minutes, so a hung
+call fails the check instead of leaving it pending.
+
+Earlier versions emulated GitHub instead: a line scanner, then
+`unified`/`remark-parse`/`rehype-raw`. GitHub renders with cmark-gfm on
+CommonMark 0.29 and then sanitizes the HTML; the emulation followed CommonMark
+0.31 and browser HTML rules. Wherever the two disagreed, the gate and the
+reviewer read different documents. Asking GitHub removes that whole class
+rather than patching its members one at a time.
+
+From the rendered HTML:
+
+- the section opens at the first heading of any level whose letters, with
+  compatibility forms folded, default-ignorable characters dropped and a short
+  table of Cyrillic and Greek lookalikes mapped, spell "proof" in any case;
+  unless it is an `<h2>` reading exactly `Proof`, that is an error;
+- a heading is recognised by its whole text, markup included; every recognised
+  Proof heading, whether it opens the section or appears later, may have only
+  lists, quotes, divs, code blocks, tables and visible formatting (`a`, `b`,
+  `em`, `i`, `strong`, `tt`, `u`) around it, and at most one `code`, `tt` or
+  `pre`. The HTML walk carries
+  that ancestry through nested elements and template content;
+- every task-list checkbox after it is a proof line. GitHub's sanitizer strips
+  raw `<input>` elements, so a checkbox can only come from task-list syntax;
+- a proof line's text is its list item without the lists nested under it, with
+  whitespace collapsed; the key is the text before the first `: `. The line may
+  contain only text, links, code, emphasis, emoji and footnote references, and
+  no invisible or text-direction characters; anything else is an error;
+- every link in the section that points at an Actions run is looked up, after
+  resolving it against `https://github.com/<base>/pull/`, and must have run in
+  the base repository;
+- `[proof: key]` tokens are read from all rendered text, folded the same way as
+  headings, except code examples: a `<code>` or `<pre>` holding only inline
+  content.
+
+The HTML is parsed with `parse5` and walked iteratively, so a deeply nested
+body gets a verdict rather than a stack overflow.
+
+### Known gaps
+
+The gate trusts GitHub's Markdown API to render the body the way the PR page
+does. The two matched when checked; if GitHub's renderers ever diverge, the gate
+follows the API. It renders the body from the triggering event, which for an
+`edited` event is the new body. Local runs without `GITHUB_TOKEN` can render
+public resources only and are limited to 60 renders an hour.
+
+Heading lookalikes are matched with a short table, not Unicode's full
+confusables data. A heading spelled with letters outside it (Coptic, small
+capitals, Cherokee, digits drawn like `o`), or carrying characters that are
+never drawn or drawn too small to see, may still read as "Proof" to a person but
+is not recognised by the gate. It cannot supply the required canonical heading,
+and pairing it with a canonical heading the reviewer cannot see is rejected. Paired with a visible canonical `## Proof` further down, the boxes under
+the lookalike are not validated: the reviewer sees two Proof sections and only
+the second one is checked.
+A cited run is tied to the PR's repository and head commit, not to a workflow
+that tests the claim: a green run of any workflow on that commit counts,
+including one the PR itself adds or changes.
+Claims inside a mermaid diagram or math are read as code and not checked.
+A claim that points at an unchecked `n/a` line counts as backed.
+
+**Also open, unchanged:** strict mode keys on the *head* repo rather than the
+base (`PR_BASE_REPO_FULL_NAME` is the rendering context and the repository a
+cited run must be in), and the
+cross-owner `runtime` rule only recognises the key spelled `runtime` and a
+value starting with `n/a`; nothing requires any given proof key to be present;
+and the terminal `// Anything else: accept` still passes arbitrary prose,
+including a value with no `/` in it, which never reaches the file-path branch at
+all. These change semantics for existing PR bodies and are tracked separately.
 
 ## License
 

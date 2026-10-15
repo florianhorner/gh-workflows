@@ -1,22 +1,33 @@
 #!/usr/bin/env bun
 /**
- * Validates the ## Proof block in a PR body.
+ * Validates the ## Proof block in a PR body, as GitHub renders it.
  *
  * Usage:
  *   cat pr-body.md | bun verify-proof-block.ts
  *   bun verify-proof-block.ts --body-file pr-body.md
  *
- * Required env vars (when validating CI run URLs):
- *   GITHUB_TOKEN          - GitHub token with repo read access
+ * Every run sends the body to GitHub's Markdown API (POST /markdown) and
+ * validates the returned HTML. Private-resource rendering needs contents: read;
+ * some labels also need issues: read or pull-requests: read. Public-resource
+ * rendering can run without GITHUB_TOKEN (60 requests/hour).
+ *
+ * Env vars for full validation of CI-run and file-path artifacts:
+ *   GITHUB_TOKEN          - GitHub token with actions: read for run lookups and
+ *                           contents: read for private-resource rendering
  *   PR_HEAD_SHA           - SHA of the PR head commit
  *   PR_HEAD_REPO_FULL_NAME - e.g. "florianhorner/govee2mqtt"
- *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"
+ *   PR_BASE_REPO_FULL_NAME - e.g. "some-upstream/govee2mqtt"; the rendering
+ *                            context (how `#123` references link) and the
+ *                            repository a cited run must have run in. Falls
+ *                            back to PR_HEAD_REPO_FULL_NAME
  *   OWNED_REPOS            - comma-separated list of repos Florian owns
  *   PR_BASE_REF            - the PR's base branch, e.g. "main". Without it the
  *                            clean-integrate witness cannot anchor a merge and
  *                            refuses, so an integrated branch reads as stale.
  *   GITHUB_WORKSPACE       - a full clone of the PR head; the witness runs git
- *                            here. Also the "we are in CI" signal that makes a
+ *                            here. File-path artifacts resolve only against it
+ *                            and, in a git checkout, must be tracked in it.
+ *                            Also the "we are in CI" signal that makes a
  *                            missing file-path artifact a hard failure.
  *
  * Optional:
@@ -24,14 +35,13 @@
  *                            the test suite can point at a local stub; see the
  *                            note at its definition for why it is not GHES
  *                            support.
+ *   PROOF_FETCH_TIMEOUT_MS - per-request limit for every GitHub call in ms,
+ *                            default 20000. Exists so tests can shorten it.
  */
 
-import { remark } from "remark";
-import remarkParse from "remark-parse";
-import { unified } from "unified";
-import { visit } from "unist-util-visit";
-import { readFileSync } from "fs";
-import { existsSync } from "fs";
+import { readFileSync, existsSync, realpathSync, statSync } from "fs";
+import { relative, resolve, sep } from "path";
+import { parseFragment } from "parse5";
 import {
   cleanIntegrateWitness,
   makeGitRunner,
@@ -45,13 +55,9 @@ import {
 interface ProofLine {
   key: string;
   checked: boolean;
-  value: string; // everything after "key: "
+  value: string; // the rendered text after "key: "
   raw: string;
-}
-
-interface ValidationResult {
-  ok: boolean;
-  errors: string[];
+  links: string[]; // hrefs of the links on the line
 }
 
 // ---------------------------------------------------------------------------
@@ -67,9 +73,9 @@ const PR_BASE_REPO = process.env.PR_BASE_REPO_FULL_NAME ?? "";
 // stub and exercise the CI-run path end to end instead of only its parts.
 //
 // It is NOT GHES support, and an earlier version of this comment wrongly implied
-// it was. CI_RUN_RE below only recognises `https://github.com/...`, so a GHES run
-// URL never reaches validateCIRun at all: it falls through to the generic-URL
-// branch and is accepted without the conclusion check or the content witness.
+// it was. classifyArtifactUrl below only accepts `github.com` as a CI-run host, so
+// a GHES run URL never reaches validateCIRun at all: it is reported as a wrong-host
+// CI-run claim rather than validated.
 // Supporting GHES means teaching URL recognition the configured host and mapping
 // its API URL to its web URL, which nothing here exercises — so the claim is
 // dropped rather than the limitation hidden.
@@ -79,11 +85,111 @@ const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// CI run URL pattern: https://github.com/{owner}/{repo}/actions/runs/{id}
-const CI_RUN_RE =
-  /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)/;
-
 const PROOF_KEY_RE = /^[a-zA-Z_][\w:]*$/;
+
+// Path shape of a run page: /{owner}/{repo}/actions/runs/{id}
+//
+// The id group is deliberately NOT `\d+`. Requiring digits here meant anything
+// else — `runs/123.`, `runs/%31` — simply failed to match, fell through to the
+// generic-URL accept and skipped validation. Capture whatever is in the slot and
+// judge it separately, so an id we cannot read is an ERROR rather than a pass.
+const CI_RUN_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([^/]*)/;
+
+// Check-run pages: /{owner}/{repo}/runs/{job id} and /{owner}/{repo}/commit/{sha}/checks.
+// They show a job's result, but nothing here can look one up (that needs the
+// checks API and a permission callers do not grant), so citing one is an error
+// rather than a generic link.
+const CHECK_PAGE_PATH_RE = /^\/[^/]+\/[^/]+\/(?:runs\/[^/]+|commit\/[^/]+\/checks)/;
+
+// Trailing punctuation GFM's autolink extension excludes from a bare link, so
+// `…/runs/123.` at the end of a sentence renders as a link to run 123.
+const AUTOLINK_TRAILING = /[?!.,:;*_~)\]]+$/;
+
+type ArtifactUrl =
+  | { kind: "ci-run"; owner: string; repo: string; runId: string }
+  | { kind: "ci-run-wrong-host"; host: string }
+  | { kind: "ci-run-bad-id"; id: string }
+  | { kind: "ci-run-insecure" }
+  | { kind: "check-page" }
+  | { kind: "insecure" }
+  | { kind: "url" }
+  | { kind: "not-url" };
+
+/**
+ * Classifies an artifact value as a URL, canonicalising the host FIRST.
+ *
+ * This replaces a single anchored regex over the raw string
+ * (`/^https:\/\/github\.com\/...\/actions\/runs\/(\d+)/`): host-exact,
+ * case-sensitive, https-only. Every near-miss — `GitHub.com`, `http://`,
+ * `www.github.com` — missed it and then landed in the generic-URL accept
+ * sitting directly behind it, which returns unconditionally. One capital letter
+ * therefore skipped the `conclusion === "success"` and head_sha checks that are
+ * the only reason this script exists, while the PR body still rendered a live
+ * link to the same run page. Hosts are case-insensitive in DNS; the three
+ * spellings are the same page.
+ *
+ * So: any URL whose PATH looks like an Actions run is treated as a CI-run claim
+ * and must validate. It is never allowed to fall through to the generic accept.
+ * A run-shaped path on some other host is an error, not a generic artifact —
+ * `github.com.example.test/o/r/actions/runs/1` is not a run page.
+ */
+function classifyArtifactUrl(value: string): ArtifactUrl {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return { kind: "not-url" };
+  }
+  // A bare test name parses as a URL: `TestThing::sub_case` has protocol
+  // "testthing:". Only http(s) is a URL for our purposes.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { kind: "not-url" };
+  }
+
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+
+  // Decode and collapse before matching. `%2F`, `%61ctions` and `//owner/...`
+  // all route to the same page on github.com, so a matcher that reads the raw
+  // pathname sees a non-run URL where the reader sees a run link.
+  let path = parsed.pathname;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // Malformed escape: leave it encoded rather than guessing.
+  }
+  path = path.replace(/\/{2,}/g, "/");
+
+  const runMatch = path.match(CI_RUN_PATH_RE);
+
+  // An empty id slot is `…/actions/runs/`, the runs index. That is not a run
+  // claim at all, so it stays a generic URL rather than becoming an error.
+  if (runMatch && runMatch[3] !== "") {
+    // A non-default port is a different origin than the one the API is asked
+    // about, so it is not this run page.
+    if (host !== "github.com" || parsed.port !== "") {
+      return { kind: "ci-run-wrong-host", host: parsed.host.toLowerCase() };
+    }
+    if (parsed.protocol !== "https:") return { kind: "ci-run-insecure" };
+    const id = runMatch[3]!.replace(AUTOLINK_TRAILING, "");
+    if (!/^\d+$/.test(id)) return { kind: "ci-run-bad-id", id: runMatch[3]! };
+    // owner/repo come out of the DECODED path and are interpolated into the API
+    // URL, so `demo%23` decodes to `demo#` and truncates the request to
+    // /repos/{owner}/{repo} — the validator would then judge the repository
+    // object as if it were a run. GitHub names cannot contain these characters,
+    // so refuse rather than encode: an encoded name is a 404 round trip for a
+    // repo that cannot exist.
+    const owner = runMatch[1]!;
+    const repo = runMatch[2]!;
+    if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
+      return { kind: "ci-run-bad-id", id: `${owner}/${repo}` };
+    }
+    return { kind: "ci-run", owner, repo, runId: id };
+  }
+
+  if (host === "github.com" && CHECK_PAGE_PATH_RE.test(path)) return { kind: "check-page" };
+  if (parsed.protocol !== "https:") return { kind: "insecure" };
+  return { kind: "url" };
+}
 
 // ---------------------------------------------------------------------------
 // Step 1: read body
@@ -105,92 +211,404 @@ function readBody(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: strip HTML comments and code fences, then find ## Proof section
+// Step 2: have GitHub render the body, then read the rendered HTML
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the raw markdown content of the ## Proof section, anchored
- * to end-of-body. The section starts at the last `## Proof` heading that
- * is NOT inside an HTML comment or code fence.
+ * The gate validates the document a reviewer sees, so it asks GitHub for it.
+ *
+ * Three earlier versions of this file emulated GitHub instead: a line scanner,
+ * then a patched line scanner, then remark + rehype-raw. Each one hid text in
+ * places GitHub shows it — a raw `<code>` or `<plaintext>` line, a `<!x`
+ * declaration, a footnote, an `<xmp>` block — because GitHub renders with
+ * cmark-gfm 0.29 and then sanitizes, while the emulation followed CommonMark
+ * 0.31 and browser HTML rules. Every disagreement was a way to show reviewers a
+ * checked box the gate never validated.
+ *
+ * `POST /markdown` in gfm mode is the renderer behind a PR's `body_html`
+ * (identical output, checked on this repo's PR #15). Private-resource rendering
+ * needs contents: read; labels may also need issues: read or pull-requests:
+ * read. Public resources can be rendered without a token at 60 requests an
+ * hour. Every run makes this call, so it is retried; a body that cannot be
+ * rendered is a failure, never a pass.
  */
-function extractProofSection(body: string): string | null {
-  // Strip HTML comments to prevent fake ## Proof inside <!-- -->
-  const noComments = body.replace(/<!--[\s\S]*?-->/g, "");
+class RenderError extends Error {}
 
-  // Strip code fences (``` or ~~~)
-  const noFences = noComments.replace(/`{3,}[\s\S]*?`{3,}/g, "").replace(/~{3,}[\s\S]*?~{3,}/g, "");
+const RENDER_ATTEMPTS = 3;
+// A hung request would otherwise leave the check pending until the job's own
+// timeout; each request to GitHub (every render attempt, every run lookup)
+// gets this long. PROOF_FETCH_TIMEOUT_MS shortens it in tests.
+const FETCH_TIMEOUT_MS = Number(process.env.PROOF_FETCH_TIMEOUT_MS) || 20_000;
 
-  // Find the last ## Proof heading (case-sensitive, per spec)
-  const lines = noFences.split("\n");
-  let proofStart = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^##\s+Proof\s*$/.test(lines[i].trim())) {
-      proofStart = i;
-      break;
+async function renderBody(body: string): Promise<string> {
+  // The context repo only affects how `#123` and `@user` references link.
+  const context = PR_BASE_REPO || PR_HEAD_REPO;
+  const payload = JSON.stringify({ text: body, mode: "gfm", ...(context ? { context } : {}) });
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "Content-Type": "application/json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+
+  let failure = "";
+  for (let attempt = 1; attempt <= RENDER_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${GITHUB_API_URL}/markdown`, {
+        method: "POST",
+        headers,
+        body: payload,
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (res.ok) return await res.text();
+      failure = `HTTP ${res.status}: ${(await res.text()).trim().slice(0, 200)}`;
+      // Only a server error or a throttle can change on retry.
+      if (res.status < 500 && res.status !== 429) break;
+    } catch (err) {
+      failure = String(err);
     }
+    if (attempt < RENDER_ATTEMPTS) await Bun.sleep(500 * attempt);
   }
-  if (proofStart === -1) return null;
-
-  // The proof section is everything from proofStart to end-of-body in the
-  // ORIGINAL body (we need original text for URL validation etc.)
-  // Re-locate in original body by finding the same ## Proof occurrence.
-  const originalLines = body.split("\n");
-  // We need to find the corresponding line in original body.
-  // Strategy: walk original body lines counting ## Proof occurrences that
-  // are NOT inside comments or code fences, and take the last one.
-  let inComment = false;
-  let inFence = false;
-  let lastProofLine = -1;
-
-  for (let i = 0; i < originalLines.length; i++) {
-    const line = originalLines[i];
-
-    // Track HTML comments (multiline)
-    const openComments = (line.match(/<!--/g) ?? []).length;
-    const closeComments = (line.match(/-->/g) ?? []).length;
-    if (inComment) {
-      if (closeComments > 0) inComment = false;
-      continue;
-    }
-    if (openComments > closeComments) {
-      inComment = true;
-      continue;
-    }
-
-    // Track code fences
-    if (/^(`{3,}|~{3,})/.test(line.trim())) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-
-    if (/^##\s+Proof\s*$/.test(line.trim())) {
-      lastProofLine = i;
-    }
-  }
-
-  if (lastProofLine === -1) return null;
-  return originalLines.slice(lastProofLine).join("\n");
+  throw new RenderError(
+    `could not render the PR body through GitHub's Markdown API (${failure}). ` +
+    "The gate validates the body as GitHub displays it and cannot run without that rendering."
+  );
 }
 
-// ---------------------------------------------------------------------------
-// Step 3: parse proof lines
-// ---------------------------------------------------------------------------
+// The parse5 default tree, reduced to the fields read here.
+interface HtmlNode {
+  nodeName: string;
+  tagName?: string;
+  value?: string;
+  attrs?: { name: string; value: string }[];
+  childNodes?: HtmlNode[];
+  content?: HtmlNode; // <template>
+  parentNode?: HtmlNode | null;
+}
 
-function parseProofLines(section: string): ProofLine[] {
-  const lines = section.split("\n");
-  const result: ProofLine[] = [];
+function childrenOf(node: HtmlNode): HtmlNode[] {
+  // A <template>'s children live in `content`. GitHub's sanitizer strips the
+  // element today; walking into it anyway means a future sanitizer change
+  // cannot hide a checkbox from the gate.
+  return [...(node.childNodes ?? []), ...(node.content?.childNodes ?? [])];
+}
 
-  for (const line of lines) {
-    // Match: - [x] key: value  OR  - [ ] key: value
-    const m = line.match(/^-\s+\[([ xX])\]\s+(\S+?):\s+(.*)$/);
-    if (!m) continue;
-    const checked = m[1].toLowerCase() === "x";
-    const key = m[2];
-    const value = stripTrailingProofTag(m[3].trim());
-    result.push({ key, checked, value, raw: line });
+/**
+ * Descendants in document order, iteratively: a PR body can nest 30,000 levels
+ * deep, and a recursive walk turns that into a stack overflow instead of a
+ * verdict. `prune` skips a node together with everything under it.
+ */
+function* descendants(node: HtmlNode, prune: (n: HtmlNode) => boolean = () => false): Generator<HtmlNode> {
+  const stack = [...childrenOf(node)].reverse();
+  while (stack.length > 0) {
+    const n = stack.pop()!;
+    if (prune(n)) continue;
+    yield n;
+    const kids = childrenOf(n);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]!);
   }
-  return result;
+}
+
+function attr(node: HtmlNode, name: string): string | undefined {
+  return node.attrs?.find((a) => a.name === name)?.value;
+}
+
+const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
+
+/**
+ * Text as a reader takes it in: compatibility forms folded (fullwidth `［` is
+ * `[`) and invisible format characters dropped (a soft hyphen or zero-width
+ * space inside "Proof" or "[proof:" changes the string, not what anyone sees).
+ * Used to recognise headings and claim tokens, never to read artifact values.
+ */
+const readable = (text: string) =>
+  text.normalize("NFKC").replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
+
+// Letters from other scripts that are drawn like the ones in "proof". NFKC does
+// not fold these; the table is short because only five letters matter.
+const PROOF_LOOKALIKES: Record<string, string> = {
+  "\u0440": "p", "\u03C1": "p", // Cyrillic er, Greek rho
+  "\u0433": "r", // Cyrillic ghe
+  "\u043E": "o", "\u03BF": "o", "\u0585": "o", // Cyrillic o, Greek omicron, Armenian oh
+  "\u0192": "f", // Latin f with hook
+};
+
+/**
+ * Whether a heading reads as "Proof" to a reader: letters only, invisible
+ * characters dropped, case folded, lookalike letters mapped. `Proof:`,
+ * `Proof ✅`, `PROOF` and a Cyrillic `Ргооf` all do. Decides where the section
+ * starts and which headings must be visible; the first one still has to be
+ * exactly `## Proof`.
+ */
+function readsAsProof(text: string): boolean {
+  const letters = [...readable(text).toLowerCase()]
+    .map((c) => PROOF_LOOKALIKES[c] ?? c)
+    .join("")
+    .replace(/[^\p{L}]/gu, "");
+  return letters === "proof";
+}
+
+/**
+ * Elements that separate text. Without a break at their edges the text of two
+ * paragraphs joins, and `[proof:` at the end of one could pair with `key]` at
+ * the start of the next.
+ */
+const BLOCK_TAGS = new Set([
+  "address", "article", "aside", "blockquote", "br", "dd", "details", "div", "dl",
+  "dt", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
+  "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "summary",
+  "table", "td", "th", "tr", "ul",
+]);
+
+/**
+ * A `<code>` or `<pre>` element is a code example when it holds only inline
+ * content. That is what backtick spans, fenced blocks and indented blocks
+ * render to, and a `[proof: key]` inside one is the syntax being shown, not a
+ * claim. A raw `<code>` wrapped around Markdown blocks renders those blocks —
+ * paragraphs, lists, checkboxes — in a monospace font; that is prose a reviewer
+ * reads, so its tokens are claims like any other.
+ */
+function isCodeExample(node: HtmlNode): boolean {
+  if (node.tagName !== "code" && node.tagName !== "pre") return false;
+  for (const n of descendants(node)) {
+    if (n.tagName !== undefined && n.tagName !== "br" && BLOCK_TAGS.has(n.tagName)) return false;
+  }
+  return true;
+}
+
+/**
+ * The text of one proof line: its list item, without the lists nested under it
+ * (each nested checkbox is a proof line of its own). Links are collected so a
+ * run cited as `[CI run](…/actions/runs/1)` is looked up by its target, which is
+ * where the rendered link sends the reader.
+ */
+function lineOf(item: HtmlNode): { text: string; core: string; anchors: HtmlNode[]; foreign: string[] } {
+  const text: string[] = [];
+  const core: string[] = [];
+  const anchors: HtmlNode[] = [];
+  const foreign = new Set<string>();
+  const outside = new Set<HtmlNode>();
+  for (const n of descendants(item, (n) => n.tagName === "ul" || n.tagName === "ol")) {
+    const beyond = n.parentNode !== undefined && n.parentNode !== null && outside.has(n.parentNode);
+    if (n.tagName !== undefined && (beyond || !allowedInLine(n))) {
+      outside.add(n);
+      if (!beyond) foreign.add(n.tagName);
+    }
+    if (n.nodeName === "#text") {
+      text.push(n.value ?? "");
+      if (!(n.parentNode && outside.has(n.parentNode))) core.push(n.value ?? "");
+    }
+    if (n.tagName === "a" && attr(n, "href")) anchors.push(n);
+  }
+  return { text: collapse(text.join("")), core: collapse(core.join("")), anchors, foreign: [...foreign] };
+}
+
+/**
+ * What a proof line may contain: text, links, code and emphasis, as Markdown
+ * writes them. Everything else GitHub's sanitizer keeps can hide, shrink,
+ * strike through or overlay text — `<rp>` fallback text and a collapsed
+ * `<details>` are hidden, `~~…~~` reads as "not this", eight nested `<sup>`/
+ * `<sub>` draw a URL two pixels tall — and each of those let the gate read a
+ * value, an `n/a` or a URL the reviewer does not see as the claim. Listing what
+ * is allowed, instead of what is not, is the only version of this that does not
+ * need a new entry for every trick.
+ */
+// `tt` is how GitHub renders an auto-linked commit SHA.
+const LINE_TAGS = new Set(["p", "input", "a", "code", "tt", "strong", "em", "b", "i", "br", "g-emoji"]);
+
+function allowedInLine(node: HtmlNode): boolean {
+  if (LINE_TAGS.has(node.tagName!)) return true;
+  // A footnote reference renders as <sup><a data-footnote-ref>n</a></sup>.
+  if (node.tagName === "sup") {
+    const kids = childrenOf(node).filter((c) => c.nodeName !== "#text" || (c.value ?? "").trim());
+    return kids.length === 1 && kids[0]!.tagName === "a" && attr(kids[0]!, "data-footnote-ref") !== undefined;
+  }
+  return false;
+}
+
+/**
+ * Invisible or direction-changing characters on a proof line: zero-width
+ * joiners and spaces, bidi controls that display a run link before an `n/a` the
+ * gate reads first, a joiner inside a URL's host. Emoji sequences use joiners
+ * and variation selectors legitimately and are exempt.
+ */
+function hasInvisible(text: string): boolean {
+  const withoutEmoji = text.replace(/\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/gu, "");
+  return /[\p{Cf}\p{Default_Ignorable_Code_Point}]/u.test(withoutEmoji);
+}
+
+function closestItem(node: HtmlNode): HtmlNode | null {
+  for (let n = node.parentNode; n; n = n.parentNode) {
+    if (n.tagName === "li") return n;
+  }
+  return null;
+}
+
+const PROOF_LINE_RE = /^(\S+?):\s+(.*)$/;
+const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
+
+/**
+ * The only elements a Proof heading may sit in. Everything else GitHub's
+ * sanitizer keeps can hide it (`<details>`, `<rp>`, `<template>`), shrink it
+ * (nested `<sup>`, `<sub>`, `<small>`, `<rt>`) or strike it through, and a
+ * heading the reviewer cannot see could stand in for a visible lookalike.
+ * Like the proof-line rule, this lists what is allowed: GitHub renders a
+ * Markdown heading at the top level, in a list item, a quote or an alert.
+ */
+const VISIBLE_CONTAINERS = new Set([
+  "blockquote", "code", "dd", "div", "dl", "dt", "li", "ol", "pre", "table",
+  "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+  // GitHub's wrapper around every rendered table.
+  "markdown-accessiblity-table",
+  // Visible formatting. HTML reopens an unclosed <b>, <a>, … around every later
+  // block, so a tag mentioned in the prose without backticks ends up wrapping
+  // the Proof heading.
+  "a", "b", "em", "i", "strong", "tt", "u",
+]);
+
+/**
+ * Allowed containers GitHub draws smaller: its stylesheet sets `<code>`, `<tt>`
+ * and `<pre>` to 85% of their parent, so each nested level shrinks a heading
+ * again. One level (a stray `<code>` in the prose) is readable; more is not.
+ */
+const SHRINKING_CONTAINERS = new Set(["code", "pre", "tt"]);
+
+function parseRenderedBody(html: string): {
+  proofLines: ProofLine[] | null;
+  malformed: string[];
+  sectionLinks: string[];
+  tokenText: string;
+} {
+  const root = parseFragment(html) as unknown as HtmlNode;
+  const tokenText: string[] = [];
+  let proofSeen = false;
+  const boxes: HtmlNode[] = [];
+  const sectionAnchors: HtmlNode[] = [];
+  const malformed: string[] = [];
+
+  // Iterative pre-order walk; an `exit` frame closes a block element.
+  // `container` names the outermost element around the node that a Proof
+  // heading may not sit in (see VISIBLE_CONTAINERS), if any; `shrunk` counts
+  // the SHRINKING_CONTAINERS around it.
+  const stack: {
+    node: HtmlNode;
+    inExample: boolean;
+    container: string | null;
+    shrunk: number;
+    exit?: boolean;
+  }[] = [{ node: root, inExample: false, container: null, shrunk: 0 }];
+  while (stack.length > 0) {
+    const { node, inExample, container, shrunk, exit } = stack.pop()!;
+    const block = node.tagName !== undefined && BLOCK_TAGS.has(node.tagName);
+    if (exit) {
+      if (block) tokenText.push("\n");
+      continue;
+    }
+    if (node.nodeName === "#text") {
+      if (!inExample) tokenText.push(node.value ?? "");
+      continue;
+    }
+    // The FIRST heading that reads as "Proof" opens the section. Every checkbox
+    // after it is a proof line, including any under a second Proof heading, so
+    // no box a reviewer can see is left out of validation. "Reads as" is
+    // deliberately loose — any level, any case, invisible characters ignored —
+    // so a lookalike cannot open a section the gate skips while a real heading
+    // further down (say, inside a collapsed <details>) is the one validated. A
+    // lookalike is then an error of its own. Its whole text counts, so markup a
+    // proof line may not carry (`## <ins>Proof</ins>`) does not hide the word.
+    // No Proof heading may sit in anything but a visible container, even after
+    // a visible section or in initially open details: a canonical heading the
+    // reviewer cannot see could otherwise stand in for a visible lookalike
+    // outside our finite table.
+    if (node.tagName !== undefined && HEADING_TAGS.has(node.tagName)) {
+      const { text: shown, core, foreign } = lineOf(node);
+      if (readsAsProof(core) || readsAsProof(shown)) {
+        if (container === "details") {
+          malformed.push(
+            "The Proof heading must be outside <details>; move the ## Proof block outside all collapsible sections."
+          );
+        } else if (container) {
+          malformed.push(
+            `The Proof heading must not be inside <${container}>; write ## Proof in the body itself (a list item or a quote is fine). If the body mentions <${container}> as text, put it in backticks.`
+          );
+        } else if (shrunk > 1) {
+          malformed.push(
+            "The Proof heading must not be inside more than one <code>, <tt> or <pre>: GitHub draws each level smaller. If the body mentions these tags as text, put them in backticks."
+          );
+        }
+        if (!proofSeen) {
+          proofSeen = true;
+          if (node.tagName !== "h2" || shown !== "Proof" || foreign.length > 0) {
+            malformed.push(
+              `The heading "${shown}" (${node.tagName}) reads as the Proof heading but is not "## Proof"; write it as ## Proof.`
+            );
+          }
+        }
+      }
+    }
+    // GitHub's sanitizer removes raw <input> elements, so every checkbox in the
+    // rendered body comes from task-list syntax.
+    if (proofSeen && node.tagName === "input" && attr(node, "type")?.toLowerCase() === "checkbox") {
+      boxes.push(node);
+    }
+    if (proofSeen && node.tagName === "a" && attr(node, "href")) sectionAnchors.push(node);
+    if (block) tokenText.push("\n");
+    const example = inExample || isCodeExample(node);
+    stack.push({ node, inExample, container, shrunk, exit: true });
+    const kids = childrenOf(node);
+    const within =
+      container ?? (node.tagName !== undefined && !VISIBLE_CONTAINERS.has(node.tagName) ? node.tagName : null);
+    const smaller = shrunk + (node.tagName !== undefined && SHRINKING_CONTAINERS.has(node.tagName) ? 1 : 0);
+    for (let i = kids.length - 1; i >= 0; i--) {
+      stack.push({ node: kids[i]!, inExample: example, container: within, shrunk: smaller });
+    }
+  }
+
+  const joined = readable(tokenText.join(""));
+  if (!proofSeen) return { proofLines: null, malformed: [], sectionLinks: [], tokenText: joined };
+
+  const proofLines: ProofLine[] = [];
+  const onLines = new Set<HtmlNode>();
+  const seenItems = new Set<HtmlNode>();
+  for (const box of boxes) {
+    const item = closestItem(box) ?? box.parentNode ?? box;
+    if (seenItems.has(item)) continue;
+    seenItems.add(item);
+    const { text, anchors, foreign } = lineOf(item);
+    for (const a of anchors) onLines.add(a);
+    if (foreign.length > 0) {
+      malformed.push(
+        `Proof line contains <${foreign.join(">, <")}> markup, which can hide or restyle part of it: "${text}". ` +
+          "A proof line may use only text, links, code and emphasis."
+      );
+      continue;
+    }
+    if (hasInvisible(text)) {
+      malformed.push(
+        `Proof line contains invisible or text-direction characters: "${text}". Remove them so the line reads as it is checked.`
+      );
+      continue;
+    }
+    const match = text.match(PROOF_LINE_RE);
+    if (!match) {
+      malformed.push(
+        `Proof checkbox is not in "key: value" form with a key that has no spaces (e.g. "tests: ..."): "${text}". Every checkbox after ## Proof is a proof line.`
+      );
+      continue;
+    }
+    proofLines.push({
+      key: match[1]!,
+      checked: attr(box, "checked") !== undefined,
+      value: stripTrailingProofTag(match[2]!.trim()),
+      raw: text,
+      links: anchors.map((a) => attr(a, "href")!),
+    });
+  }
+  // Links in the section that no proof line carries: nested bullets, paragraphs,
+  // tables, footnotes, a bullet with an emoji where the checkbox should be. A
+  // run linked there reads as evidence as much as one on a checkbox line does.
+  const sectionLinks = sectionAnchors.filter((a) => !onLines.has(a)).map((a) => attr(a, "href")!);
+  return { proofLines, malformed, sectionLinks, tokenText: joined };
 }
 
 /**
@@ -210,13 +628,13 @@ function parseProofLines(section: string): ProofLine[] {
  * rejects the dirty string.
  *
  * Tag format mirrors the [proof: KEY] inline-token regex elsewhere in this
- * file: case-sensitive `proof:`, allow whitespace around the key.
- * Inline-token validation (validateInlineTokens) still scans the original
+ * file: `proof:` in any case, whitespace allowed around the word and the key.
+ * Inline-token validation (validateInlineTokens) still scans the rendered
  * body text, so the self-reference tags are still counted there — stripping
  * here only affects artifact validation.
  */
 function stripTrailingProofTag(value: string): string {
-  return value.replace(/\s*\[proof:\s*[^\]]+\]\s*$/, "").trim();
+  return value.replace(/\s*\[\s*proof\s*:\s*[^\]]+\]\s*$/i, "").trim();
 }
 
 /**
@@ -248,16 +666,342 @@ function stripArtifactDescription(value: string): string {
 // Step 4: validate each proof line
 // ---------------------------------------------------------------------------
 
+/** An `n/a` value, however its reason is (or is not) attached. */
+const NA_PREFIX_RE = /^n\/a\b/i;
+
+/**
+ * Parses an `n/a` value into its reason.
+ *
+ * Returns the reason, `""` for an `n/a` with no reason at all (`n/a`, `n/a —`),
+ * or `null` when the value is an `n/a` whose reason is not attached in a form
+ * we recognise.
+ *
+ * An ASCII hyphen counts as a separator here, with or without spaces around
+ * it, even though stripArtifactDescription deliberately excludes it. The two are not the same
+ * question: an `n/a` reason is prose, while a real artifact may be a file path
+ * full of hyphens. Requiring an em-dash left the rule one keystroke from
+ * unenforced — `n/a - no device` was silently accepted on a cross-owner PR.
+ */
+function parseNotApplicable(value: string): string | null {
+  const m = value.match(/^n\/a(?:\s*[\u2014\u2013-]\s*(.*))?$/i);
+  if (!m) return null;
+  return (m[1] ?? "").trim();
+}
+
+function looksLikeFilePath(artifact: string): boolean {
+  return (
+    artifact.startsWith(".") || artifact.startsWith("/") || artifact.includes("/")
+  );
+}
+
+/**
+ * Validates a file-path artifact and confines it to the PR checkout.
+ *
+ * Two defects this replaces, both of which let a path that is nowhere in the PR
+ * pass as "committed to the PR branch":
+ *
+ *  - `existsSync(artifact)` was tried BARE first, i.e. against the process cwd.
+ *    Under the reusable workflow that cwd is the nested gh-workflows checkout
+ *    (`working-directory: _gh_workflows/scripts`), so
+ *    `__tests__/verify-proof-block.test.ts` or `node_modules/<anything>`
+ *    satisfied the check. The `${GITHUB_WORKSPACE}/${value}` fallback was
+ *    correct — it just never ran, because the wrong tree answered first.
+ *  - There was no containment check at all, despite the comment claiming
+ *    "must exist on disk within repo". `/etc/passwd` and `../../../../etc/hosts`
+ *    both passed.
+ *
+ * Resolution is now only ever against GITHUB_WORKSPACE, which the workflow
+ * points at the PR head checkout.
+ */
+// The path is read from the rendered line, so `scripts/__tests__/x.ts` arrives
+// as `scripts/tests/x.ts` with "tests" in bold — which is also what the
+// reviewer sees. Say how to keep a path intact wherever a path is refused.
+const PATH_HINT =
+  "(read as GitHub displays it; put paths in backticks so Markdown formatting cannot change them)";
+
+function validateFilePath(key: string, artifact: string, errors: string[]): void {
+  const workspace = process.env.GITHUB_WORKSPACE;
+
+  if (!workspace) {
+    // Local usage: no checkout root to resolve against, so existence is
+    // unknowable and stays soft, as before. An escape is still an escape
+    // though, and saying so needs no filesystem.
+    if (artifact.startsWith("/") || artifact.split("/").includes("..")) {
+      errors.push(
+        `[${key}] File-path artifact must be repository-relative, got: ${artifact}`
+      );
+    }
+    return;
+  }
+
+  // realpath, not just resolve: resolve() is lexical, and existsSync follows
+  // symlinks, so a committed `etc-link -> /etc` made `etc-link/passwd` look
+  // like it lived inside the checkout.
+  const root = realpathOrSelf(resolve(workspace));
+  const full = realpathOrSelf(resolve(root, artifact));
+  if (full !== root && !full.startsWith(root + sep)) {
+    errors.push(`[${key}] File path escapes the repository checkout: ${artifact}`);
+    return;
+  }
+  if (!existsSync(full)) {
+    errors.push(`[${key}] File path does not exist: ${artifact} ${PATH_HINT}`);
+    return;
+  }
+
+  // A directory is not an artifact. `git ls-files --error-unmatch` treats its
+  // argument as a PATHSPEC and succeeds for anything covering at least one
+  // tracked file, so `.` — or `proof/` — satisfied the tracked check on its own.
+  if (!statSync(full).isFile()) {
+    errors.push(`[${key}] File-path artifact must be a file, not a directory: ${artifact}`);
+    return;
+  }
+
+  // "Repository-relative" has to be enforced, not just documented: an absolute
+  // path inside the workspace passed both containment and the tracked check.
+  if (artifact.startsWith("/")) {
+    errors.push(
+      `[${key}] File-path artifact must be repository-relative, got: ${artifact}`
+    );
+    return;
+  }
+
+  // Existing inside the checkout directory is not the claim. The claim is
+  // "committed to the PR branch", and only git can answer it. This is what
+  // excludes the nested gh-workflows checkout: the reusable workflow puts it at
+  // `_gh_workflows/` INSIDE github.workspace and then runs `bun install` there,
+  // so `_gh_workflows/scripts/__tests__/...` and `_gh_workflows/scripts/
+  // node_modules/<anything>` are inside the workspace yet in no PR commit.
+  const git = makeGitRunner(workspace);
+  // --literal-pathspecs: an untracked file named `*` or `:(glob)x` must not
+  // match a tracked sibling.
+  const tracked = (path: string) => git(["--literal-pathspecs", "ls-files", "--error-unmatch", "--", path]).ok;
+  // A committed symlink is tracked as a link; the file a reviewer opens is its
+  // target, which may be anything in the workspace (the nested gh-workflows
+  // checkout, a build output). The target has to be committed too.
+  const target = relative(root, full).split(sep).join("/");
+  if (tracked(artifact)) {
+    if (target === artifact.replace(/^\.\//, "") || tracked(target)) return;
+    errors.push(
+      `[${key}] File path ${artifact} points at ${target}, which is not committed to the PR branch ${PATH_HINT}`
+    );
+    return;
+  }
+
+  // git said no. Distinguish "untracked" from "cannot answer": a workspace that
+  // is not a git checkout (local usage, tests) leaves existence as the only
+  // available evidence, which is the behaviour this function started from.
+  //
+  // "Cannot answer" is decided by the presence of `.git`, NOT by the exit code.
+  // Keying on `rev-parse` returning exactly "true" meant any git failure read as
+  // "not a checkout" and accepted — and the everyday cause of that in CI is
+  // `detected dubious ownership` (safe.directory) on container and self-hosted
+  // runners, which would silently reopen this hole with nothing in the log.
+  const looksLikeRepo = existsSync(resolve(root, ".git"));
+  const insideRepo = git(["rev-parse", "--is-inside-work-tree"]);
+  const answered = insideRepo.ok && insideRepo.stdout === "true";
+
+  if (answered || looksLikeRepo) {
+    errors.push(
+      `[${key}] File path is not committed to the PR branch: ${artifact} ${PATH_HINT}`
+    );
+    if (!answered) {
+      console.error(
+        `  (git could not be queried in ${root}: ${insideRepo.stderr || "no reason given"})`
+      );
+    }
+    return;
+  }
+
+  console.log(
+    `ℹ [${key}] ${artifact} exists but ${root} is not a git checkout, so "committed to the PR branch" was not verified.`
+  );
+}
+
+/** realpath, falling back to the lexical path when it does not exist yet. */
+function realpathOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+/**
+ * Resolves an href the way the PR page does. GitHub keeps relative hrefs in the
+ * rendered body, so `[CI run](/o/r/actions/runs/1)` and `../actions/runs/1`
+ * open a run page from https://github.com/<base>/pull/<n>, and a classifier
+ * that only reads absolute URLs would wave them through.
+ */
+function resolveHref(href: string): string {
+  const repo = PR_BASE_REPO || PR_HEAD_REPO;
+  const page = repo ? `https://github.com/${repo}/pull/` : "https://github.com/";
+  try {
+    const url = new URL(href, page);
+    // A bare `www.github.com/…` is autolinked as http://; github.com answers
+    // it with a redirect to the https page, so that is where the link leads.
+    if (url.protocol === "http:" && url.hostname.toLowerCase().replace(/^www\./, "") === "github.com") {
+      url.protocol = "https:";
+    }
+    return url.href;
+  } catch {
+    return href;
+  }
+}
+
+/**
+ * Validates a URL that looks like an Actions run and ignores any other kind.
+ * `looked` holds the runs this line (or the section outside the lines) has
+ * already reported, so a run that is both a line's text and its link is
+ * reported once. Shared by artifact values and by links.
+ */
+async function validateRunUrl(
+  key: string,
+  url: ArtifactUrl,
+  shown: string,
+  looked: Set<string>,
+  errors: string[]
+): Promise<void> {
+  switch (url.kind) {
+    case "ci-run": {
+      const run = `${url.owner}/${url.repo}/${url.runId}`.toLowerCase();
+      if (looked.has(run)) return;
+      looked.add(run);
+      await validateCIRun(key, url.owner, url.repo, url.runId, errors);
+      return;
+    }
+    case "ci-run-wrong-host":
+      errors.push(`[${key}] CI run URL must be on github.com, got host "${url.host}": ${shown}`);
+      return;
+    case "ci-run-bad-id":
+      errors.push(`[${key}] CI run URL has an unreadable run id "${url.id}": ${shown}`);
+      return;
+    case "ci-run-insecure":
+      errors.push(`[${key}] Artifact URL must use https, not http: ${shown}`);
+      return;
+    case "check-page":
+      errors.push(
+        `[${key}] A check-run page cannot be verified; cite the Actions run (…/actions/runs/<id>) instead: ${shown}`
+      );
+      return;
+    case "not-url":
+      // Shown as a link but not a URL anything can open or look up — an
+      // invisible character in the host does that. Not something to wave on.
+      if (/^https?:\/\//i.test(shown)) errors.push(`[${key}] URL cannot be parsed: ${shown}`);
+      return;
+  }
+}
+
+async function validateUrlArtifact(
+  key: string,
+  artifact: string,
+  looked: Set<string>,
+  errors: string[]
+): Promise<void> {
+  const url = classifyArtifactUrl(artifact);
+  switch (url.kind) {
+    case "ci-run":
+    case "ci-run-wrong-host":
+    case "ci-run-bad-id":
+    case "ci-run-insecure":
+    case "check-page":
+      await validateRunUrl(key, url, artifact, looked, errors);
+      return;
+    case "insecure":
+      errors.push(`[${key}] Artifact URL must use https, not http: ${artifact}`);
+      return;
+    case "not-url":
+      await validateRunUrl(key, url, artifact, looked, errors);
+      return;
+    case "url":
+      return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
+  }
+}
+
+/**
+ * Validates one artifact value — the part of a proof line that is supposed to
+ * BE the evidence — and every link on the line that points at an Actions run.
+ * Shared by the checked and the unchecked path so the two cannot drift apart.
+ *
+ * The links matter because the value is the rendered TEXT. `[CI run](…/runs/1)`
+ * renders as the text "CI run", which is prose, while the reader clicking it
+ * lands on run 1. So a run a line links to is looked up whatever the text says,
+ * and a run that is both the text and the link is looked up once.
+ */
+async function validateArtifact(
+  key: string,
+  value: string,
+  links: string[],
+  errors: string[]
+): Promise<void> {
+  const looked = new Set<string>();
+  // When the value itself is a URL, it is the artifact and the line's other
+  // links are notes: a run among them is still looked up, a check page is
+  // context. When the value is prose, a link is the artifact.
+  const valueIsUrl = /^(?:https?:\/\/|www\.)/i.test(stripArtifactDescription(value));
+  for (const href of links) {
+    const target = resolveHref(href);
+    const url = classifyArtifactUrl(target);
+    if (valueIsUrl && url.kind === "check-page") continue;
+    await validateRunUrl(key, url, target, looked, errors);
+  }
+
+  // Strip an optional " — <description>" annotation so only the artifact
+  // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
+  let artifact = stripArtifactDescription(value);
+  // A bare `www.` value is autolinked; read it as the URL it links to.
+  if (/^www\./i.test(artifact)) artifact = `https://${artifact}`;
+
+  // A value that starts with a URL is that URL plus notes:
+  // `…/actions/runs/1 (head abc123, success)` is run 1, not a run whose id is
+  // "1 (head abc123, success)". Any other URL in the notes is split out even
+  // when no space separates it (GitHub autolinks `a,b` as one link that reads
+  // as two), and every run among them is looked up; a generic link in a note
+  // is context and is not judged.
+  if (/^https?:\/\//i.test(artifact)) {
+    const urls = artifact.split(/\s+/).flatMap((t) => t.split(/(?=https?:\/\/)/i)).filter((t) => /^https?:\/\//i.test(t));
+    await validateUrlArtifact(key, urls[0]!, looked, errors);
+    for (const note of urls.slice(1)) {
+      const url = classifyArtifactUrl(note);
+      if (url.kind.startsWith("ci-run") || url.kind === "not-url") {
+        await validateRunUrl(key, url, note, looked, errors);
+      }
+    }
+    return;
+  }
+  if (classifyArtifactUrl(artifact).kind !== "not-url") {
+    await validateUrlArtifact(key, artifact, looked, errors);
+    return;
+  }
+
+  // Test name? /^[a-zA-Z_][\w:]*$/
+  if (PROOF_KEY_RE.test(artifact)) {
+    return; // valid test name
+  }
+
+  if (looksLikeFilePath(artifact)) {
+    validateFilePath(key, artifact, errors);
+    return;
+  }
+
+  // Anything else: accept (test name list, comma-separated, etc.)
+}
+
 async function validateProofLine(
   line: ProofLine,
   isUpstream: boolean,
   errors: string[]
 ): Promise<void> {
-  const { key, checked, value } = line;
+  const { key, checked, value, links } = line;
 
   if (!checked) {
-    // Unchecked: must be n/a — <reason> (reason non-empty)
-    if (/^n\/a\s*—\s*.+/.test(value)) {
+    if (NA_PREFIX_RE.test(value)) {
+      const reason = parseNotApplicable(value);
+      if (!reason) {
+        errors.push(
+          `[${key}] Unchecked "n/a" needs a reason in the form "n/a — <reason>". Got: "${value}"`
+        );
+        return;
+      }
       // runtime: n/a is forbidden for upstream PRs
       if (key === "runtime" && isUpstream) {
         errors.push(
@@ -266,15 +1010,22 @@ async function validateProofLine(
       }
       return; // valid n/a
     }
-    // Also accept checked=false with a real artifact (author chose not to check it):
-    // treat same as checked for validation purposes if it has content
-    if (value && value !== "n/a") {
-      // unchecked but has a value — warn but don't fail (author may still be filling it)
+
+    if (!value) {
+      errors.push(
+        `[${key}] Unchecked box must have a value like "n/a — <reason>" or a real artifact. Got: "${value}"`
+      );
       return;
     }
-    errors.push(
-      `[${key}] Unchecked box must have a value like "n/a — <reason>" or a real artifact. Got: "${value}"`
-    );
+
+    // Unchecked but carrying a real artifact: validate it exactly as a checked
+    // one. This used to be an unconditional `return` guarded only by
+    // `value !== "n/a"` — a silent accept that skipped every check, and the
+    // hole that `n/a —` with an empty reason fell into once the
+    // [proof: KEY] strip shortened the value to something the n/a classifier
+    // no longer recognised. The classifier and the fallthrough disagreed, and
+    // the strip moved the boundary between them.
+    await validateArtifact(key, value, links, errors);
     return;
   }
 
@@ -285,50 +1036,12 @@ async function validateProofLine(
   }
 
   // n/a on a checked box is contradictory
-  if (/^n\/a/.test(value)) {
+  if (NA_PREFIX_RE.test(value)) {
     errors.push(`[${key}] Checked box cannot have n/a value.`);
     return;
   }
 
-  // Strip an optional " — <description>" annotation so only the artifact
-  // itself is validated (e.g. "proof/foo.txt — what it proves" → "proof/foo.txt").
-  const artifact = stripArtifactDescription(value);
-
-  // CI run URL?
-  const ciMatch = artifact.match(CI_RUN_RE);
-  if (ciMatch) {
-    await validateCIRun(key, ciMatch[1], ciMatch[2], ciMatch[3], errors);
-    return;
-  }
-
-  // Test name? /^[a-zA-Z_][\w:]*$/
-  if (PROOF_KEY_RE.test(artifact)) {
-    return; // valid test name
-  }
-
-  // URL (http/https)? Check BEFORE the file-path branch — URLs contain `/`
-  // and would otherwise be misrouted into existsSync() and fail in CI
-  // (where GITHUB_WORKSPACE is set).
-  if (/^https?:\/\//.test(artifact)) {
-    return; // non-CI URL: accept (gist, screenshot, release asset, etc.)
-  }
-
-  // File path? Must exist on disk within repo
-  if (artifact.startsWith(".") || artifact.startsWith("/") || artifact.includes("/")) {
-    if (!existsSync(artifact)) {
-      // Soft: don't fail on file paths in CI (path relative to repo root may differ)
-      // Only fail if GITHUB_WORKSPACE is set (we're in CI)
-      if (process.env.GITHUB_WORKSPACE) {
-        const fullPath = `${process.env.GITHUB_WORKSPACE}/${artifact}`;
-        if (!existsSync(fullPath)) {
-          errors.push(`[${key}] File path does not exist: ${artifact}`);
-        }
-      }
-    }
-    return;
-  }
-
-  // Anything else: accept (test name list, comma-separated, etc.)
+  await validateArtifact(key, value, links, errors);
 }
 
 /**
@@ -369,6 +1082,12 @@ function witnessCleanIntegrate(runHeadSha: string): WitnessResult {
   });
 }
 
+/**
+ * One lookup per run, however many lines cite it; every citing line still
+ * reports the run's problems under its own key.
+ */
+const runVerdicts = new Map<string, Promise<{ problems: string[]; notes: string[] }>>();
+
 async function validateCIRun(
   key: string,
   owner: string,
@@ -376,12 +1095,44 @@ async function validateCIRun(
   runId: string,
   errors: string[]
 ): Promise<void> {
+  const id = `${owner}/${repo}/${runId}`.toLowerCase();
+  let verdict = runVerdicts.get(id);
+  if (!verdict) {
+    verdict = checkRun(owner, repo, runId);
+    runVerdicts.set(id, verdict);
+  }
+  const { problems, notes } = await verdict;
+  for (const problem of problems) errors.push(`[${key}] ${problem}`);
+  for (const note of notes) console.log(`ℹ [${key}] ${note}`);
+}
+
+async function checkRun(
+  owner: string,
+  repo: string,
+  runId: string
+): Promise<{ problems: string[]; notes: string[] }> {
+  const problems: string[] = [];
+  const notes: string[] = [];
   if (!GITHUB_TOKEN) {
     // No token: skip URL validation (local usage)
-    return;
+    return { problems, notes };
   }
   if (!PR_HEAD_SHA) {
-    return; // No SHA context: skip
+    return { problems, notes }; // No SHA context: skip
+  }
+
+  // A run says something about this PR only if it ran in the PR's own
+  // repository. Any other repository can run the same commit: push it there,
+  // add an always-green workflow, and head_sha and conclusion both check out.
+  // That includes the head repository of a fork PR, whose author controls its
+  // workflows; checks for a fork PR run in the base repository. With no
+  // repository to compare against, the run cannot be attributed: fail closed.
+  const prRepo = PR_BASE_REPO || PR_HEAD_REPO;
+  if (!prRepo) {
+    problems.push(
+      `CI run ${runId} cannot be attributed: PR_BASE_REPO_FULL_NAME is not set, so the PR's repository is unknown.`
+    );
+    return { problems, notes };
   }
 
   try {
@@ -393,25 +1144,33 @@ async function validateCIRun(
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
         },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       }
     );
 
     if (!res.ok) {
-      errors.push(
-        `[${key}] CI run URL returned HTTP ${res.status}: ${owner}/${repo}/runs/${runId}`
-      );
-      return;
+      problems.push(`CI run URL returned HTTP ${res.status}: ${owner}/${repo}/runs/${runId}`);
+      return { problems, notes };
     }
 
     const data = (await res.json()) as {
       conclusion: string | null;
       head_sha: string;
+      repository?: { full_name?: string };
     };
 
-    if (data.conclusion !== "success") {
-      errors.push(
-        `[${key}] CI run ${runId} conclusion is "${data.conclusion}", expected "success".`
+    // The API's answer names the repository, so an old URL of a renamed or
+    // transferred repository, which redirects to the same run, still counts.
+    const runRepo = data.repository?.full_name ?? `${owner}/${repo}`;
+    if (runRepo.toLowerCase() !== prRepo.toLowerCase()) {
+      problems.push(
+        `CI run ${runId} ran in ${runRepo}, not in this PR's repository ${prRepo}; cite a run of this PR's checks.`
       );
+      return { problems, notes };
+    }
+
+    if (data.conclusion !== "success") {
+      problems.push(`CI run ${runId} conclusion is "${data.conclusion}", expected "success".`);
     }
 
     if (data.head_sha !== PR_HEAD_SHA) {
@@ -422,18 +1181,19 @@ async function validateCIRun(
       const witness = witnessCleanIntegrate(data.head_sha);
       if (!witness.accepted) {
         const detail = witness.detail ? ` — ${witness.detail}` : "";
-        errors.push(
-          `[${key}] CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale (${witness.reason})${detail}.`
+        problems.push(
+          `CI run ${runId} head_sha "${data.head_sha}" does not match PR head "${PR_HEAD_SHA}". Run is stale (${witness.reason})${detail}.`
         );
       } else {
-        console.log(
-          `ℹ [${key}] CI run ${runId} ran on ${data.head_sha}, which this head integrates from ${PR_BASE_REF} without changing content — accepted.`
+        notes.push(
+          `CI run ${runId} ran on ${data.head_sha}, which this head integrates from ${PR_BASE_REF} without changing content — accepted.`
         );
       }
     }
   } catch (err) {
-    errors.push(`[${key}] Failed to fetch CI run: ${String(err)}`);
+    problems.push(`Failed to fetch CI run: ${String(err)}`);
   }
+  return { problems, notes };
 }
 
 // ---------------------------------------------------------------------------
@@ -441,22 +1201,22 @@ async function validateCIRun(
 // ---------------------------------------------------------------------------
 
 function validateInlineTokens(
-  body: string,
+  tokenText: string,
   proofLines: ProofLine[],
   errors: string[]
 ): void {
   const proofKeys = new Set(proofLines.map((l) => l.key));
-  const tokenRe = /\[proof:\s*([^\]]+)\]/g;
+  const seen = new Set<string>();
+  // As loose as a reader: `[Proof: x]` and `[ proof : x ]` are claims too.
+  const tokenRe = /\[\s*proof\s*:\s*([^\]]+)\]/gi;
 
-  // Find all [proof: key] tokens in the body (skip inside code fences / comments)
-  const strippedBody = body
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/`{3,}[\s\S]*?`{3,}/g, "")
-    .replace(/`[^`]+`/g, ""); // inline code too
-
+  // The text comes from the same rendering that produced the proof lines, with
+  // code examples already left out; escaped or mismatched backticks are text.
   let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(strippedBody)) !== null) {
+  while ((m = tokenRe.exec(tokenText)) !== null) {
     const ref = m[1].trim();
+    if (seen.has(ref)) continue;
+    seen.add(ref);
     if (!proofKeys.has(ref)) {
       errors.push(
         `Dangling [proof: ${ref}] token — no proof line with key "${ref}" found.`
@@ -473,11 +1233,19 @@ async function main(): Promise<void> {
   const body = readBody();
   const errors: string[] = [];
 
-  // 1. Find proof section
-  const proofSection = extractProofSection(body);
-  if (!proofSection) {
+  // 1. Render the body through GitHub and find the proof section in the result
+  let html: string;
+  try {
+    html = await renderBody(body);
+  } catch (err) {
+    if (!(err instanceof RenderError)) throw err;
+    console.error(`ERROR: ${err.message}`);
+    process.exit(1);
+  }
+  const { proofLines, malformed, sectionLinks, tokenText } = parseRenderedBody(html);
+  if (proofLines === null) {
     console.error(
-      "ERROR: PR body does not contain a ## Proof section anchored to end-of-body."
+      "ERROR: PR body does not contain a ## Proof section as GitHub renders it (a level-2 heading reading exactly \"Proof\")."
     );
     console.error(
       'Every PR must end with a ## Proof block. See https://github.com/florianhorner/gh-workflows for the template.'
@@ -485,9 +1253,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 2. Parse proof lines
-  const proofLines = parseProofLines(proofSection);
-  if (proofLines.length === 0) {
+  // 2. Every checkbox after the heading must be a readable proof line, and
+  //    there must be at least one
+  errors.push(...malformed);
+  if (proofLines.length === 0 && malformed.length === 0) {
     errors.push(
       "## Proof section found but contains no checkbox lines. Add at least one proof entry."
     );
@@ -505,13 +1274,20 @@ async function main(): Promise<void> {
     );
   }
 
-  // 4. Validate each proof line
+  // 4. Validate each proof line, then any run linked elsewhere in the section.
+  //    Links on an unchecked `n/a` line are context for the reason given, not
+  //    evidence, and are not looked up.
   await Promise.all(
     proofLines.map((line) => validateProofLine(line, isUpstream, errors))
   );
+  const sectionLooked = new Set<string>();
+  for (const href of sectionLinks) {
+    const target = resolveHref(href);
+    await validateRunUrl("Proof section", classifyArtifactUrl(target), target, sectionLooked, errors);
+  }
 
   // 5. Validate inline [proof: key] tokens
-  validateInlineTokens(body, proofLines, errors);
+  validateInlineTokens(tokenText, proofLines, errors);
 
   // 6. Report
   if (errors.length > 0) {
