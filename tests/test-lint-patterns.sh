@@ -184,6 +184,17 @@ case "$NOTE_OUT" in
 esac
 rm -f "$NOTE_BODY" "$EXTRA_PATTERNS"
 
+# A relative body path shaped `name=value` is a file, not an awk assignment: the
+# copy must still carry the body, so a violation in it still fails. Stdin is
+# /dev/null so a regression fails here instead of waiting on a terminal.
+EQ_DIR="$(mktemp -d)"
+printf 'Written with Claude Code.\n' > "$EQ_DIR/body=pr.md"
+EQ_RC=0
+(cd "$EQ_DIR" && bash "$REPO_ROOT/scripts/check-body-lint.sh" --mode body "body=pr.md" </dev/null >/dev/null 2>&1) || EQ_RC=$?
+if [ "$EQ_RC" -eq 1 ]; then ok
+else bad "relative body path 'body=pr.md': expected exit 1, got $EQ_RC"; fi
+rm -rf "$EQ_DIR"
+
 echo
 if [ "$FAIL" -gt 0 ]; then
   echo "FAILED: $FAIL assertion(s), $PASS passed."

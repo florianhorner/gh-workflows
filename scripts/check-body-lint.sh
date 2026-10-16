@@ -108,6 +108,9 @@ LINT_FILE="$BODY_FILE"
 if [ "$MODE" = "body" ] && [ -n "${LINT_PLATFORM_FOOTER_LINE:-}" ]; then
   FOOTER_COPY="$(mktemp)"
   FOOTER_CUT="$(mktemp)"
+  # The body goes in on stdin, never as an operand: awk reads an operand shaped
+  # `name=value` (a relative path such as `body=pr.md`) as a variable assignment,
+  # then reads an empty stdin, and every pattern would pass on an empty copy.
   if ! FOOTER_RULE="$LINT_PLATFORM_FOOTER_RULE" FOOTER_LINE="$LINT_PLATFORM_FOOTER_LINE" \
        CUT_FILE="$FOOTER_CUT" awk '
     { raw[NR] = $0; t = $0; sub(/\r$/, "", t); cmp[NR] = t }
@@ -120,7 +123,7 @@ if [ "$MODE" = "body" ] && [ -n "${LINT_PLATFORM_FOOTER_LINE:-}" ]; then
         print (n - 1) "-" n > ENVIRON["CUT_FILE"]
       }
       for (i = 1; i <= last; i++) print raw[i]
-    }' "$BODY_FILE" > "$FOOTER_COPY"; then
+    }' < "$BODY_FILE" > "$FOOTER_COPY"; then
     echo "ERROR: could not separate the platform footer from '$BODY_FILE'." >&2
     exit 2
   fi
