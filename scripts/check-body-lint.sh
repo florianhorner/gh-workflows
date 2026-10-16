@@ -98,12 +98,42 @@ fi
 FAIL=0
 HITS=0
 GREP_ERR="$(mktemp)"
-trap 'rm -f "$GREP_ERR" "${STYLE_FILE:-}"' EXIT
+trap 'rm -f "$GREP_ERR" "${STYLE_FILE:-}" "${FOOTER_COPY:-}" "${FOOTER_CUT:-}"' EXIT
+
+# The cloud-session footer (PLATFORM_FOOTER in lint-patterns.sh) is not authored
+# text. In body mode every pattern runs on a copy without it. Only trailing lines
+# are dropped, so each line number reported below still points into the
+# original body; CR is stripped for the comparison only, never from the copy.
+LINT_FILE="$BODY_FILE"
+if [ "$MODE" = "body" ] && [ -n "${LINT_PLATFORM_FOOTER_LINE:-}" ]; then
+  FOOTER_COPY="$(mktemp)"
+  FOOTER_CUT="$(mktemp)"
+  if ! FOOTER_RULE="$LINT_PLATFORM_FOOTER_RULE" FOOTER_LINE="$LINT_PLATFORM_FOOTER_LINE" \
+       CUT_FILE="$FOOTER_CUT" awk '
+    { raw[NR] = $0; t = $0; sub(/\r$/, "", t); cmp[NR] = t }
+    END {
+      n = NR
+      while (n > 0 && cmp[n] ~ /^[[:space:]]*$/) n--
+      last = NR
+      if (n > 1 && cmp[n] ~ ENVIRON["FOOTER_LINE"] && cmp[n - 1] ~ ENVIRON["FOOTER_RULE"]) {
+        last = n - 2
+        print (n - 1) "-" n > ENVIRON["CUT_FILE"]
+      }
+      for (i = 1; i <= last; i++) print raw[i]
+    }' "$BODY_FILE" > "$FOOTER_COPY"; then
+    echo "ERROR: could not separate the platform footer from '$BODY_FILE'." >&2
+    exit 2
+  fi
+  LINT_FILE="$FOOTER_COPY"
+  if [ -s "$FOOTER_CUT" ]; then
+    echo "NOTE: lines $(cat "$FOOTER_CUT") are the Claude Code platform footer and are not linted."
+  fi
+fi
 
 for i in "${!PATTERNS[@]}"; do
   PAT="${PATTERNS[$i]}"
   RC=0
-  MATCHES="$(grep -nE -- "$PAT" "$BODY_FILE" 2>"$GREP_ERR")" || RC=$?
+  MATCHES="$(grep -nE -- "$PAT" "$LINT_FILE" 2>"$GREP_ERR")" || RC=$?
   # A pattern that the local grep dialect rejects must fail loudly. Checking the
   # exit code alone is not enough; some dialects accept a malformed pattern,
   # warn on stderr, and match something unintended.
@@ -130,7 +160,7 @@ done
 # gate that runs on the same body.
 if [ "$MODE" = "body" ] && [ "${#LINT_BASELINE_PROSE_STYLE[@]}" -gt 0 ]; then
   STYLE_FILE="$(mktemp)"
-  grep -vE -- "$LINT_PROSE_STYLE_EXEMPT" "$BODY_FILE" > "$STYLE_FILE" || true
+  grep -vE -- "$LINT_PROSE_STYLE_EXEMPT" "$LINT_FILE" > "$STYLE_FILE" || true
   for PAT in "${LINT_BASELINE_PROSE_STYLE[@]}"; do
     RC=0
     MATCHES="$(grep -nE -- "$PAT" "$STYLE_FILE" 2>"$GREP_ERR")" || RC=$?
