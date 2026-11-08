@@ -1,13 +1,7 @@
 name: body-lint-caller
 
-# Dogfood: lints gh-workflows' own PR and issue bodies using the reusable
-# workflow defined in this same repo, by local path. A change to body-lint.yml
-# on a PR branch is therefore tested against itself — a bad change breaks its
-# own verification, which is the point.
-#
-# Note this repo has no scripts/lint-patterns.sh of its own to pass as
-# extra_patterns; the baseline alone applies here. Consuming repos that carry
-# project-specific patterns pass their path instead. See README.
+# Exercise this repository's reusable workflow by local path on each PR.
+# Only baseline patterns apply; no extra_patterns file is configured.
 
 on:
   pull_request:
@@ -16,10 +10,7 @@ on:
     types: [opened, edited]
 
 jobs:
-  # The pattern set is only as good as the harness that measures it, and a test
-  # that nothing runs is not a gate. This job is also where GNU grep gets
-  # exercised: the local hook resolves BSD grep, so without a Linux runner half
-  # the dialect contract is untested.
+  # Exercise the pattern harness with GNU grep as well as local BSD grep.
   patterns:
     if: github.event_name == 'pull_request'
     name: Pattern harness
@@ -35,11 +26,8 @@ jobs:
 
   pr-body:
     if: github.event_name == 'pull_request'
-    # Required, not optional. A called workflow's permissions can only be
-    # maintained or reduced relative to the caller, never elevated, and an
-    # attempted elevation is refused before anything runs: startup_failure,
-    # with no logs and no check run to inspect. body-lint.yml declares
-    # `actions: read` to resolve its own ref, so callers need both lines.
+    # Called workflows cannot elevate permissions. Both are required for
+    # checkouts and reusable-workflow ref resolution.
     permissions:
       contents: read
       actions: read

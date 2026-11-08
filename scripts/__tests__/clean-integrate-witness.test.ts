@@ -130,9 +130,8 @@ describe("cleanIntegrateWitness — accepts", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The parent has to be the base. This is the condition an adversarial review
-// found missing, and it is the one that decides whether the whole acceptance
-// path is sound.
+// The integrated parent must be a state from the base branch's history.
+// An arbitrary branch can reproduce a merge tree without providing CI evidence.
 // ---------------------------------------------------------------------------
 
 describe("cleanIntegrateWitness — the merged-in parent must be the base", () => {

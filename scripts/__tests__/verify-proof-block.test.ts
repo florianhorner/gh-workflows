@@ -53,10 +53,7 @@ async function runParser(
 
     return { exitCode, stdout, stderr };
   } finally {
-    // Actually delete it. The old `Bun.file(tmp).slice(0, 0)` constructed a
-    // Blob slice and removed nothing, so every run since this suite was
-    // written leaked a fixture into /tmp (702 of them by the time anyone
-    // counted).
+    // Remove the temporary fixture after each parser invocation.
     await unlink(tmp).catch(() => {});
     api?.stop(true);
   }
@@ -240,36 +237,11 @@ describe("verify-proof-block", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  // The stale-CI-run path is covered for real in
-  // __tests__/clean-integrate-witness.test.ts, which drives this script against
-  // a local API stub and real git fixtures. A placeholder asserting
-  // `expect(true).toBe(true)` stood here and claimed the path was
-  // "integration-tested by the CI workflow against real GitHub API" — there was
-  // no such test, so the file advertised coverage that existed nowhere.
+  // clean-integrate-witness.test.ts covers stale runs with a local API stub
+  // and temporary Git repositories.
 
-  // ---------------------------------------------------------------------
-  // Regression guard for the [proof: <KEY>] suffix bug.
-  //
-  // The PR template uses inline `[proof: <KEY>]` tokens both in prose AND
-  // as a self-reference at the end of each proof line:
-  //
-  //   - [x] runtime: proof/bootstrap.txt [proof: runtime]
-  //
-  // Before the fix, parseProofLines() captured `proof/bootstrap.txt
-  // [proof: runtime]` as the value, then existsSync() failed because no
-  // file is literally named that. The same trap fired for non-CI URLs
-  // (gist links etc.) when GITHUB_WORKSPACE was set, because they include
-  // `/` and got misrouted into the file-path branch before reaching the
-  // URL branch.
-  //
-  // This shipped at v1.1 and broke every commit-message-standards
-  // bootstrap PR (lightener #77, mammamiradio #302, QFE #21,
-  // flora-signal #76, gstack-for-kiro #3, conversation-intelligence-
-  // dashboard #90, home-assistant-config #549, retro #4). The fix
-  // strips the trailing [proof: <KEY>] suffix during parsing AND
-  // moves the URL branch ahead of the file-path branch so URLs
-  // never hit existsSync().
-  // ---------------------------------------------------------------------
+  // Remove trailing proof tokens before validating the artifact value.
+  // URL recognition must precede file-path validation because URLs contain /.
 
   it("strips trailing [proof: KEY] tag from a file-path artifact", async () => {
     // Use this test file's own path so existsSync() succeeds at the
@@ -347,10 +319,7 @@ Bootstrap. [proof: runtime]
   });
 
   it("accepts a prose / test-name artifact with trailing [proof: KEY] tag (workaround path still works)", async () => {
-    // Pre-fix workaround: bootstrap PRs used prose values that contained
-    // no `/` and no `://`, falling through to the catch-all "Anything
-    // else: accept" branch. Verify this path still passes — the strip
-    // is additive, not breaking.
+    // Plain values without / or :// retain the parser's existing acceptance.
     const PROSE_BODY = `
 ## Proof
 
@@ -369,20 +338,7 @@ Bootstrap. [proof: runtime]
     expect(result.exitCode).toBe(0);
   });
 
-  // ---------------------------------------------------------------------
-  // Regression guard for the em-dash artifact-description bug.
-  //
-  // Authors annotate a real artifact with a human description after an
-  // em-dash, e.g.
-  //   - [x] runtime: proof/foo.txt — parity check confirms X [proof: runtime]
-  // After stripTrailingProofTag removed the [proof:] suffix the value was
-  // "proof/foo.txt — parity check confirms X", which still contains "/" and
-  // got misrouted into existsSync() — failing even though proof/foo.txt
-  // exists. This broke the first file-path-cited PR
-  // (florianhorner/adaptive-lighting #18:
-  // "proof/expand-light-groups-desc.txt — parity check..."). The fix splits
-  // the value at the first em-dash and validates only the artifact.
-  // ---------------------------------------------------------------------
+  // An artifact description after an em dash is excluded from path lookup.
 
   it("accepts a file-path artifact annotated with an em-dash description", async () => {
     const DESC_BODY = `
@@ -450,13 +406,8 @@ Bootstrap. [proof: runtime]
     expect(result.exitCode).toBe(0);
   });
 
-  // Regression guard for the compound-key / inline-token mismatch bug.
-  // The earliest draft of the template used `lint/fmt:` and `schema/topic:` as
-  // proof line keys, but the inline tokens said `[proof: lint]` and
-  // `[proof: schema]`. The parser correctly rejected this as a dangling
-  // reference — Agent 3 worked around it by omitting inline tokens entirely,
-  // which silently disabled the claim-reference feature on the first live PR.
-  // Canonical keys are single-word slugs. This test pins that.
+  // Inline tokens must match complete proof keys. A short key cannot stand in
+  // for a compound key such as lint/fmt.
   it("fails when proof line uses compound key but inline token uses short form", async () => {
     const MISMATCH_BODY = `
 ## Summary

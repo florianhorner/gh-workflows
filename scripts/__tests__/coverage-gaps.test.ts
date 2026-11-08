@@ -5,28 +5,10 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { startApiStub, stubUrl, type RouteHandler } from "./github-api-stub";
 
-// Paths through verify-proof-block.ts that no other test pins. Each case below
-// names a guard that could be deleted, or a request detail that could change,
-// with the rest of the suite still green:
-//
-//   - a run counted as proof whenever its conclusion was anything but "failure"
-//   - a checked box with no value, or a checked `n/a`, passing
-//   - a test identifier such as `parser::tests::roundtrip` read as a URL, and
-//     a run URL that GitHub does not link read as a file path
-//   - the render and run-lookup requests going out in a shape the local stub
-//     never checks (auth header, content type, which repository is asked)
-//   - the error paths of both API calls (throttling, an unreachable host, a
-//     refused or malformed answer)
-//   - a claim written with fullwidth brackets, and content above the Proof
-//     heading, being read differently from how a reviewer reads them
-//   - the workflow no longer passing the verifier the token or PR head SHA,
-//     which turns every run lookup into a silent skip
-//
-// Nothing here calls GitHub. Cases that need a real rendering reuse bodies that
-// are already recorded in fixtures/github-renders.json (the text and the
-// rendering context must match a recording exactly, or the stub answers 422);
-// the rest hand the verifier synthetic HTML, like the HTML-walk cases in
-// proof-gate-bypasses.test.ts.
+// Tests run conclusions, artifact values, API requests and failures, rendered
+// claims, and the workflow environment. Requests use local stubs. Rendered
+// bodies must match a recording's text and context; other cases inject synthetic
+// HTML to test the walker.
 
 // Test-only override, so a modified copy of the verifier can be run against
 // these cases to prove each one fails without the code it guards.

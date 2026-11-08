@@ -5,15 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runResponse, runsById, startApiStub, stubUrl } from "./github-api-stub";
 
-// Every case here is a way a PR body could satisfy the proof gate without the
-// evidence the gate exists to require. All of them are reachable from a body a
-// person would plausibly write, and none of them was covered: the suite had 53
-// green tests while each of these walked straight through.
-//
-// The cited run in the URL cases is deliberately a FAILED one. A verifier that
-// recognises the URL must reject it. Acceptance therefore proves the URL was
-// never recognised at all and fell into the generic-URL accept behind it, while
-// the rendered PR body still links to the same run page.
+// Synthetic proof bodies exercise URL recognition, path containment and
+// rendered-text validation. URL cases cite failed runs: the verifier must
+// recognize each spelling and reject the run.
 
 // Test-only override for proving regressions against an immutable old parser.
 const SCRIPT = process.env.PROOF_TEST_SCRIPT ?? `${import.meta.dir}/../verify-proof-block.ts`;

@@ -1,0 +1,120 @@
+#1:The review found a missing queue limit
+#2:An audit surfaced an empty configuration value
+#3:Fuzzing caught an invalid record length
+#4:Mutation testing flagged a missing retry condition
+#5:The reviewer revealed an unchecked result
+#6:Reviewers turned up a duplicate branch
+#7:Code review flagged an unused fallback
+#8:a reviewer checking the retry counter
+#9:A reviewer comparing the timeout values
+#10:a review pass inspecting the cache key
+#11:A reviewer bot suggesting an explicit return type
+#12:a reviewer asking about the default interval
+#13:A missing field was found during review
+#14:The duplicate entry was caught in the audit
+#15:A timeout mismatch surfaced during the review
+#16:The unchecked result was flagged by the reviewer
+#17:Findings from code review
+#18:Findings from the review
+#19:What I cut was the unused helper
+#20:I should have checked the return value
+#21:I drafted a different error message
+#22:I rewrote the configuration loader
+#23:I initially used a shared counter
+#24:Two findings concern the parser
+#25:3 review passes checked the error path
+#26:Three review rounds covered the patch
+#27:2 of 4 reviewers checked the fixture
+#28:3 of 4 models accepted the patch
+#29:1 of 2 agents proposed the same change
+#30:findings raised for the configuration reader
+#31:findings confirmed for the retry helper
+#32:findings refuted by the fixture
+#33:findings applied to the branch
+#34:adversarially verified with a stub server
+#35:Adversarial verification covered the retry helper
+#36:The app's own diagnostic data showed an empty field
+#37:The service's own sample data revealed a duplicate entry
+#38:Usage data showed a missing label
+#39:Listening data revealed a blank title
+#40:Telemetry data confirmed an invalid counter
+#41:operator preference data is included in this invented example
+#42:The example menu contains an option nobody had chosen
+#43:The sample bundle contains a theme nobody wanted
+#44:The fictional picker includes a preset nobody has picked
+#45:The patch followed /autoplan instructions
+#46:Codex review checked the retry helper
+#47:Codex independent review checked the error path
+#48:Claude review checked the fixture
+#49:This example was written with Claude Code
+#50:The fictional instructions are in CLAUDE.md
+#51:🤖 Generated with a sample assistant
+#52:The example began in stash@{2}
+#53:The fix is on an unpushed branch
+#54:An un-pushed branch contains the helper
+#55:The example mentions untracked files
+#56:The example mentions untracked code
+#57:The draft was written in a Conductor workspace
+#58:A Conductor session produced this example
+#59:A Conductor agent produced this example
+#60:The retry counter is reset — the connection stays open
+#61:## Pre-Landing Review
+#62:## PreLanding Review
+#63:### Findings
+#64:## Review notes
+#65:## Review findings
+#66:## What I removed
+#67:The linter reports an invalid field name
+#68:The parser found an invalid record and returned an error
+#69:A reviewer opens the configuration page
+#70:The audit log records each accepted update
+#71:The test suite checks the retry limit
+#72:Reviewers can inspect the generated patch
+#73:The health check reports a stale cache entry
+#74:Static analysis reports unused imports
+#75:A review panel displays the current revision
+#76:Callers can configure the timeout
+#77:The handler drafted a response before closing the socket
+#78:Users initially see an empty list
+#79:7 of 8 parser paths are covered
+#80:The worker retries 3 times
+#81:Exit codes: 0 clean, 1 violation, 2 gate error
+#82:The queue holds four records
+#83:Two workers process the queue
+#84:3 of 5 tasks finished before the deadline
+#85:The preferences panel has a reset button
+#86:The cache stores playback metadata
+#87:The legacy endpoint logs each request
+#88:The service serves a static manifest
+#89:Telemetry is disabled by default
+#90:Sample data is loaded from a fixture
+#91:Nobody can read a deleted record
+#92:The default profile uses a neutral theme
+#93:Claude is absent from the runtime path
+#94:The codex directory contains example inputs
+#95:Conductor tracks are listed in the manifest
+#96:Conductor workspace support includes a launch command
+#97:Generated files are stored under build/
+#98:The cache stash is cleared on shutdown
+#99:Files untracked by the manifest are ignored
+#100:Pushed builds use the release identifier
+#101:- [ ] runtime: n/a — no runtime change
+#102:- [ ] build: n/a — documentation only
+#103:- [x] tests: proof/tests.log
+#104:## Summary
+#105:## What changed
+#106:## Notes
+#107:## Testing
+#108:## Proof
+#109:### Behaviour
+#2001:## Summary
+#2001:
+#2001:The parser rejects an empty record.
+#2001:## Findings
+#2001:The review found an unchecked result
+#2001:
+#2002:## Summary
+#2002:
+#2002:The parser rejects an empty record.
+#2002:## Proof
+#2002:- [ ] runtime: n/a — no runtime change

@@ -12,12 +12,10 @@ concurrency:
   group: verify-claims-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-# Least privilege. `contents: read` covers both checkouts; `actions: read` is
-# required because verify-proof-block.ts resolves CI-run proof URLs against
-# /repos/{owner}/{repo}/actions/runs/{id}. The body itself is rendered with
-# POST /markdown, which uses `contents: read` for private resources. Some label
-# rendering may additionally need issue or pull-request read access; those
-# permissions are not granted here. Callers cannot elevate this permission set.
+# Checkouts and private Markdown rendering need contents: read. Resolving
+# referenced_workflows[] and CI-run proof URLs needs actions: read. Optional
+# issue and pull-request read permissions for label rendering are not granted.
+# Callers must permit at least this access for GitHub to start the job.
 permissions:
   contents: read
   actions: read
@@ -26,8 +24,7 @@ jobs:
   verify:
     name: Verify PR proof block
     runs-on: ubuntu-latest
-    # The job makes network calls (the body render, run lookups); a hung one
-    # should fail the check in minutes, not leave it pending for six hours.
+    # Bound the time spent rendering the body and looking up run artifacts.
     timeout-minutes: 10
 
     # Skip draft PRs
@@ -46,35 +43,17 @@ jobs:
             const fs = require("fs");
             fs.writeFileSync("/tmp/pr-body.md", body, "utf8");
             core.info(`PR body length: ${body.length} chars`);
-            // The clean-integrate witness is the only thing here that reads git
-            // history, and it is only ever consulted for a cited CI-run URL. No
-            // such URL means no history question, so the full history is dead
-            // weight — on a large consumer that is a ~570 MB fetch added to a
-            // 20 s job. (A file-path proof line asks git only whether the file
-            // is tracked, which a shallow checkout answers.)
-            //
-            // Getting this wrong is safe in both directions: a false positive
-            // costs one needless deep fetch, and a false negative leaves a
-            // shallow clone in which the witness fails closed, i.e. the strict
-            // pre-change behaviour. It can never turn a refusal into an accept.
-            // Broad on purpose: the verifier also reads a percent-encoded id or
-            // slash and a doubled slash as a run.
+            // Only CI-run proofs need full history for the merge witness.
+            // A false positive costs a deep fetch; a false negative leaves the
+            // shallow witness unable to prove integration, so it fails closed.
+            // Include percent-encoded and doubled slashes recognised by the parser.
             const citesCiRun = /actions(?:\/|%2f)+runs(?:\/|%2f)+[^\s)\]]/i.test(body);
             core.info(`Cites a CI run URL: ${citesCiRun}`);
             core.setOutput("cites_ci_run", String(citesCiRun));
 
-      # The full history is load-bearing, not hygiene. verify-proof-block.ts asks
-      # git whether a cited CI run's commit is this head minus a clean base
-      # integration (scripts/clean-integrate-witness.ts). That needs the head's
-      # ancestry — the run's commit, the merge's integrated parent, and the base
-      # branch to anchor it to. A depth-1 checkout cannot resolve any of them and
-      # the witness fails closed, so a shallow clone here does not weaken the
-      # check; it silently restores the old behaviour of calling every integrated
-      # branch stale. It is fetched only when the body cites a CI run at all.
-      #
-      # The quotes matter: GitHub expressions treat the number 0 as falsy, so the
-      # unquoted `&& 0 || 1` form always yields 1 and would make this shallow in
-      # exactly the case that needs depth.
+      # The merge witness needs the run commit, integrated parent and base
+      # first-parent history. A shallow checkout cannot prove integration.
+      # Quote '0': an unquoted numeric 0 is falsy, so && 0 || 1 yields 1.
       - name: Checkout PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -82,21 +61,9 @@ jobs:
           fetch-depth: ${{ steps.pr-body.outputs.cites_ci_run == 'true' && '0' || '1' }}
           persist-credentials: false
 
-      # Resolve the ref this workflow was itself called with, so the scripts we
-      # execute are the ones the caller pinned. Previously this checkout was
-      # hardcoded to `v1`, which meant a consumer pinning @v1.1 — or even a full
-      # commit SHA — still ran whatever verify-proof-block.ts happened to be at
-      # the tip of v1. The outer pin locked this YAML and nothing else, so it
-      # bought no reproducibility and no supply-chain protection.
-      #
-      # There is no `github` context property carrying the *callee* ref.
-      # `github.workflow_ref`/`workflow_sha` resolve to the CALLER, and
-      # `job_workflow_ref` is an OIDC token claim, not a context value — using it
-      # in an expression fails the whole workflow at startup.
-      #
-      # The Actions API does expose it: a run's `referenced_workflows[]` lists
-      # every remote reusable workflow it invoked, with the exact commit SHA that
-      # was resolved. That is what `actions: read` above is for.
+      # Check out scripts at the SHA the caller pinned. referenced_workflows[]
+      # exposes that callee SHA; github.workflow_ref and workflow_sha describe
+      # the caller. job_workflow_ref is an OIDC claim, not a context property.
       - name: Resolve own ref
         id: self
         env:
@@ -109,9 +76,7 @@ jobs:
                          | select(.path | startswith("florianhorner/gh-workflows/.github/workflows/verify-claims.yml@"))
                          | .sha' 2>/dev/null | head -n1 || true)"
           if [ -z "$sha" ]; then
-            # No entry means this was invoked by local path (`uses: ./…`), i.e.
-            # gh-workflows dogfooding itself. The correct scripts are the ones on
-            # the PR head, which is also what the first checkout used.
+            # Local-path calls use the PR head, matching the first checkout.
             sha="$PR_HEAD_SHA"
             echo "No referenced_workflows entry — local invocation, using PR head ${sha}"
           fi
@@ -144,9 +109,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # The clean-integrate witness anchors a merge's integrated parent to
-          # this branch. Without it the witness cannot tell a base integrate
-          # from `git merge any-other-branch`, and it refuses rather than guess.
+          # Anchor the integrated parent to the PR's base branch. Without this
+          # ref the witness cannot establish a clean base integration.
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
           PR_BASE_REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
