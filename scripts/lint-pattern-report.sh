@@ -30,8 +30,8 @@ source "$SCRIPT_DIR/lint-patterns.sh"
 STRIPPED="$(mktemp)"
 INDEX="$(mktemp)"
 trap 'rm -f "$STRIPPED" "$INDEX"' EXIT
-sed 's/^#[0-9]*://' "$CORPUS" > "$STRIPPED"
-sed -n 's/^\(#[0-9]*\):.*/\1/p' "$CORPUS" > "$INDEX"
+sed 's/^#[0-9][0-9]*://' "$CORPUS" > "$STRIPPED"
+sed -n 's/^\(#[0-9][0-9]*\):.*/\1/p' "$CORPUS" > "$INDEX"
 
 if [ "$(wc -l < "$STRIPPED")" -ne "$(wc -l < "$INDEX")" ]; then
   echo "ERROR: corpus line/index mismatch: every line needs a #<case-id>: prefix." >&2

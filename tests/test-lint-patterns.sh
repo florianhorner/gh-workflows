@@ -226,6 +226,12 @@ REPORT_RC=0
 bash scripts/lint-pattern-report.sh "$REPORT_INPUT" > "$REPORT_OUTPUT" 2>&1 || REPORT_RC=$?
 if [ "$REPORT_RC" -eq 2 ]; then ok
 else bad "malformed corpus: expected exit 2, got $REPORT_RC"; fi
+# An empty case ID (`#:`) is not numeric and must be rejected too.
+printf '#:## Findings\n' > "$REPORT_INPUT"
+REPORT_RC=0
+bash scripts/lint-pattern-report.sh "$REPORT_INPUT" > "$REPORT_OUTPUT" 2>&1 || REPORT_RC=$?
+if [ "$REPORT_RC" -eq 2 ]; then ok
+else bad "empty case ID: expected exit 2, got $REPORT_RC"; fi
 REPORT_RC=0
 bash scripts/lint-pattern-report.sh "$REPORT_INPUT.missing" > "$REPORT_OUTPUT" 2>&1 || REPORT_RC=$?
 if [ "$REPORT_RC" -eq 2 ]; then ok
