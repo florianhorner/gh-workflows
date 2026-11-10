@@ -6,11 +6,13 @@ name: workflow-lint
 on:
   pull_request:
     paths:
+      - 'README.md'
       - '.github/workflows/**'
       - 'scripts/**'
   push:
     branches: [main]
     paths:
+      - 'README.md'
       - '.github/workflows/**'
       - 'scripts/**'
 
