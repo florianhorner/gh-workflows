@@ -43,6 +43,71 @@ The workflow deliberately filters out every other zizmor rule. Broader GitHub
 Actions hardening belongs in a separately reviewed policy, so adopting this
 guard cannot unexpectedly expose unrelated legacy findings.
 
+## `pin-check` — action and reusable-workflow pins
+
+A dependency bot's pin bump rewrites a SHA and its version comment and nothing
+else, so nobody reads upstream code in that change. This reusable workflow
+checks the parts of it a machine can verify, for every `uses:` in a caller's
+workflow and composite-action definitions:
+
+1. The pin is a full commit SHA. This is zizmor's offline `unpinned-uses`
+   audit, whose default policy requires a hash for `actions/*` too.
+2. The trailing version comment names a tag of the same repository, and that
+   tag is at the pinned commit. When the tag is an alias that has since moved
+   (`v4`), a release tag in its line (`v4.x.y`) must still be at the pinned
+   commit. A SHA that no tag points at fails, which also rules out a commit
+   that exists only in a fork.
+3. A called reusable workflow asks for no permission that the calling job does
+   not grant. GitHub refuses such a run before it starts, with no logs and no
+   check run. A job that declares no permissions is compared against GitHub's
+   restricted default token (`contents: read`, `packages: read`).
+
+Tags are listed with `git ls-remote` and called workflows are read through the
+contents API. A lookup that fails fails the check. zizmor's online audits are
+not used, because one failed API call there either aborts the run or, for
+`ref-version-mismatch`, reports nothing; in zizmor 1.28 that audit also reports
+nothing for a reusable-workflow pin.
+
+Pull requests use `pull_request_target` and read only the changed workflow and
+action YAML through GitHub's API, as `checkout-credentials` does. Pushes check
+the complete repository.
+
+```yaml
+name: pin-check
+on:
+  pull_request_target:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  check-pr:
+    if: github.event_name == 'pull_request_target'
+    uses: florianhorner/gh-workflows/.github/workflows/pin-check.yml@<full-commit-sha> # <tag>
+    with:
+      pull_request_number: ${{ github.event.pull_request.number }}
+  check-push:
+    if: github.event_name == 'push'
+    uses: florianhorner/gh-workflows/.github/workflows/pin-check.yml@<full-commit-sha> # <tag>
+```
+
+What it does not check:
+
+- A pin without a version comment fails, and so does a pin to a commit that no
+  tag points at. Name the tag, or call an action from the same repository by
+  local path (`./`).
+- In pull-request mode only changed files are checked, so a change to a called
+  workflow is not compared against callers that did not change. The next push
+  to the default branch checks the complete repository.
+- Permissions are compared one call deep; a called workflow's own nested calls
+  are not followed.
+- `docker://` and local `./` references are out of scope.
+- It reads no upstream code. A tagged release can still be malicious.
+
+`bash scripts/test-pin-check` runs the fixtures, extracting the check's script
+from the workflow itself; `workflow-lint.yml` runs it on every change.
+
 ## `verify-claims` — PR Proof Block Enforcement
 
 Every PR body must end with a `## Proof` block listing artifacts for each claim. This workflow validates that block server-side and blocks merge if it's missing or malformed.
@@ -343,6 +408,12 @@ never the content. Treat a pass as a tripwire on habitual violations, not as
 evidence that a body is clean.
 
 ## Release notes
+
+### Unreleased — `pin-check` checks pins against their tags and callers
+
+New reusable workflow `pin-check.yml`, with a dogfood caller
+(`pin-check-caller.yml`) and fixtures in `scripts/test-pin-check`, which
+`workflow-lint.yml` runs. See "`pin-check`" above.
 
 ### Unreleased — body-lint ignores the Claude Code cloud footer
 

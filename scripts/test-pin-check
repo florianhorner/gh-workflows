@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# Tests for .github/workflows/pin-check.yml.
+#
+# The version-comment and permission check runs the exact script embedded in
+# the workflow, extracted from the YAML. Fixture tag listings and called
+# workflows stand in for git ls-remote and the contents API. The last two
+# cases go online (git ls-remote against github.com); set PIN_CHECK_OFFLINE=1
+# to skip them.
+set -euo pipefail
+
+ZIZMOR_VERSION="${ZIZMOR_VERSION:-1.28.0}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workflow="${repo_root}/.github/workflows/pin-check.yml"
+caller="${repo_root}/.github/workflows/pin-check-caller.yml"
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+failures=0
+fail() {
+  echo "FAIL: $*" >&2
+  failures=$((failures + 1))
+}
+
+script="${work}/check.py"
+uv run --no-config --no-project --with pyyaml==6.0.2 python3 - "${workflow}" "${script}" <<'PY'
+import sys
+
+import yaml
+
+workflow, out = sys.argv[1], sys.argv[2]
+with open(workflow) as handle:
+    steps = yaml.safe_load(handle)["jobs"]["pins"]["steps"]
+step = next(s for s in steps if s.get("name") == "Check version comments and reusable-workflow permissions")
+assert step["shell"] == "uv run --no-config --no-project --with pyyaml==6.0.2 python3 {0}", step["shell"]
+with open(out, "w") as handle:
+    handle.write(step["run"])
+PY
+
+A=1111111111111111111111111111111111111111   # v1.2.0
+B=2222222222222222222222222222222222222222   # v1.3.0, and the alias v1
+C=3333333333333333333333333333333333333333   # no tag points here
+T=4444444444444444444444444444444444444444   # annotated tag object of v2.0.0
+D=5555555555555555555555555555555555555555   # the commit v2.0.0 points at
+
+tags="${work}/tags"
+callees="${work}/callees"
+mkdir -p "${tags}/acme" "${callees}"
+for repository in tool wf; do
+  printf '%s\trefs/tags/%s\n' \
+    "${A}" v1.2.0 "${B}" v1.3.0 "${B}" v1 "${T}" v2.0.0 "${D}" 'v2.0.0^{}' \
+    > "${tags}/acme/${repository}.tags"
+done
+
+# write_file FIXTURE PATH CONTENTS
+write_file() {
+  mkdir -p "$(dirname "${work}/fixtures/$1/$2")"
+  printf '%s\n' "$3" > "${work}/fixtures/$1/$2"
+}
+
+# callee REF NAME CONTENTS: acme/wf/.github/workflows/NAME at REF
+callee() {
+  mkdir -p "${callees}/acme/wf/$1/.github/workflows"
+  printf '%s\n' "$3" > "${callees}/acme/wf/$1/.github/workflows/$2"
+}
+
+# step_workflow FIXTURE USES-LINE: a one-step workflow
+step_workflow() {
+  write_file "$1" .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $2"
+}
+
+run_check() {
+  AUDIT_TARGET="${work}/fixtures/$1" \
+    PIN_CHECK_TAGS_DIR="${tags}" \
+    PIN_CHECK_CALLEE_DIR="${callees}" \
+    uv run --no-config --no-project --with pyyaml==6.0.2 python3 "${script}" > "${work}/$1.out" 2>&1
+}
+
+expect_pass() {
+  if ! run_check "$1"; then
+    fail "$1: expected the check to pass"
+    sed 's/^/    /' "${work}/$1.out" >&2
+  fi
+}
+
+# expect_fail FIXTURE TEXT: fails, and an annotation contains TEXT
+expect_fail() {
+  if run_check "$1"; then
+    fail "$1: expected the check to fail"
+  elif ! grep -F -- '::error ' "${work}/$1.out" | grep -Fq -- "$2"; then
+    fail "$1: no annotation contains: $2"
+    sed 's/^/    /' "${work}/$1.out" >&2
+  fi
+}
+
+# --- version comments
+step_workflow exact "acme/tool@${A} # v1.2.0"
+expect_pass exact
+
+step_workflow alias-moved "acme/tool@${A} # v1"
+expect_pass alias-moved
+
+step_workflow stale-comment "acme/tool@${A} # v1.3.0"
+expect_fail stale-comment "tag v1.3.0 of acme/tool is at 222222222222, not 111111111111; 111111111111 is tagged v1.2.0"
+
+step_workflow no-comment "acme/tool@${A}"
+expect_fail no-comment "has no version comment"
+
+step_workflow unknown-tag "acme/tool@${A} # v9"
+expect_fail unknown-tag "the comment names v9, which is not a tag of acme/tool; 111111111111 is tagged v1.2.0"
+
+step_workflow untagged "acme/tool@${C} # v1.2.0"
+expect_fail untagged "no tag of acme/tool points at 333333333333"
+
+step_workflow annotated "acme/tool@${D} # v2.0.0"
+expect_pass annotated
+
+step_workflow annotated-object "acme/tool@${T} # v2.0.0"
+expect_fail annotated-object "tag v2.0.0 of acme/tool is at 555555555555, not 444444444444"
+
+step_workflow quoted "'acme/tool@${A}' # v1.2.0"
+expect_pass quoted
+
+step_workflow tag-pin "acme/tool@v1"
+expect_pass tag-pin   # not a SHA pin: the full-SHA step reports it
+
+step_workflow no-tag-listing "acme/missing@${A} # v1.2.0"
+expect_fail no-tag-listing "missing.tags"
+
+write_file composite actions/lint/action.yml "name: lint
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.3.0"
+expect_fail composite "tag v1.3.0 of acme/tool"
+
+# --- reusable-workflow permissions
+callee "${A}" lint.yml 'on: workflow_call
+permissions:
+  contents: read
+  actions: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+
+# reusable_workflow FIXTURE WORKFLOW-PERMISSIONS JOB-PERMISSIONS USES
+reusable_workflow() {
+  write_file "$1" .github/workflows/test.yml "name: test
+on: pull_request
+$2
+jobs:
+  lint:
+$3
+    uses: $4"
+}
+
+lint_pin="acme/wf/.github/workflows/lint.yml@${A} # v1.2.0"
+
+reusable_workflow elevation '' '    permissions:
+      contents: read' "${lint_pin}"
+expect_fail elevation "job lint grants actions: none, but acme/wf/.github/workflows/lint.yml@${A} asks for actions: read"
+
+reusable_workflow fit '' '    permissions:
+      contents: read
+      actions: read' "${lint_pin}"
+expect_pass fit
+
+reusable_workflow workflow-level 'permissions:
+  contents: read
+  actions: read' '' "${lint_pin}"
+expect_pass workflow-level
+
+reusable_workflow job-overrides-workflow 'permissions: write-all' '    permissions:
+      contents: read' "${lint_pin}"
+expect_fail job-overrides-workflow "grants actions: none"
+
+reusable_workflow empty-grant '' '    permissions: {}' "${lint_pin}"
+expect_fail empty-grant "grants actions: none"
+
+reusable_workflow write-all '' '    permissions: write-all' "${lint_pin}"
+expect_pass write-all
+
+reusable_workflow undeclared-elevation '' '' "${lint_pin}"
+expect_fail undeclared-elevation "job lint declares no permissions, but acme/wf/.github/workflows/lint.yml@${A} asks for actions: read"
+
+callee "${B}" contents.yml 'on: workflow_call
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow undeclared-default '' '' "acme/wf/.github/workflows/contents.yml@${B} # v1.3.0"
+expect_pass undeclared-default
+
+callee "${B}" job-level.yml 'on: workflow_call
+permissions: write-all
+jobs:
+  narrow:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  wide:
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-jobs '' '    permissions:
+      contents: read
+      issues: read' "acme/wf/.github/workflows/job-level.yml@${B} # v1.3.0"
+expect_fail callee-jobs "grants issues: read, but acme/wf/.github/workflows/job-level.yml@${B} asks for issues: write"
+
+callee "${B}" narrowed.yml 'on: workflow_call
+permissions: write-all
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-job-narrows '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/narrowed.yml@${B} # v1.3.0"
+expect_pass callee-job-narrows   # GitHub checks each called job, and this job asks for contents: read only
+
+callee "${B}" inherit.yml 'on: workflow_call
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-inherits '' '    permissions: {}' "acme/wf/.github/workflows/inherit.yml@${B} # v1.3.0"
+expect_pass callee-inherits
+
+reusable_workflow local-callee '' '    permissions:
+      issues: read' './.github/workflows/callee.yml'
+write_file local-callee .github/workflows/callee.yml 'on: workflow_call
+permissions:
+  issues: write
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+expect_fail local-callee "grants issues: read, but ./.github/workflows/callee.yml asks for issues: write"
+
+reusable_workflow dot-segment '' '    permissions: {}' "acme/../wf/.github/workflows/lint.yml@${A} # v1.2.0"
+expect_fail dot-segment "refusing a dot segment"
+
+reusable_workflow nested-path '' '    permissions: {}' "acme/wf/.github/workflows/sub/lint.yml@${A} # v1.2.0"
+expect_fail nested-path "not a reusable workflow path"
+
+reusable_workflow missing-callee '' '    permissions: {}' "acme/wf/.github/workflows/absent.yml@${A} # v1.2.0"
+expect_fail missing-callee "absent.yml"
+
+# --- full-SHA step: zizmor's offline unpinned-uses, as the workflow runs it
+zizmor_count() {
+  uvx --no-config --from "zizmor==${ZIZMOR_VERSION}" zizmor \
+    --offline --strict-collection --collect=workflows,actions \
+    --no-config --no-ignores --no-exit-codes --format=json-v1 \
+    "${work}/fixtures/$1" \
+    | jq '[.[] | select(.ident == "unpinned-uses" and .ignored == false)] | length'
+}
+for case in tag-pin:1 exact:0 composite:0 fit:0 local-callee:0; do
+  fixture="${case%%:*}"
+  expected="${case##*:}"
+  actual="$(zizmor_count "${fixture}")"
+  if [ "${actual}" != "${expected}" ]; then
+    fail "${fixture}: expected ${expected} unpinned-uses finding(s), got ${actual}"
+  fi
+done
+write_file composite-tag actions/lint/action.yml 'name: lint
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@v1'
+actual="$(zizmor_count composite-tag)"
+[ "${actual}" = 1 ] || fail "composite-tag: expected 1 unpinned-uses finding, got ${actual}"
+
+# --- the gate's own shape
+grep -Eq '^  pull_request_target:$' "${caller}" || fail "caller: must run on pull_request_target"
+if grep -Eq '^  pull_request:$' "${caller}"; then
+  fail "caller: pull_request would let a PR replace its own gate"
+fi
+if grep -Eq '^    paths(-ignore)?:$' "${caller}"; then
+  fail "caller: path filters can skip the gate on oversized diffs"
+fi
+grep -Eq '^        if: inputs\.pull_request_number == 0$' "${workflow}" || fail "workflow: checkout must be push-only"
+grep -Eq 'pulls/\$\{PULL_REQUEST_NUMBER\}/files' "${workflow}" || fail "workflow: PR files must come from the API"
+for flag in --offline --no-config --no-ignores --strict-collection; do
+  grep -Eq -- "^            ${flag} \\\\$" "${workflow}" || fail "workflow: zizmor must run with ${flag}"
+done
+
+# --- online: this repository's own pins, and one real mismatch
+if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then
+  if ! AUDIT_TARGET="${repo_root}" uv run --no-config --no-project --with pyyaml==6.0.2 \
+      python3 "${script}" > "${work}/self.out" 2>&1; then
+    fail "self: this repository's pins do not pass"
+    sed 's/^/    /' "${work}/self.out" >&2
+  fi
+  checkout_v4=11d5960a326750d5838078e36cf38b85af677262
+  step_workflow real-mismatch "actions/checkout@${checkout_v4} # v3"
+  if AUDIT_TARGET="${work}/fixtures/real-mismatch" uv run --no-config --no-project \
+      --with pyyaml==6.0.2 python3 "${script}" > "${work}/real-mismatch.out" 2>&1; then
+    fail "real-mismatch: a v4 commit commented as v3 passed"
+  elif ! grep -Fq "tag v3 of actions/checkout is at" "${work}/real-mismatch.out"; then
+    fail "real-mismatch: unexpected output"
+    sed 's/^/    /' "${work}/real-mismatch.out" >&2
+  fi
+fi
+
+if [ "${failures}" -ne 0 ]; then
+  echo "${failures} pin-check test(s) failed" >&2
+  exit 1
+fi
+echo "pin-check tests passed"
