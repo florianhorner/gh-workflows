@@ -82,10 +82,9 @@ workflow and composite-action definitions:
 Tags are listed with `git ls-remote`. A remote called workflow is read through
 the contents API; a local one from the checkout or, in pull-request mode when it
 did not change, at the pull request's head. A lookup that fails fails the check, and so does a `uses:` the
-check cannot read. zizmor's online audits are not used, because one failed API
-call there either aborts the run or, for `ref-version-mismatch`, reports
-nothing; in zizmor 1.28 that audit also reports nothing for a reusable-workflow
-pin. Text from the checked files never reaches the log as a workflow command:
+check cannot read. zizmor's online audits are not used: one failed API call
+aborts the whole run, and in zizmor 1.28 `ref-version-mismatch` does not audit
+reusable-workflow pins at all. Text from the checked files never reaches the log as a workflow command:
 annotations escape it, zizmor's own log is shown only when zizmor fails and then
 with workflow commands switched off, and an unsafe file name is shown
 base64-encoded, and the Python problem matcher that setup-uv would add is left
@@ -137,7 +136,9 @@ Limits:
 - Workflow and action files may not be symbolic links: a runner loads
   whatever a link points at, which a pull request can change without touching
   the link. In pull-request mode the head commit's file list is read to find
-  them, and a list too large for one response fails the check.
+  them, and a list too large for one response fails the check. Directory links
+  are not followed: an action behind one is checked at its real path inside the
+  repository, and not at all if the link points outside it.
 - A tab between a pin and its `#` comment fails as invalid YAML (PyYAML rejects
   it); separate them with spaces.
 - It reviews no upstream code; it reads a called workflow only for the

@@ -373,7 +373,8 @@ step_workflow upper-case-wrong "acme/tool@${E_UPPER} # v1.2.0"
 expect_fail upper-case-wrong "tag v1.2.0 of acme/tool is at 111111111111, not abcdefabcdef; abcdefabcdef is tagged v3.0.0"
 
 # An image needs a tag or a digest.
-for case in "docker-untagged-check:docker://alpine" "docker-registry-port:docker://localhost:5000/img"; do
+for case in "docker-untagged-check:docker://alpine" "docker-registry-port:docker://localhost:5000/img" \
+    "docker-short-digest:docker://alpine@sha256:abc"; do
   step_workflow "${case%%:*}" "${case#*:}"
   expect_fail "${case%%:*}" "${case#*:} names no image tag or digest"
 done
@@ -390,6 +391,23 @@ jobs:
       <<: *grant
     uses: acme/wf/.github/workflows/lint.yml@${A} # v1.2.0"
 expect_fail merge-permissions "YAML merge keys are not supported (line 9)"
+
+step_workflow docker-empty-tag "'docker://alpine:'"
+expect_fail docker-empty-tag "docker://alpine: names no image tag or digest"
+
+step_workflow docker-digest "docker://alpine@sha256:$(printf 'a%.0s' $(seq 1 64))"
+expect_pass docker-digest
+
+write_file dangling-link .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+ln -s ../../nowhere.yml "${work}/fixtures/dangling-link/.github/workflows/linked.yml"
+expect_fail dangling-link "file=.github/workflows/linked.yml,line=1,title=pin-check::is a symbolic link"
 
 # Local and docker references are not pins; the check passes over them.
 write_file not-pins .github/workflows/test.yml "name: test
@@ -1173,6 +1191,7 @@ if run_prepare pr 7; then
     fail "prepare pr: unexpected check output"
     sed 's/^/    /' "${work}/prepare-pr/check.out" >&2
   fi
+  no_forged_commands "${work}/prepare-pr/check.out"
 else
   fail "prepare pr: the collection step failed"
   sed 's/^/    /' "${work}/prepare-pr/out" >&2
@@ -1183,6 +1202,7 @@ if run_prepare case 10; then
       "${python}" "${work}/check.py" > "${work}/prepare-case/check.out" 2>&1; then
     fail "prepare case: the untagged pin in Action.yml passed"
   fi
+  no_forged_commands "${work}/prepare-case/check.out"
 else
   fail "prepare case: the collection step failed"
   sed 's/^/    /' "${work}/prepare-case/out" >&2
@@ -1274,6 +1294,7 @@ if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then
     fail "self: this repository's pins do not pass"
     sed 's/^/    /' "${work}/self.out" >&2
   fi
+  no_forged_commands "${work}/self.out"
   checkout_v4=11d5960a326750d5838078e36cf38b85af677262
   step_workflow real-mismatch "actions/checkout@${checkout_v4} # v3"
   if AUDIT_TARGET="${work}/fixtures/real-mismatch" "${python}" "${work}/check.py" \
@@ -1283,6 +1304,7 @@ if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then
     fail "real-mismatch: unexpected output"
     sed 's/^/    /' "${work}/real-mismatch.out" >&2
   fi
+  no_forged_commands "${work}/real-mismatch.out"
 fi
 
 if [ "${failures}" -ne 0 ]; then
