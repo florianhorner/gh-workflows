@@ -5,7 +5,11 @@ name: pin-check
 # version comment of a pin and nothing else, so nobody reads upstream code in
 # that change. These are the parts of it that a machine can verify:
 #
-#   1. Every `uses:` is pinned to a full commit SHA (zizmor unpinned-uses).
+#   1. Every `uses:` other than a local `./` path or a `docker://` image is
+#      pinned to a full commit SHA. zizmor's unpinned-uses checks this; the last
+#      step requires it again of every reference zizmor lets through, including
+#      one zizmor reads as a hash pin whose path the step cannot parse. A
+#      reference zizmor cannot parse at all stops the job in zizmor's step.
 #   2. The version comment names a tag of the same repository, and that tag is
 #      at the pinned commit. If the tag is an alias that has since moved (v4),
 #      a release tag in its line (v4.x.y) must still be at the pinned commit.
@@ -16,7 +20,8 @@ name: pin-check
 #      (startup_failure, no logs, no check run), so a pin bump that raises the
 #      callee's permissions otherwise shows up only as an unexplained red run.
 #
-# Every lookup that fails, fails the check.
+# Every lookup that fails, and every reference the checks cannot read, fails
+# the check.
 
 on:
   workflow_call:
@@ -63,6 +68,7 @@ jobs:
               echo "AUDIT_TARGET=${GITHUB_WORKSPACE}"
               echo "AUDIT_TARGET_EMPTY=false"
               echo "PIN_CHECK_HEAD_SHA="
+              echo "PIN_CHECK_COLLECTED="
             } >> "${GITHUB_ENV}"
             exit 0
           fi
@@ -75,7 +81,7 @@ jobs:
           expected_count="$(jq -r '.changed_files' <<< "${pull}")"
           head_sha="$(jq -r '.head.sha' <<< "${pull}")"
           if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Unexpected pull request head SHA: ${head_sha}" >&2
+            echo "Unexpected pull request head SHA (base64): $(printf '%s' "${head_sha}" | base64 -w0)" >&2
             exit 1
           fi
 
@@ -107,14 +113,19 @@ jobs:
             # Workflows, plus composite actions wherever they live: zizmor
             # collects every action.yml, and actions are often kept outside
             # .github/actions so that other repositories can call them.
+            # The action-file name is matched in any case: a runner on a
+            # case-insensitive file system loads Action.yml as action.yml.
+            lowered="$(printf '%s' "${filename}" | tr '[:upper:]' '[:lower:]')"
             if [[ ! "${filename}" =~ ^\.github/workflows/[^/]+\.ya?ml$ \
-              && ! "${filename}" =~ (^|/)action\.ya?ml$ ]]; then
+              && ! "${lowered}" =~ (^|/)action\.ya?ml$ ]]; then
               continue
             fi
 
+            # The name is shown base64-encoded: raw, a line break or a `##[`
+            # in it would start a workflow command of its own in this log.
             if [[ "${filename}" == *$'\n'* || "${filename}" == *$'\r'* || "${filename}" == *$'\t'* \
               || "${filename}" =~ (^|/)\.\.?(/|$) ]]; then
-              echo "Unsafe workflow path returned by GitHub: ${filename}" >&2
+              echo "Unsafe workflow path returned by GitHub (base64): $(printf '%s' "${filename}" | base64 -w0)" >&2
               exit 1
             fi
 
@@ -130,6 +141,7 @@ jobs:
           {
             echo "AUDIT_TARGET=${audit_root}"
             echo "PIN_CHECK_HEAD_SHA=${head_sha}"
+            echo "PIN_CHECK_COLLECTED=${count}"
           } >> "${GITHUB_ENV}"
           if [ "${count}" -eq 0 ]; then
             echo "AUDIT_TARGET_EMPTY=true" >> "${GITHUB_ENV}"
@@ -149,12 +161,18 @@ jobs:
           fi
 
           report="${RUNNER_TEMP}/zizmor-pin-check.json"
+          log="${RUNNER_TEMP}/zizmor-pin-check.log"
 
           # Offline on purpose. zizmor's online rules depend on API calls: one
           # failing call aborts the whole run, and ref-version-mismatch reports
           # nothing for a reusable-workflow pin. The next step makes its own
           # lookups and fails when one fails.
-          uvx --no-config --from zizmor==1.28.0 zizmor \
+          #
+          # zizmor's log quotes the checked files (expressions it cannot parse,
+          # file names, spans of bad YAML), so it never reaches this log with
+          # workflow commands switched on: it is dropped on success and shown
+          # between stop-commands markers with a random token on failure.
+          if ! uvx --no-config --from zizmor==1.28.0 zizmor \
             --offline \
             --strict-collection \
             --collect=workflows,actions \
@@ -162,26 +180,28 @@ jobs:
             --no-ignores \
             --no-exit-codes \
             --format=json-v1 \
-            "${AUDIT_TARGET}" > "${report}"
+            "${AUDIT_TARGET}" > "${report}" 2> "${log}"; then
+            token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::error title=pin-check unpinned::zizmor could not read the checked files; its log follows, with workflow commands switched off."
+            echo "::stop-commands::${token}"
+            cat "${log}"
+            echo "::${token}::"
+            exit 1
+          fi
 
           count="$(jq '[.[] | select(.ident == "unpinned-uses" and .ignored == false)] | length' "${report}")"
 
-          jq -r '
+          # Paths and messages are escaped as workflow-command data: a file
+          # name from a pull request must not be able to start a command.
+          jq -r --arg root "${AUDIT_TARGET}/" '
+            def data: tostring | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+            def prop: data | gsub(":"; "%3A") | gsub(","; "%2C");
             .[]
             | select(.ident == "unpinned-uses" and .ignored == false)
             | .locations[]
             | select(.symbolic.kind == "Primary")
-            | [
-                (.symbolic.key.Local.verbatim_path // "workflow"),
-                (((.concrete.location.start_point.row // 0) + 1) | tostring),
-                (.symbolic.annotation // "action is not pinned to a hash")
-              ]
-            | @tsv
-          ' "${report}" | while IFS=$'\t' read -r path line message; do
-            path="${path#"${AUDIT_TARGET}"/}"
-            path="${path#./}"
-            echo "::error file=${path},line=${line},title=pin-check unpinned::${message}. Pin the full commit SHA and name its tag in a trailing comment."
-          done
+            | "::error file=\((.symbolic.key.Local.verbatim_path // "workflow") | ltrimstr($root) | ltrimstr("./") | prop),line=\((.concrete.location.start_point.row // 0) + 1),title=pin-check unpinned::\((.symbolic.annotation // "action is not pinned to a hash") | data). Pin the full commit SHA and name its tag in a trailing comment."
+          ' "${report}"
 
           if [ "${count}" -ne 0 ]; then
             echo "Found ${count} pin(s) that are not a full commit SHA."
@@ -192,11 +212,11 @@ jobs:
 
       # Embedded rather than checked out, so the gate runs no code from the
       # repository it checks. scripts/test-pin-check extracts this exact
-      # script from the workflow and runs it against fixtures.
+      # script from the workflow and runs it with stand-in git and gh.
       - name: Check version comments and reusable-workflow permissions
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: uv run --no-config --no-project --with pyyaml==6.0.2 python3 {0}
+        shell: uv run --no-config --no-project --with pyyaml==6.0.3 python3 {0}
         run: |
           import base64
           import json
@@ -208,22 +228,20 @@ jobs:
 
           import yaml
 
-          SCOPES = [
-              "actions", "attestations", "checks", "contents", "deployments",
-              "discussions", "id-token", "issues", "models", "packages", "pages",
-              "pull-requests", "repository-projects", "security-events", "statuses",
-          ]
           LEVELS = {"none": 0, "read": 1, "write": 2}
           NAMES = {0: "none", 1: "read", 2: "write"}
+          ALL = None  # the level of every scope a permissions value does not list
           # GITHUB_TOKEN under GitHub's restricted default (metadata: read is implicit).
-          RESTRICTED_DEFAULT = {"contents": 1, "packages": 1}
+          RESTRICTED_DEFAULT = {ALL: 0, "contents": 1, "packages": 1}
           NAME = r"[A-Za-z0-9_.-]+"
           REMOTE = re.compile(rf"^(?P<owner>{NAME})/(?P<repo>{NAME})(?P<path>(?:/{NAME})*)@(?P<ref>[^\s@]+)$")
           REUSABLE = re.compile(rf"^/\.github/workflows/{NAME}\.ya?ml$")
           LOCAL_REUSABLE = re.compile(rf"^\./(?P<path>\.github/workflows/{NAME}\.ya?ml)$")
-          SHA = re.compile(r"^[0-9a-f]{40}$")
+          SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+          MERGE_TAG = "tag:yaml.org,2002:merge"
+          ACTION_FILES = ("action.yml", "action.yaml")
           USES_LINE = re.compile(
-              r"""^\s*(?:-\s+)?uses:\s*(?P<q>['"]?)(?P<uses>[^'"\s#]+)(?P=q)\s*(?:#\s*(?P<comment>\S+).*)?$"""
+              r"""^\s*(?:-\s+)?uses:\s*(?:&\S+\s+)?(?P<q>['"]?)(?P<uses>[^'"\s#]+)(?P=q)\s*(?:#\s*(?P<comment>\S+).*)?$"""
           )
 
 
@@ -231,36 +249,52 @@ jobs:
               pass
 
 
+          def escape_data(value):
+              return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def escape_property(value):
+              return escape_data(value).replace(":", "%3A").replace(",", "%2C")
+
+
           def error(path, line, message):
-              print(f"::error file={path},line={line},title=pin-check::{message}")
+              """One annotation. Names and messages can come from a pull request, so both are escaped."""
+              print(f"::error file={escape_property(path)},line={line},title=pin-check::{escape_data(message)}")
 
 
           def normalize(spec, where):
-              """A permissions value as {scope: level}; None when the key is absent."""
+              """A permissions value as {scope: level}, with ALL for unlisted scopes; None when absent."""
               if spec is None:
                   return None
               if spec == "read-all":
-                  return {scope: 1 for scope in SCOPES}
+                  return {ALL: 1}
               if spec == "write-all":
-                  return {scope: 2 for scope in SCOPES}
+                  return {ALL: 2}
               if isinstance(spec, dict):
-                  levels = {scope: 0 for scope in SCOPES}
+                  levels = {ALL: 0}
                   for scope, level in spec.items():
                       if level not in LEVELS:
-                          raise Refused(f"{where}: unknown permission level {level!r} for {scope}")
+                          raise Refused(f"{where}: unknown permission level {level!r} for {scope!r}")
                       levels[str(scope)] = LEVELS[level]
                   return levels
               raise Refused(f"{where}: unreadable permissions value {spec!r}")
 
 
-          def load_yaml(text, where):
+          def level_of(levels, scope):
+              return levels.get(scope, levels.get(ALL, 0))
+
+
+          def run(command, what):
               try:
-                  data = yaml.safe_load(text)
-              except yaml.YAMLError as exc:
-                  raise Refused(f"{where}: invalid YAML ({exc})") from None
-              if not isinstance(data, dict):
-                  raise Refused(f"{where}: not a YAML mapping")
-              return data
+                  result = subprocess.run(
+                      command, capture_output=True, text=True, timeout=120, check=False,
+                      env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                  )
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  raise Refused(f"{what} failed: {exc}") from None
+              if result.returncode != 0:
+                  raise Refused(f"{what} failed: {result.stderr.strip()[:300]}")
+              return result.stdout
 
 
           def parse_remote(uses):
@@ -269,37 +303,24 @@ jobs:
                   return None
               parts = [match["owner"], match["repo"], *match["path"].split("/")[1:]]
               if any(part in (".", "..") for part in parts):
-                  raise Refused(f"refusing a dot segment in {uses}")
+                  raise Refused(f"refusing a dot segment in {uses!r}")
               return match
 
 
           def tag_commits(repository):
               """{tag: commit}; an annotated tag resolves to the commit it points at."""
-              fixtures = os.environ.get("PIN_CHECK_TAGS_DIR")
-              if fixtures:
-                  listing = (Path(fixtures) / f"{repository}.tags").read_text()
-              else:
-                  try:
-                      result = subprocess.run(
-                          ["git", "ls-remote", "--tags", f"https://github.com/{repository}.git"],
-                          capture_output=True, text=True, timeout=120, check=False,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                      )
-                  except subprocess.TimeoutExpired:
-                      raise Refused(f"listing the tags of {repository} timed out") from None
-                  if result.returncode != 0:
-                      raise Refused(f"could not list the tags of {repository}: {result.stderr.strip()}")
-                  listing = result.stdout
+              listing = run(["git", "ls-remote", "--tags", f"https://github.com/{repository}.git"],
+                            f"listing the tags of {repository}")
               plain, peeled = {}, {}
               for row in listing.splitlines():
                   commit, _, ref = row.partition("\t")
-                  if not ref.startswith("refs/tags/"):
+                  if not SHA.match(commit) or not ref.startswith("refs/tags/"):
                       continue
                   name = ref[len("refs/tags/"):]
                   if name.endswith("^{}"):
-                      peeled[name[:-3]] = commit
+                      peeled[name[:-3]] = commit.lower()
                   else:
-                      plain[name] = commit
+                      plain[name] = commit.lower()
               return {name: peeled.get(name, commit) for name, commit in plain.items()}
 
 
@@ -313,7 +334,8 @@ jobs:
                   return f"the comment names {comment}, which is not a tag of {repository}{hint}"
               if tags[comment] == sha:
                   return None
-              if any(name.startswith(comment + ".") for name in at_sha):
+              line_release = re.compile(re.escape(comment) + r"(\.\d+)+")
+              if any(line_release.fullmatch(name) for name in at_sha):
                   return None  # an alias that moved on; the pin is still a release in its line
               hint = (f"{sha[:12]} is tagged {', '.join(at_sha)}" if at_sha
                       else f"no tag of {repository} points at {sha[:12]}")
@@ -321,18 +343,10 @@ jobs:
 
 
           def gh_file(repository, path, ref):
-              """File text through GitHub's contents API; tests point PIN_CHECK_CALLEE_DIR at fixtures."""
-              fixtures = os.environ.get("PIN_CHECK_CALLEE_DIR")
-              if fixtures:
-                  return (Path(fixtures) / repository / ref / path).read_text()
-              result = subprocess.run(
-                  ["gh", "api", f"repos/{repository}/contents/{path}?ref={ref}"],
-                  capture_output=True, text=True, timeout=120, check=False,
-              )
-              if result.returncode != 0:
-                  raise Refused(f"could not read {repository}/{path}@{ref}: {result.stderr.strip()}")
-              payload = json.loads(result.stdout)
-              if payload.get("type") != "file" or payload.get("encoding") != "base64":
+              """File text through GitHub's contents API."""
+              payload = json.loads(run(["gh", "api", f"repos/{repository}/contents/{path}?ref={ref}"],
+                                       f"reading {repository}/{path}@{ref}"))
+              if not isinstance(payload, dict) or payload.get("type") != "file" or payload.get("encoding") != "base64":
                   raise Refused(f"{repository}/{path}@{ref} is not a base64 file")
               return base64.b64decode(payload["content"]).decode("utf-8")
 
@@ -341,8 +355,8 @@ jobs:
               remote = parse_remote(uses)
               if remote:
                   if not REUSABLE.match(remote["path"]):
-                      raise Refused(f"not a reusable workflow path: {uses}")
-                  return gh_file(f"{remote['owner']}/{remote['repo']}", remote["path"][1:], remote["ref"])
+                      raise Refused(f"not a reusable workflow path: {uses!r}")
+                  return gh_file(f"{remote['owner']}/{remote['repo']}", remote["path"][1:], remote["ref"].lower())
               local = LOCAL_REUSABLE.match(uses)
               if local:
                   candidate = root / local["path"]
@@ -351,126 +365,211 @@ jobs:
                   head_sha = os.environ.get("PIN_CHECK_HEAD_SHA", "")
                   if head_sha:
                       return gh_file(os.environ["GITHUB_REPOSITORY"], local["path"], head_sha)
-                  raise Refused(f"local reusable workflow not found: {uses}")
-              raise Refused(f"unrecognised reusable workflow reference: {uses}")
+                  raise Refused(f"local reusable workflow not found: {uses!r}")
+              raise Refused(f"unrecognised reusable workflow reference: {uses!r}")
+
+
+          def load_yaml(text, where):
+              try:
+                  data = yaml.safe_load(text)
+              except yaml.YAMLError as exc:
+                  raise Refused(f"{where}: invalid YAML ({exc})") from None
+              if not isinstance(data, dict):
+                  raise Refused(f"{where}: not a YAML mapping")
+              return data
 
 
           def requested(callee, where):
               """Highest level per scope that any job of the called workflow asks for; None if all inherit."""
               top = normalize(callee.get("permissions"), f"{where} (workflow permissions)")
               wanted = None
-              for name, job in (callee.get("jobs") or {}).items():
+              jobs = callee.get("jobs")
+              if not isinstance(jobs, dict):
+                  raise Refused(f"{where}: jobs is not a mapping")
+              for name, job in jobs.items():
                   if not isinstance(job, dict):
-                      continue
-                  effective = normalize(job.get("permissions"), f"{where} job {name}")
+                      raise Refused(f"{where}: job {name!r} is not a mapping")
+                  effective = normalize(job.get("permissions"), f"{where} job {name!r}")
                   if effective is None:
                       effective = top
                   if effective is None:
                       continue
-                  wanted = wanted or {}
-                  for scope, level in effective.items():
-                      wanted[scope] = max(wanted.get(scope, 0), level)
+                  if wanted is None:
+                      wanted = {ALL: 0}
+                  for scope in set(effective) | set(wanted):
+                      wanted[scope] = max(level_of(wanted, scope), level_of(effective, scope))
               return wanted
 
 
-          def parsed_uses(data):
-              """(uses, job name) for each reusable-workflow call; (uses, None) for each step."""
+          def shortfalls(wanted, granted):
+              """(what, asked, granted) for every scope the callee asks more of than the caller grants."""
+              if level_of(wanted, ALL) > level_of(granted, ALL):
+                  return [(f"{NAMES[level_of(wanted, ALL)]}-all", level_of(wanted, ALL), level_of(granted, ALL))]
               found = []
-              jobs = data.get("jobs")
-              for name, job in (jobs.items() if isinstance(jobs, dict) else []):
-                  if not isinstance(job, dict):
-                      continue
-                  if isinstance(job.get("uses"), str):
-                      found.append((job["uses"].strip(), name))
-                  for step in job.get("steps") or []:
-                      if isinstance(step, dict) and isinstance(step.get("uses"), str):
-                          found.append((step["uses"].strip(), None))
-              runs = data.get("runs")
-              if isinstance(runs, dict):
-                  for step in runs.get("steps") or []:
-                      if isinstance(step, dict) and isinstance(step.get("uses"), str):
-                          found.append((step["uses"].strip(), None))
+              for scope in sorted(s for s in wanted if s is not ALL):
+                  if level_of(wanted, scope) > level_of(granted, scope):
+                      found.append((scope, level_of(wanted, scope), level_of(granted, scope)))
               return found
 
 
-          def uses_lines(text):
-              lines = {}
-              for number, line in enumerate(text.splitlines(), start=1):
-                  match = USES_LINE.match(line)
-                  if match:
-                      lines.setdefault(match["uses"], []).append((number, match["comment"]))
-              return lines
+          def triggers(data):
+              on = data.get("on", data.get(True))  # PyYAML reads a bare `on:` key as True
+              if isinstance(on, str):
+                  return {on}
+              if isinstance(on, (list, dict)):
+                  return {str(event) for event in on}
+              return set()
 
 
-          def check_comments(shown, text, data, tag_cache):
-              lines = uses_lines(text)
+          def mapping_values(node, key):
+              """The value nodes for `key` in a plain YAML mapping node, every one if the key repeats."""
+              if not isinstance(node, yaml.MappingNode):
+                  return []
+              if any(name.tag == MERGE_TAG for name, _ in node.value):
+                  # safe_load would merge in keys this walk cannot see, a uses among them.
+                  raise Refused(f"YAML merge keys are not supported (line {node.start_mark.line + 1})")
+              return [value for name, value in node.value if isinstance(name, yaml.ScalarNode) and name.value == key]
+
+
+          def plain_mapping(node, what):
+              if not isinstance(node, yaml.MappingNode) or node.tag != "tag:yaml.org,2002:map":
+                  raise Refused(f"{what} on line {node.start_mark.line + 1} is not a plain mapping")
+              return node
+
+
+          def uses_nodes(root):
+              """(uses node, job name) for a reusable-workflow call and (uses node, None) for a step."""
+              found = []
+
+              def steps_of(owner):
+                  for steps in mapping_values(owner, "steps"):
+                      for step in (steps.value if isinstance(steps, yaml.SequenceNode) else []):
+                          found.extend((node, None) for node in mapping_values(plain_mapping(step, "a step"), "uses"))
+
+              for jobs in mapping_values(root, "jobs"):
+                  if isinstance(jobs, yaml.MappingNode) and any(key.tag == MERGE_TAG for key, _ in jobs.value):
+                      raise Refused(f"YAML merge keys are not supported (line {jobs.start_mark.line + 1})")
+                  for key, job in (jobs.value if isinstance(jobs, yaml.MappingNode) else []):
+                      name = key.value if isinstance(key, yaml.ScalarNode) else None
+                      found.extend((node, name) for node in mapping_values(plain_mapping(job, "a job"), "uses"))
+                      steps_of(job)
+              for runs in mapping_values(root, "runs"):
+                  steps_of(runs)
+              return found
+
+
+          def job_named(jobs, name):
+              """The job safe_load built for a key whose text is `name`; `yes` or `null` load as True or None."""
+              if name in jobs:
+                  return jobs[name]
+              try:
+                  return jobs.get(yaml.safe_load(name))
+              except (yaml.YAMLError, TypeError):
+                  return None
+
+
+          def check_comments(shown, lines, found, tag_cache):
               problems = 0
-              for uses in sorted({uses for uses, _ in parsed_uses(data)}):
-                  if uses.startswith(("./", "docker://")):
-                      continue
-                  try:
-                      remote = parse_remote(uses)
-                  except Refused as exc:
-                      error(shown, 1, str(exc))
+              for node, _ in found:
+                  line = node.start_mark.line + 1
+                  if not isinstance(node, yaml.ScalarNode):
+                      error(shown, line, "uses must be a single string")
                       problems += 1
                       continue
-                  if not remote or not SHA.match(remote["ref"]):
-                      continue  # not a SHA pin: the full-SHA step reports it
-                  if uses not in lines:
-                      error(shown, 1, f"could not find the line of {uses}; write each uses on one line")
+                  uses = node.value.strip()
+                  if uses.startswith("docker://") or (uses.startswith("./") and "@" not in uses):
+                      continue
+                  try:
+                      remote = None if uses.startswith("./") else parse_remote(uses)
+                  except Refused as exc:
+                      error(shown, line, str(exc))
+                      problems += 1
+                      continue
+                  if not remote:
+                      error(shown, line, f"cannot read {uses!r} as owner/repo[/path]@ref, so its pin cannot be checked")
+                      problems += 1
+                      continue
+                  if not SHA.match(remote["ref"]):
+                      error(shown, line, f"{uses} is not pinned to a full commit SHA")
+                      problems += 1
+                      continue
+                  # The comment is read from the line YAML puts this uses on, never from a
+                  # look-alike line elsewhere (a run: block, say).
+                  match = USES_LINE.match(lines[line - 1]) if line <= len(lines) else None
+                  if not match or match["uses"] != uses:
+                      error(shown, line, f"cannot read the version comment of {uses}; "
+                                         f"write it as `uses: {uses} # <tag>` on one line")
                       problems += 1
                       continue
                   repository = f"{remote['owner']}/{remote['repo']}"
                   try:
                       if repository not in tag_cache:
                           tag_cache[repository] = tag_commits(repository)
-                      tags = tag_cache[repository]
-                  except (Refused, OSError) as exc:
-                      error(shown, lines[uses][0][0], str(exc))
+                  except Refused as exc:
+                      error(shown, line, str(exc))
                       problems += 1
                       continue
-                  for number, comment in lines[uses]:
-                      problem = comment_problem(repository, remote["ref"], comment, tags)
-                      if problem:
-                          error(shown, number, problem)
-                          problems += 1
+                  problem = comment_problem(repository, remote["ref"].lower(), match["comment"], tag_cache[repository])
+                  if problem:
+                      error(shown, line, problem)
+                      problems += 1
               return problems
 
 
-          def check_permissions(shown, text, data, root):
-              lines = uses_lines(text)
+          def check_permissions(shown, data, found, root):
               problems = 0
               top = normalize(data.get("permissions"), f"{shown} (workflow permissions)")
-              for uses, name in parsed_uses(data):
-                  if name is None:
+              jobs = data.get("jobs") if isinstance(data.get("jobs"), dict) else {}
+              for node, name in found:
+                  if name is None or not isinstance(node, yaml.ScalarNode):
                       continue
-                  job = data["jobs"][name]
-                  line = lines.get(uses, [(1, None)])[0][0]
+                  uses, line = node.value.strip(), node.start_mark.line + 1
+                  remote = None if uses.startswith("./") else REMOTE.match(uses)
+                  if remote and not SHA.match(remote["ref"]):
+                      continue  # not a SHA pin: reported above, and not fetched at a moving ref
+                  job = job_named(jobs, name)
+                  if not isinstance(job, dict):
+                      error(shown, line, f"cannot read job {name!r}")
+                      problems += 1
+                      continue
                   try:
-                      granted = normalize(job.get("permissions"), f"{shown} job {name}")
+                      granted = normalize(job.get("permissions"), f"{shown} job {name!r}")
                       declared = granted is not None or top is not None
                       if granted is None:
                           granted = top
                       wanted = requested(load_yaml(callee_text(uses, root), uses), uses)
-                  except (Refused, OSError, UnicodeDecodeError, ValueError, subprocess.TimeoutExpired) as exc:
-                      error(shown, line, f"job {name}: {exc}")
+                  except (Refused, OSError, UnicodeDecodeError, ValueError) as exc:
+                      error(shown, line, f"job {name!r}: {exc}")
                       problems += 1
                       continue
-                  if wanted is None:
+                  if wanted is None or not any(level > 0 for level in wanted.values()):
                       continue
-                  if not declared:
-                      granted = RESTRICTED_DEFAULT
-                  for scope, level in sorted(wanted.items()):
-                      have = granted.get(scope, 0)
-                      if level <= have:
-                          continue
-                      if declared:
-                          error(shown, line, f"job {name} grants {scope}: {NAMES[have]}, but {uses} asks for "
-                                             f"{scope}: {NAMES[level]}. GitHub refuses the run before it starts.")
+                  if not declared and triggers(data) == {"workflow_call"}:
+                      # The job passes on whatever its own caller grants, which is not visible here.
+                      # Declared, the grant is checked here, and the caller's grant one level up.
+                      asks = ", ".join(f"{scope}: {NAMES[level]}" for scope, level in sorted(
+                          (s, v) for s, v in wanted.items() if s is not ALL and v > 0))
+                      if level_of(wanted, ALL) > 0:
+                          asks = f"{NAMES[level_of(wanted, ALL)]}-all"
+                      error(shown, line, f"job {name!r} declares no permissions and its workflow runs only on "
+                                         f"workflow_call, so the grant it inherits cannot be compared with what "
+                                         f"{uses} asks for ({asks}). Declare those permissions on the job.")
+                      problems += 1
+                      continue
+                  for scope, asked, have in shortfalls(wanted, granted if declared else RESTRICTED_DEFAULT):
+                      shorthand = scope.endswith("-all")
+                      asks = scope if shorthand else f"{scope}: {NAMES[asked]}"
+                      if not declared:
+                          message = (f"job {name!r} declares no permissions, but {uses} asks for {asks}. Under the "
+                                     f"restricted default token GitHub refuses the run before it starts; grant it "
+                                     f"on the job.")
+                      elif shorthand:
+                          message = (f"job {name!r} grants less than {scope}, which {uses} asks for, as far as a "
+                                     f"listed grant shows. Grant {scope} on the job.")
                       else:
-                          error(shown, line, f"job {name} declares no permissions, but {uses} asks for "
-                                             f"{scope}: {NAMES[level]}. Under the restricted default token GitHub "
-                                             f"refuses the run before it starts; grant it on the job.")
+                          message = (f"job {name!r} grants {scope}: {NAMES[have]}, but {uses} asks for {asks}. "
+                                     f"GitHub refuses the run before it starts.")
+                      error(shown, line, message)
                       problems += 1
               return problems
 
@@ -479,26 +578,36 @@ jobs:
               if os.environ.get("AUDIT_TARGET_EMPTY") == "true":
                   return 0
               root = Path(os.environ["AUDIT_TARGET"])
-              workflows = sorted(root.glob(".github/workflows/*.y*ml"))
-              actions = sorted(p for p in root.rglob("action.y*ml")
-                               if not {".git", "node_modules"} & set(p.relative_to(root).parts))
+              workflows = sorted(p for p in (root / ".github" / "workflows").glob("*")
+                                 if p.is_file() and p.name.endswith((".yml", ".yaml")))
+              actions = set()
+              for directory, subdirectories, files in os.walk(root):
+                  subdirectories[:] = [d for d in subdirectories if d != ".git"]
+                  actions.update(Path(directory) / f for f in files if f.lower() in ACTION_FILES)
+              actions = sorted(actions - set(workflows))
               tag_cache, problems = {}, 0
               for path in workflows + actions:
                   shown = path.relative_to(root).as_posix()
                   text = path.read_text()
                   try:
                       data = load_yaml(text, shown)
-                  except Refused as exc:
+                      found = uses_nodes(yaml.compose(text, Loader=yaml.SafeLoader))
+                  except (Refused, yaml.YAMLError) as exc:
                       error(shown, 1, str(exc))
                       problems += 1
                       continue
-                  problems += check_comments(shown, text, data, tag_cache)
+                  problems += check_comments(shown, text.splitlines(), found, tag_cache)
                   if path in workflows:
                       try:
-                          problems += check_permissions(shown, text, data, root)
+                          problems += check_permissions(shown, data, found, root)
                       except Refused as exc:
                           error(shown, 1, str(exc))
                           problems += 1
+              collected = os.environ.get("PIN_CHECK_COLLECTED", "")
+              if collected and int(collected) != len(workflows) + len(actions):
+                  print(f"::error title=pin-check::collected {collected} file(s) but checked "
+                        f"{len(workflows) + len(actions)}; refusing a partial check.")
+                  problems += 1
               if problems:
                   print(f"Found {problems} pin problem(s).")
                   return 1
@@ -507,4 +616,9 @@ jobs:
               return 0
 
 
-          sys.exit(main())
+          try:
+              status = main()
+          except Exception as exc:  # fail closed, and keep the text of an unexpected failure escaped
+              print(f"::error title=pin-check::unexpected failure: {escape_data(type(exc).__name__)}: {escape_data(exc)}")
+              status = 1
+          sys.exit(status)
