@@ -102,10 +102,18 @@ while rest:
 # with a different path or query finds nothing.
 key = hashlib.sha256(re.sub(r"^https://api\.github\.com/", "", endpoint).encode()).hexdigest()
 path = os.path.join(os.environ["FAKE_GH_DIR"], key)
-if not os.path.isfile(path):
+if os.path.isfile(path + ".seq"):
+    # A sequence answers successive calls in turn and then repeats its last
+    # answer: a pull request whose head moves between two reads.
+    sequence = json.load(open(path + ".seq"))
+    pages = sequence[:1]
+    if len(sequence) > 1:
+        json.dump(sequence[1:], open(path + ".seq", "w"))
+elif not os.path.isfile(path):
     sys.stderr.write("gh: Not Found (HTTP 404)\n")
     sys.exit(1)
-pages = json.load(open(path))
+else:
+    pages = json.load(open(path))
 if not paginate:
     pages = pages[:1]  # without --paginate, gh returns the first page only
 status = 0
@@ -129,6 +137,16 @@ gh_response() {
   "${python}" -c 'import hashlib, json, sys
 key = hashlib.sha256(sys.argv[2].encode()).hexdigest()
 json.dump(sys.argv[3:], open(f"{sys.argv[1]}/{key}", "w"))' "${FAKE_GH_DIR}" "${endpoint}" "$@"
+}
+
+# gh_sequence ENDPOINT BODY [BODY ...]: one body per call to exactly ENDPOINT,
+# the last repeated
+gh_sequence() {
+  local endpoint="$1"
+  shift
+  "${python}" -c 'import hashlib, json, sys
+key = hashlib.sha256(sys.argv[2].encode()).hexdigest()
+json.dump(sys.argv[3:], open(f"{sys.argv[1]}/{key}.seq", "w"))' "${FAKE_GH_DIR}" "${endpoint}" "$@"
 }
 
 # contents_response REPOSITORY PATH REF TEXT: a contents-API file
@@ -1034,8 +1052,8 @@ for fixture in exact fit local-callee composite zizmor-quotes-expression zizmor-
 done
 
 # --- the PR-mode collection step, against the stand-in API
-api_file() {  # api_file PATH: one entry of the pull request's file list
-  printf '{"status":"modified","filename":"%s","contents_url":"https://api.github.com/repos/acme/repo/contents/%s?ref=%s"}' "$1" "$1" "${H}"
+api_file() {  # api_file PATH [REF]: one entry of the pull request's file list
+  printf '{"status":"modified","filename":"%s","contents_url":"https://api.github.com/repos/acme/repo/contents/%s?ref=%s"}' "$1" "$1" "${2:-${H}}"
 }
 gh_response "repos/acme/repo/pulls/7" "{\"changed_files\":4,\"head\":{\"sha\":\"${H}\"}}"
 gh_response "repos/acme/repo/pulls/7/files?per_page=100" \
@@ -1128,6 +1146,45 @@ gh_response "repos/acme/repo/pulls/11" "{\"changed_files\":1,\"head\":{\"sha\":\
 gh_response "repos/acme/repo/pulls/11/files?per_page=100" "[$(api_file 'tools/x\n##[warning file=README.md;line=1;title=pin-check]looks fine/action.yml')]"
 gh_response "repos/acme/repo/pulls/9" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
 gh_response "repos/acme/repo/pulls/9/files?per_page=100" "[$(api_file '..\n::warning::forged/action.yml')]"
+# One commit throughout: a head that moves during collection with the same
+# number of changed files, an event that names another head, contents URLs
+# that name a newer head, and a name that needs percent-encoding.
+H4=6666666666666666666666666666666666666664   # a head the pull request moves to
+gh_sequence "repos/acme/repo/pulls/25" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}" "{\"changed_files\":1,\"head\":{\"sha\":\"${H4}\"}}"
+gh_response "repos/acme/repo/pulls/25/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/26" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/26/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/27" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/27/files?per_page=100" "[$(api_file .github/workflows/pinned.yml "${H4}")]"
+contents_response acme/repo .github/workflows/pinned.yml "${H}" "name: pinned
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+contents_response acme/repo .github/workflows/pinned.yml "${H4}" "name: pinned
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+gh_sequence "repos/acme/repo/pulls/29" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}" 'not json'
+gh_response "repos/acme/repo/pulls/29/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/28" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/28/files?per_page=100" "[$(api_file '.github/workflows/a b#c.yml')]"
+contents_response acme/repo '.github/workflows/a%20b%23c.yml' "${H}" "name: encoded
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
 
 # run_prepare CASE PULL_REQUEST_NUMBER: 0 when the step passes
 run_prepare() {
@@ -1136,7 +1193,8 @@ run_prepare() {
   : > "${dir}/env"
   local status=0
   GITHUB_ENV="${dir}/env" RUNNER_TEMP="${dir}/temp" GITHUB_WORKSPACE="${dir}/workspace" \
-    GITHUB_REPOSITORY=acme/repo PULL_REQUEST_NUMBER="$2" PATH="${fakebin}:${PATH}" \
+    GITHUB_REPOSITORY=acme/repo PULL_REQUEST_NUMBER="$2" EVENT_HEAD_SHA="${EVENT_HEAD_SHA:-}" \
+    PATH="${fakebin}:${PATH}" \
     bash --noprofile --norc -eo pipefail "${work}/prepare.sh" > "${dir}/out" 2>&1 || status=$?
   no_forged_commands "${dir}/out"
   return "${status}"
@@ -1265,6 +1323,41 @@ fi
 if run_prepare not-a-file 22; then
   fail "prepare not-a-file: a contents entry that is not a file was accepted"
 fi
+if run_prepare moved 25; then
+  fail "prepare moved: a head that moved during collection was accepted"
+elif ! grep -Fq "The pull request head moved while its files were collected" "${work}/prepare-moved/out"; then
+  fail "prepare moved: unexpected output"
+  sed 's/^/    /' "${work}/prepare-moved/out" >&2
+fi
+if run_prepare reread-fails 29; then
+  fail "prepare reread-fails: a failed second read of the head was accepted"
+elif grep -Fq "AUDIT_TARGET=" "${work}/prepare-reread-fails/env"; then
+  fail "prepare reread-fails: the audit target was written"
+fi
+if EVENT_HEAD_SHA="${H4}" run_prepare event-old 26; then
+  fail "prepare event-old: a head other than the event's was checked"
+elif ! grep -Fq "no longer the commit this run was started for" "${work}/prepare-event-old/out"; then
+  fail "prepare event-old: unexpected output"
+  sed 's/^/    /' "${work}/prepare-event-old/out" >&2
+fi
+if ! EVENT_HEAD_SHA="${H}" run_prepare event-same 26; then
+  fail "prepare event-same: the event's own head failed"
+  sed 's/^/    /' "${work}/prepare-event-same/out" >&2
+fi
+if run_pipeline pinned 27; then
+  grep -Fq "acme/tool@${A} # v1.2.0" "${work}/prepare-pinned/temp/pin-check-audit/.github/workflows/pinned.yml" \
+    || fail "prepare pinned: the file was not read at the checked head"
+else
+  fail "prepare pinned: the file was read at the head its contents URL named, not at the checked head"
+  sed 's/^/    /' "${work}/prepare-pinned/"*.out >&2 || true
+fi
+if run_pipeline encoded 28; then
+  [ -f "${work}/prepare-encoded/temp/pin-check-audit/.github/workflows/a b#c.yml" ] \
+    || fail "prepare encoded: the file was not collected under its own name"
+else
+  fail "prepare encoded: a name that needs percent-encoding was not read"
+  sed 's/^/    /' "${work}/prepare-encoded/"*.out >&2 || true
+fi
 if run_prepare push 0; then
   grep -Fxq "AUDIT_TARGET=${work}/prepare-push/workspace" "${work}/prepare-push/env" || fail "prepare push: audit target"
   grep -Fxq "AUDIT_TARGET_EMPTY=false" "${work}/prepare-push/env" || fail "prepare push: AUDIT_TARGET_EMPTY is not false"
@@ -1287,6 +1380,9 @@ grep -Eq '^          add-problem-matchers: false$' "${workflow}" || fail "workfl
 for flag in --offline --no-config --no-ignores --strict-collection; do
   grep -Eq -- "^            ${flag} \\\\$" "${workflow}" || fail "workflow: zizmor must run with ${flag}"
 done
+# shellcheck disable=SC2016 # the expression is matched literally
+grep -Fxq '          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' "${workflow}" \
+  || fail "workflow: the collection step must be given the event's head"
 
 # --- online: this repository's own pins, and one real mismatch
 if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then

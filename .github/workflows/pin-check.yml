@@ -63,6 +63,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          # The commit this run was started for, which its result is reported
+          # on; empty when the caller's event is not a pull request event.
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -86,6 +89,13 @@ jobs:
           head_sha="$(jq -r '.head.sha' <<< "${pull}")"
           if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Unexpected pull request head SHA (base64): $(printf '%s' "${head_sha}" | base64 -w0)" >&2
+            exit 1
+          fi
+          # Every file below is read at head_sha, and the result is reported on
+          # the event's head. When the pull request has moved on since the event,
+          # the new head gets a run of its own.
+          if [ -n "${EVENT_HEAD_SHA:-}" ] && [ "${head_sha}" != "${EVENT_HEAD_SHA}" ]; then
+            echo "The pull request head is no longer the commit this run was started for; the new head's own run checks it." >&2
             exit 1
           fi
 
@@ -114,7 +124,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/files?per_page=100" \
             --jq '
               .[]
-              | [.status, .filename, .contents_url,
+              | [.status, .filename,
                  (.filename | test("[\\r\\n\\t]") or contains("##[")
                    or (split("/") | any(. == "" or . == "." or . == ".." or utf8bytelength > 255)))]
               | @base64
@@ -132,8 +142,7 @@ jobs:
             record="$(printf '%s' "${encoded}" | base64 --decode)"
             status="$(jq -r '.[0]' <<< "${record}")"
             filename="$(jq -r '.[1]' <<< "${record}")"
-            contents_url="$(jq -r '.[2]' <<< "${record}")"
-            unsafe="$(jq -r '.[3]' <<< "${record}")"
+            unsafe="$(jq -r '.[2]' <<< "${record}")"
 
             if [ "${status}" = "removed" ]; then
               continue
@@ -160,12 +169,25 @@ jobs:
 
             destination="${audit_root}/${filename}"
             mkdir -p "$(dirname "${destination}")"
-            gh api "${contents_url}" \
+            # Read at head_sha, the commit whose tree was checked for links,
+            # not at the head the file list happened to be taken from. Each
+            # path segment is percent-encoded; the slashes between them stay.
+            encoded_path="$(jq -rn --arg name "${filename}" '$name | @uri | gsub("%2F"; "/")')"
+            gh api "repos/${GITHUB_REPOSITORY}/contents/${encoded_path}?ref=${head_sha}" \
               --jq 'if .type == "file" and .encoding == "base64" then .content else error("expected base64 file content") end' \
               | tr -d '\n' \
               | base64 --decode > "${destination}"
             count=$((count + 1))
           done < "${manifest}"
+
+          # The file list shows the pull request as it was when it was read. If
+          # the head moved during collection, the list may belong to another
+          # commit than the files; the new head's own run checks it.
+          head_after="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.head.sha')"
+          if [ "${head_after}" != "${head_sha}" ]; then
+            echo "The pull request head moved while its files were collected; the new head's own run checks it." >&2
+            exit 1
+          fi
 
           {
             echo "AUDIT_TARGET=${audit_root}"

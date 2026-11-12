@@ -96,7 +96,10 @@ mappings are refused, because they can hide a `uses:` or change a grant.
 Pull requests use `pull_request_target` and, as `checkout-credentials` does,
 read through GitHub's API instead of checking anything out: the changed workflow
 and action YAML, any unchanged local workflow a changed one calls, and the head
-commit's file list. Pushes check the complete repository.
+commit's file list. Every file is read at the commit the run was started for.
+If the pull request has moved on by then, or moves while its files are
+collected, the run fails and the new head's own run checks it. Pushes check the
+complete repository.
 
 ```yaml
 name: pin-check
@@ -126,6 +129,9 @@ Limits:
 - In pull-request mode only changed files are checked, so a change to a called
   workflow is not compared against callers that did not change. The next push
   to the default branch checks the complete repository.
+- Called with a pull request number from an event that is not a pull request
+  event, such as `workflow_dispatch`, the run has no event head to compare and
+  checks the pull request's head as it finds it.
 - Permissions are compared one call deep; a called workflow's own nested calls
   are not followed.
 - A `docker://` image is checked only for a tag or digest. A local `./`
