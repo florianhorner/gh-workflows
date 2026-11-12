@@ -51,6 +51,10 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.16"
+          # Its Python problem matcher would read the later steps' logs, which
+          # quote the checked files, and turn a matching pair of lines into an
+          # annotation even while workflow commands are switched off.
+          add-problem-matchers: false
 
       # As in checkout-credentials.yml: a pull_request_target caller is loaded
       # from the trusted base branch, and the proposed YAML is read through
@@ -85,11 +89,34 @@ jobs:
             exit 1
           fi
 
+          # A workflow or action file that is a symbolic link loads whatever it
+          # points at, which a pull request can change without touching the
+          # link, so such files are refused. The head commit's tree shows them.
+          tree="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees/${head_sha}?recursive=1")"
+          if [ "$(jq -r '.truncated' <<< "${tree}")" != "false" ]; then
+            echo "The pull request's file tree is too large to list in one response; refusing a partial check." >&2
+            exit 1
+          fi
+          links="$(jq -r '
+            [.tree[]
+             | select(.mode == "120000")
+             | .path
+             | select(test("^\\.github/workflows/[^/]*\\.ya?ml$") or (ascii_downcase | test("(^|/)action\\.ya?ml$")))
+             | @base64]
+            | join(" ")
+          ' <<< "${tree}")"
+          if [ -n "${links}" ]; then
+            echo "Workflow or action files that are symbolic links (base64): ${links}" >&2
+            exit 1
+          fi
+
           gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/files?per_page=100" \
             --jq '
               .[]
-              | [.status, .filename, .contents_url]
+              | [.status, .filename, .contents_url,
+                 (.filename | test("[\\r\\n\\t]") or contains("##[")
+                   or (split("/") | any(. == "" or . == "." or . == ".." or utf8bytelength > 255)))]
               | @base64
             ' > "${manifest}"
 
@@ -106,26 +133,28 @@ jobs:
             status="$(jq -r '.[0]' <<< "${record}")"
             filename="$(jq -r '.[1]' <<< "${record}")"
             contents_url="$(jq -r '.[2]' <<< "${record}")"
+            unsafe="$(jq -r '.[3]' <<< "${record}")"
 
             if [ "${status}" = "removed" ]; then
               continue
             fi
-            # Workflows, plus composite actions wherever they live: zizmor
-            # collects every action.yml, and actions are often kept outside
-            # .github/actions so that other repositories can call them.
-            # The action-file name is matched in any case: a runner on a
-            # case-insensitive file system loads Action.yml as action.yml.
+            # Workflows, plus composite actions wherever they live: actions are
+            # often kept outside .github/actions so that other repositories
+            # can call them. The action-file name is matched in any case: a
+            # runner on a case-insensitive file system loads Action.yml as
+            # action.yml.
             lowered="$(printf '%s' "${filename}" | tr '[:upper:]' '[:lower:]')"
-            if [[ ! "${filename}" =~ ^\.github/workflows/[^/]+\.ya?ml$ \
+            if [[ ! "${filename}" =~ ^\.github/workflows/[^/]*\.ya?ml$ \
               && ! "${lowered}" =~ (^|/)action\.ya?ml$ ]]; then
               continue
             fi
 
-            # The name is shown base64-encoded: raw, a line break or a `##[`
-            # in it would start a workflow command of its own in this log.
-            if [[ "${filename}" == *$'\n'* || "${filename}" == *$'\r'* || "${filename}" == *$'\t'* \
-              || "${filename}" =~ (^|/)\.\.?(/|$) ]]; then
-              echo "Unsafe workflow path returned by GitHub (base64): $(printf '%s' "${filename}" | base64 -w0)" >&2
+            # A name with a control character, `##[`, an empty or dot segment,
+            # or a segment too long to create is refused before any command
+            # handles it, and shown base64-encoded: raw, it could start a
+            # workflow command of its own in this log.
+            if [ "${unsafe}" != "false" ]; then
+              echo "Unsafe workflow path returned by GitHub (base64): $(jq -r '.[1] | @base64' <<< "${record}")" >&2
               exit 1
             fi
 
@@ -162,6 +191,17 @@ jobs:
 
           report="${RUNNER_TEMP}/zizmor-pin-check.json"
           log="${RUNNER_TEMP}/zizmor-pin-check.log"
+
+          # zizmor reads workflows and files named exactly action.yml or
+          # action.yaml, outside paths a .gitignore covers. When nothing to
+          # check is one of those (only an Action.yml, say), it would stop the
+          # job with nothing to read; the next step checks every file instead.
+          if [ -z "$(find "${AUDIT_TARGET}" -name .git -prune -o -type f \( \
+              -path "${AUDIT_TARGET}/.github/workflows/*.yml" -o -path "${AUDIT_TARGET}/.github/workflows/*.yaml" \
+              -o -name action.yml -o -name action.yaml \) -print -quit)" ]; then
+            echo "No file here is one zizmor reads; the next step checks the pins."
+            exit 0
+          fi
 
           # Offline on purpose. zizmor's online rules depend on API calls: one
           # failing call aborts the whole run, and ref-version-mismatch reports
@@ -200,11 +240,14 @@ jobs:
             | select(.ident == "unpinned-uses" and .ignored == false)
             | .locations[]
             | select(.symbolic.kind == "Primary")
-            | "::error file=\((.symbolic.key.Local.verbatim_path // "workflow") | ltrimstr($root) | ltrimstr("./") | prop),line=\((.concrete.location.start_point.row // 0) + 1),title=pin-check unpinned::\((.symbolic.annotation // "action is not pinned to a hash") | data). Pin the full commit SHA and name its tag in a trailing comment."
+            | (.symbolic.annotation // "action is not pinned to a hash") as $what
+            | (if ($what | startswith("image")) then "Pin the image to a tag or a sha256 digest."
+               else "Pin the full commit SHA and name its tag in a trailing comment." end) as $advice
+            | "::error file=\((.symbolic.key.Local.verbatim_path // "workflow") | ltrimstr($root) | ltrimstr("./") | prop),line=\((.concrete.location.start_point.row // 0) + 1),title=pin-check unpinned::\($what | data). \($advice)"
           ' "${report}"
 
           if [ "${count}" -ne 0 ]; then
-            echo "Found ${count} pin(s) that are not a full commit SHA."
+            echo "Found ${count} unpinned reference(s)."
             exit 1
           fi
 
@@ -241,7 +284,7 @@ jobs:
           MERGE_TAG = "tag:yaml.org,2002:merge"
           ACTION_FILES = ("action.yml", "action.yaml")
           USES_LINE = re.compile(
-              r"""^\s*(?:-\s+)?uses:\s*(?:&\S+\s+)?(?P<q>['"]?)(?P<uses>[^'"\s#]+)(?P=q)\s*(?:#\s*(?P<comment>\S+).*)?$"""
+              r"""^\s*(?:-\s+)?(?:&\S+\s+)?uses:\s*(?:&\S+\s+)?(?P<q>['"]?)(?P<uses>[^'"\s#]+)(?P=q)\s*(?:#\s*(?P<comment>\S+).*)?$"""
           )
 
 
@@ -325,7 +368,8 @@ jobs:
 
 
           def comment_problem(repository, sha, comment, tags):
-              """None when the version comment names a tag at the pinned commit, else why not."""
+              """None when the comment names a tag at the pinned commit, or an alias with a release in its
+              line at it; else why not."""
               if not comment:
                   return f"{repository}@{sha} has no version comment naming the tag it was pinned from"
               at_sha = sorted(name for name, commit in tags.items() if commit == sha)
@@ -369,6 +413,15 @@ jobs:
               raise Refused(f"unrecognised reusable workflow reference: {uses!r}")
 
 
+          def construct(node):
+              """The value safe_load would build for one composed node."""
+              loader = yaml.SafeLoader("")
+              try:
+                  return loader.construct_document(node)
+              finally:
+                  loader.dispose()
+
+
           def load_yaml(text, where):
               try:
                   data = yaml.safe_load(text)
@@ -379,16 +432,27 @@ jobs:
               return data
 
 
-          def requested(callee, where):
-              """Highest level per scope that any job of the called workflow asks for; None if all inherit."""
-              top = normalize(callee.get("permissions"), f"{where} (workflow permissions)")
-              wanted = None
-              jobs = callee.get("jobs")
-              if not isinstance(jobs, dict):
+          def requested(text, where):
+              """Highest level per scope that any job of the called workflow asks for; None if all inherit.
+
+              Each job is read from its own YAML node: safe_load would fold job ids such as `yes` and `on`
+              into one key, and keep only the last of a repeated id, dropping what the others ask for.
+              """
+              top = normalize(load_yaml(text, where).get("permissions"), f"{where} (workflow permissions)")
+              try:
+                  jobs = mapping_values(yaml.compose(text, Loader=yaml.SafeLoader), "jobs")
+              except yaml.YAMLError as exc:
+                  raise Refused(f"{where}: invalid YAML ({exc})") from None
+              if len(jobs) != 1 or not isinstance(jobs[0], yaml.MappingNode):
                   raise Refused(f"{where}: jobs is not a mapping")
-              for name, job in jobs.items():
-                  if not isinstance(job, dict):
+              if any(key.tag == MERGE_TAG for key, _ in jobs[0].value):
+                  raise Refused(f"{where}: YAML merge keys are not supported")
+              wanted = None
+              for key, node in jobs[0].value:
+                  name = key.value if isinstance(key, yaml.ScalarNode) else "?"
+                  if not isinstance(node, yaml.MappingNode) or node.tag != "tag:yaml.org,2002:map":
                       raise Refused(f"{where}: job {name!r} is not a mapping")
+                  job = construct(node)
                   effective = normalize(job.get("permissions"), f"{where} job {name!r}")
                   if effective is None:
                       effective = top
@@ -402,13 +466,20 @@ jobs:
 
 
           def shortfalls(wanted, granted):
-              """(what, asked, granted) for every scope the callee asks more of than the caller grants."""
-              if level_of(wanted, ALL) > level_of(granted, ALL):
-                  return [(f"{NAMES[level_of(wanted, ALL)]}-all", level_of(wanted, ALL), level_of(granted, ALL))]
+              """(what, asked, granted) entries that together say what the caller must grant.
+
+              A shorthand the callee asks for (read-all, write-all) that the grant falls short of comes
+              first; after it, every named scope the callee asks more of than that shorthand would give.
+              A list of scopes never counts as a shorthand here.
+              """
+              shorthand = level_of(wanted, ALL) > level_of(granted, ALL)
               found = []
+              if shorthand:
+                  found.append((f"{NAMES[level_of(wanted, ALL)]}-all", level_of(wanted, ALL), level_of(granted, ALL)))
               for scope in sorted(s for s in wanted if s is not ALL):
-                  if level_of(wanted, scope) > level_of(granted, scope):
-                      found.append((scope, level_of(wanted, scope), level_of(granted, scope)))
+                  have = level_of(granted, scope)
+                  if level_of(wanted, scope) > max(have, level_of(wanted, ALL) if shorthand else have):
+                      found.append((scope, level_of(wanted, scope), have))
               return found
 
 
@@ -438,39 +509,29 @@ jobs:
 
 
           def uses_nodes(root):
-              """(uses node, job name) for a reusable-workflow call and (uses node, None) for a step."""
+              """(uses node, job name, job node) for a reusable-workflow call; (uses node, None, None) for a step."""
               found = []
 
               def steps_of(owner):
                   for steps in mapping_values(owner, "steps"):
                       for step in (steps.value if isinstance(steps, yaml.SequenceNode) else []):
-                          found.extend((node, None) for node in mapping_values(plain_mapping(step, "a step"), "uses"))
+                          found.extend((node, None, None) for node in mapping_values(plain_mapping(step, "a step"), "uses"))
 
               for jobs in mapping_values(root, "jobs"):
                   if isinstance(jobs, yaml.MappingNode) and any(key.tag == MERGE_TAG for key, _ in jobs.value):
                       raise Refused(f"YAML merge keys are not supported (line {jobs.start_mark.line + 1})")
                   for key, job in (jobs.value if isinstance(jobs, yaml.MappingNode) else []):
                       name = key.value if isinstance(key, yaml.ScalarNode) else None
-                      found.extend((node, name) for node in mapping_values(plain_mapping(job, "a job"), "uses"))
+                      found.extend((node, name, job) for node in mapping_values(plain_mapping(job, "a job"), "uses"))
                       steps_of(job)
               for runs in mapping_values(root, "runs"):
                   steps_of(runs)
               return found
 
 
-          def job_named(jobs, name):
-              """The job safe_load built for a key whose text is `name`; `yes` or `null` load as True or None."""
-              if name in jobs:
-                  return jobs[name]
-              try:
-                  return jobs.get(yaml.safe_load(name))
-              except (yaml.YAMLError, TypeError):
-                  return None
-
-
           def check_comments(shown, lines, found, tag_cache):
               problems = 0
-              for node, _ in found:
+              for node, _, _ in found:
                   line = node.start_mark.line + 1
                   if not isinstance(node, yaml.ScalarNode):
                       error(shown, line, "uses must be a single string")
@@ -519,26 +580,21 @@ jobs:
           def check_permissions(shown, data, found, root):
               problems = 0
               top = normalize(data.get("permissions"), f"{shown} (workflow permissions)")
-              jobs = data.get("jobs") if isinstance(data.get("jobs"), dict) else {}
-              for node, name in found:
+              for node, name, job_node in found:
                   if name is None or not isinstance(node, yaml.ScalarNode):
                       continue
                   uses, line = node.value.strip(), node.start_mark.line + 1
                   remote = None if uses.startswith("./") else REMOTE.match(uses)
                   if remote and not SHA.match(remote["ref"]):
                       continue  # not a SHA pin: reported above, and not fetched at a moving ref
-                  job = job_named(jobs, name)
-                  if not isinstance(job, dict):
-                      error(shown, line, f"cannot read job {name!r}")
-                      problems += 1
-                      continue
                   try:
+                      job = construct(job_node)  # its own node: safe_load folds `yes` and `on`, and repeated ids
                       granted = normalize(job.get("permissions"), f"{shown} job {name!r}")
                       declared = granted is not None or top is not None
                       if granted is None:
                           granted = top
-                      wanted = requested(load_yaml(callee_text(uses, root), uses), uses)
-                  except (Refused, OSError, UnicodeDecodeError, ValueError) as exc:
+                      wanted = requested(callee_text(uses, root), uses)
+                  except (Refused, OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
                       error(shown, line, f"job {name!r}: {exc}")
                       problems += 1
                       continue
@@ -588,6 +644,11 @@ jobs:
               tag_cache, problems = {}, 0
               for path in workflows + actions:
                   shown = path.relative_to(root).as_posix()
+                  if path.is_symlink():
+                      error(shown, 1, "is a symbolic link; a runner loads whatever it points at, which can change "
+                                      "without touching this file, so linked workflow and action files are refused")
+                      problems += 1
+                      continue
                   text = path.read_text()
                   try:
                       data = load_yaml(text, shown)

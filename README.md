@@ -53,8 +53,10 @@ workflow and composite-action definitions:
 1. The pin is a full commit SHA. zizmor's offline `unpinned-uses` audit checks
    this, and its default policy requires a hash for `actions/*` too. The next
    check requires it again of every reference zizmor lets through, including one
-   zizmor reads as a hash pin whose path the check cannot parse. A reference
-   zizmor cannot parse at all stops the job in zizmor's step.
+   zizmor reads as a hash pin whose path the check cannot parse. zizmor skips
+   files a `.gitignore` covers and action files in other letter cases, and is
+   not run when it would have nothing to read; the next check reads them all. A
+   reference zizmor cannot parse at all stops the job in zizmor's step.
 2. The trailing version comment names a tag of the same repository, and that
    tag is at the pinned commit. When the tag is an alias that has since moved
    (`v4`), a release tag in its line (`v4.x.y`) must still be at the pinned
@@ -65,27 +67,34 @@ workflow and composite-action definitions:
    not grant. GitHub refuses such a run before it starts, with no logs and no
    check run. A job that declares no permissions, in a workflow that declares
    none either, is compared against GitHub's restricted default token
-   (`contents: read`, `packages: read`). In a workflow
-   that runs only on `workflow_call`, such a job passes on whatever its own
-   caller grants, which is not visible here, so it must declare the permissions
-   the called workflow asks for; its caller is then checked one level up.
+   (`contents: read`, `packages: read`). In a workflow that runs only on
+   `workflow_call`, such a job passes on whatever its own caller grants, which
+   is not visible here, so it must declare the permissions the called workflow
+   asks for; its caller is then checked one level up. A called workflow that
+   asks for `read-all` or `write-all` needs that shorthand granted: a list of
+   scopes does not count as one here. Each job is read on its own, so job ids
+   that YAML 1.1 would read as one key (`yes`, `on`, `true`) and repeated ids
+   are each compared.
 
-Tags are listed with `git ls-remote` and called workflows are read through the
-contents API. A lookup that fails fails the check, and so does a `uses:` the
+Tags are listed with `git ls-remote`. A remote called workflow is read through
+the contents API; a local one from the checkout or, in pull-request mode when it
+did not change, at the pull request's head. A lookup that fails fails the check, and so does a `uses:` the
 check cannot read. zizmor's online audits are not used, because one failed API
 call there either aborts the run or, for `ref-version-mismatch`, reports
 nothing; in zizmor 1.28 that audit also reports nothing for a reusable-workflow
 pin. Text from the checked files never reaches the log as a workflow command:
 annotations escape it, zizmor's own log is shown only when zizmor fails and then
 with workflow commands switched off, and an unsafe file name is shown
-base64-encoded. Action files are found in any letter case (`Action.yml`), as a
-runner on a case-insensitive file system would load them. YAML anchors are
-read; YAML merge keys (`<<`) and steps that are not plain mappings are refused,
-because they can hide a `uses:` from the check.
+base64-encoded, and the Python problem matcher that setup-uv would add is left
+off. Action files are found in any letter case (`Action.yml`), as a runner on a
+case-insensitive file system would load them. YAML anchors are read; YAML merge
+keys (`<<`) and steps that are not plain mappings are refused, because they can
+hide a `uses:` from the check.
 
-Pull requests use `pull_request_target` and read only the changed workflow and
-action YAML through GitHub's API, as `checkout-credentials` does. Pushes check
-the complete repository.
+Pull requests use `pull_request_target` and, as `checkout-credentials` does,
+read through GitHub's API instead of checking anything out: the changed workflow
+and action YAML, any unchanged local workflow a changed one calls, and the head
+commit's file list. Pushes check the complete repository.
 
 ```yaml
 name: pin-check
@@ -120,7 +129,14 @@ Limits:
 - A `docker://` image gets only zizmor's check, which fails an image with no
   tag. A local `./` reference gets no SHA or tag check, but a local reusable
   workflow is still compared for permissions.
-- It reads no upstream code. A tagged release can still be malicious.
+- Workflow and action files may not be symbolic links: a runner loads
+  whatever a link points at, which a pull request can change without touching
+  the link. In pull-request mode the head commit's file list is read to find
+  them, and a list too large for one response fails the check.
+- A tab between a pin and its `#` comment fails as invalid YAML (PyYAML rejects
+  it); separate them with spaces.
+- It reviews no upstream code; it reads a called workflow only for the
+  permissions it asks for. A tagged release can still be malicious.
 
 `bash scripts/test-pin-check` runs the workflow's three `run:` steps, extracted
 from the YAML, against fixtures with stand-in `git` and `gh`, plus two online

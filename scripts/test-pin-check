@@ -153,6 +153,7 @@ for repository in tool wf; do
     "${A}" v1.2.0 "${B}" v1.3.0 "${B}" v1 "${T}" v2.0.0 "${D}" 'v2.0.0^{}' "${E}" v3.0.0 "${TEN}" v10.0.0 "${RC}" v1.0.0-rc.1 \
     > "${FAKE_GIT_DIR}/acme/${repository}.tags"
 done
+printf 'zzzz\trefs/tags/v9.9.9\n' >> "${FAKE_GIT_DIR}/acme/tool.tags"
 
 # write_file FIXTURE PATH CONTENTS
 write_file() {
@@ -251,6 +252,13 @@ expect_fail() {
   no_forged_commands "${work}/${fixture}.out"
 }
 
+# expect_also FIXTURE TEXT: the last run of FIXTURE also carries an annotation with TEXT
+expect_also() {
+  if ! grep -F -- '::error ' "${work}/$1.out" | grep -Fq -- "$2"; then
+    fail "$1: no annotation contains: $2"
+  fi
+}
+
 # --- version comments
 step_workflow exact "acme/tool@${A} # v1.2.0"
 expect_pass exact
@@ -287,6 +295,79 @@ expect_fail alias-other-line "tag v1 of acme/tool is at 222222222222, not 777777
 
 step_workflow alias-pre-release "acme/tool@${RC} # v1"
 expect_fail alias-pre-release "tag v1 of acme/tool is at 222222222222, not 888888888888; 888888888888 is tagged v1.0.0-rc.1"
+
+step_workflow malformed-tag-row "acme/tool@${A} # v9.9.9"
+expect_fail malformed-tag-row "the comment names v9.9.9, which is not a tag of acme/tool"
+
+# An anchor may stand before the key on the step line too (it anchors the key).
+write_file anchor-before-key .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - &tool uses: acme/tool@${A} # v1.2.0"
+expect_pass anchor-before-key
+
+write_file set-step .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - !!set {uses: acme/tool@main}"
+expect_fail set-step "is not a plain mapping"
+
+# A .git directory is never read.
+write_file dot-git .git/x/action.yml "name: x
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@v1"
+write_file dot-git .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+expect_pass dot-git
+
+# A linked workflow or action file loads whatever it points at, which can
+# change without touching the link.
+write_file symlink ci/x-action.yaml "name: x
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.2.0"
+mkdir -p "${work}/fixtures/symlink/tools/x"
+ln -s ../../ci/x-action.yaml "${work}/fixtures/symlink/tools/x/action.yml"
+expect_fail symlink "tools/x/action.yml,line=1,title=pin-check::is a symbolic link"
+
+# File names are annotation properties: line breaks are escaped.
+write_file lf-name $'.github/workflows/a\nb.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@v1"
+expect_fail lf-name "::error file=.github/workflows/a%0Ab.yml,line=8,title=pin-check::acme/tool@v1 is not pinned"
+write_file cr-name $'.github/workflows/a\rb.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@v1"
+expect_fail cr-name "::error file=.github/workflows/a%0Db.yml,line=8,title=pin-check::acme/tool@v1 is not pinned"
 
 step_workflow upper-case-wrong "acme/tool@${E_UPPER} # v1.2.0"
 expect_fail upper-case-wrong "tag v1.2.0 of acme/tool is at 111111111111, not abcdefabcdef; abcdefabcdef is tagged v3.0.0"
@@ -627,7 +708,7 @@ reusable_workflow reusable-caller-missing-callee '' '' "acme/wf/.github/workflow
 expect_fail reusable-caller-missing-callee "gh: Not Found (HTTP 404)"
 
 reusable_workflow reusable-and-push '' '' "${lint_pin}" '[workflow_call, push]'
-expect_fail reusable-and-push "job 'lint' declares no permissions"
+expect_fail reusable-and-push "job 'lint' declares no permissions, but ${lint_ref} asks for actions: read. Under the restricted default token"
 
 reusable_workflow local-callee '' '    permissions:
       issues: read' './.github/workflows/callee.yml'
@@ -698,6 +779,92 @@ jobs:
     uses: ${lint_pin}"
 expect_pass job-id-yes
 
+# Job ids that safe_load folds together (yes, on, true) are distinct jobs to
+# GitHub; each is checked against its own grant.
+write_file folded-ids .github/workflows/test.yml "name: test
+on: pull_request
+jobs:
+  yes:
+    permissions: {}
+    uses: ${lint_pin}
+  on:
+    permissions:
+      contents: read
+      actions: read
+    uses: ${lint_pin}"
+expect_fail folded-ids "job 'yes' grants actions: none, but ${lint_ref} asks for actions: read"
+
+write_file repeated-id .github/workflows/test.yml "name: test
+on: pull_request
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: ${lint_pin}
+  lint:
+    permissions: write-all
+    uses: ${lint_pin}"
+expect_fail repeated-id "job 'lint' grants actions: none, but ${lint_ref} asks for actions: read"
+
+contents_response acme/wf .github/workflows/folded.yml "${B}" 'on: workflow_call
+jobs:
+  yes:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  on:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-folded-ids '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/folded.yml@${B} # v1.3.0"
+expect_fail callee-folded-ids "grants contents: read, but acme/wf/.github/workflows/folded.yml@${B} asks for contents: write"
+
+contents_response acme/wf .github/workflows/job-list.yml "${B}" 'on: workflow_call
+jobs:
+  build:
+    - run: true'
+reusable_workflow callee-job-not-mapping '' '    permissions: {}' "acme/wf/.github/workflows/job-list.yml@${B} # v1.3.0"
+expect_fail callee-job-not-mapping "job 'build' is not a mapping"
+
+# A shorthand that falls short comes with every named scope beyond it.
+contents_response acme/wf .github/workflows/mixed.yml "${B}" 'on: workflow_call
+jobs:
+  read:
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  write:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow mixed-shorthand '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/mixed.yml@${B} # v1.3.0"
+expect_fail mixed-shorthand "grants less than read-all, which acme/wf/.github/workflows/mixed.yml@${B} asks for"
+expect_also mixed-shorthand "grants contents: read, but acme/wf/.github/workflows/mixed.yml@${B} asks for contents: write"
+
+# A reusable workflow pinned with an upper-case SHA is read at the lower-case ref.
+contents_response acme/wf .github/workflows/lint.yml "${E}" 'on: workflow_call
+permissions:
+  contents: read
+  actions: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow upper-case-callee '' '    permissions:
+      contents: read
+      actions: read' "acme/wf/.github/workflows/lint.yml@${E_UPPER} # v3.0.0"
+expect_pass upper-case-callee
+
 # A name from YAML cannot start a workflow command of its own.
 contents_response acme/wf .github/workflows/forge.yml "${B}" 'on: workflow_call
 jobs:
@@ -757,7 +924,7 @@ for fixture in tag-pin checkout-tag wf-tag-pin composite-tag; do
   if run_full_sha "${fixture}"; then
     fail "${fixture}: the full-SHA step passed a tag pin"
   elif ! grep -Fq 'title=pin-check unpinned::action is not pinned to a hash' "${work}/${fixture}.full-sha.out" \
-      || ! grep -Fxq 'Found 1 pin(s) that are not a full commit SHA.' "${work}/${fixture}.full-sha.out"; then
+      || ! grep -Fxq 'Found 1 unpinned reference(s).' "${work}/${fixture}.full-sha.out"; then
     fail "${fixture}: the full-SHA step failed without reporting the unpinned uses"
     sed 's/^/    /' "${work}/${fixture}.full-sha.out" >&2
   fi
@@ -811,6 +978,17 @@ if run_full_sha zizmor-fails; then
 elif ! grep -Eq '^::stop-commands::[0-9a-f]{32}$' "${work}/zizmor-fails.full-sha.out"; then
   fail "zizmor-fails: zizmor's log was not fenced off"
 fi
+step_workflow docker-untagged "docker://alpine"
+if run_full_sha docker-untagged; then
+  fail "docker-untagged: the full-SHA step passed an image with no tag"
+elif ! grep -Fq 'Pin the image to a tag or a sha256 digest.' "${work}/docker-untagged.full-sha.out"; then
+  fail "docker-untagged: the advice does not fit an image"
+fi
+if run_full_sha lf-name; then
+  fail "lf-name: the full-SHA step passed a tag pin"
+elif ! grep -Fq '::error file=.github/workflows/a%0Ab.yml,line=8,title=pin-check unpinned::' "${work}/lf-name.full-sha.out"; then
+  fail "lf-name: the file property's line break is not escaped"
+fi
 for fixture in exact fit local-callee composite zizmor-quotes-expression zizmor-quotes-name; do
   if ! run_full_sha "${fixture}"; then
     fail "${fixture}: the full-SHA step failed a SHA or local pin"
@@ -854,6 +1032,43 @@ runs:
   using: composite
   steps:
     - uses: acme/tool@${C} # v1.2.0"
+H2=6666666666666666666666666666666666666662   # a head whose tree links an action file
+H3=6666666666666666666666666666666666666663   # a head whose tree is truncated
+gh_response "repos/acme/repo/git/trees/${H}?recursive=1" '{"truncated":false,"tree":[{"path":"README.md","mode":"100644"}]}'
+gh_response "repos/acme/repo/git/trees/${H2}?recursive=1" \
+  '{"truncated":false,"tree":[{"path":"tools/x/action.yml","mode":"120000"},{"path":"ci/x-action.yaml","mode":"100644"}]}'
+gh_response "repos/acme/repo/git/trees/${H3}?recursive=1" '{"truncated":true,"tree":[]}'
+gh_response "repos/acme/repo/pulls/15" "{\"changed_files\":1,\"head\":{\"sha\":\"${H2}\"}}"
+gh_response "repos/acme/repo/pulls/15/files?per_page=100" "[$(api_file ci/x-action.yaml)]"
+gh_response "repos/acme/repo/pulls/16" "{\"changed_files\":1,\"head\":{\"sha\":\"${H3}\"}}"
+gh_response "repos/acme/repo/pulls/16/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/17" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/17/files?per_page=100" "[$(api_file .github/workflows/.yml)]"
+contents_response acme/repo .github/workflows/.yml "${H}" "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+long_name="tools/$(printf 'A%.0s' $(seq 1 300))/action.yml"
+gh_response "repos/acme/repo/pulls/18" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/18/files?per_page=100" "[$(api_file "${long_name}")]"
+gh_response "repos/acme/repo/pulls/19" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/19/files?per_page=100" "[$(api_file 'tools/x##[warning title=pin-check]Every pin matches its tag/action.yml')]"
+gh_response "repos/acme/repo/pulls/20" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/20/files?per_page=100" "[$(api_file tools/only/Action.yml)]"
+contents_response acme/repo tools/only/Action.yml "${H}" "name: only
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.2.0"
+gh_response "repos/acme/repo/pulls/21" '{"changed_files":1,"head":{"sha":"not-a-sha"}}'
+gh_response "repos/acme/repo/pulls/22" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/22/files?per_page=100" "[$(api_file tools/dir/action.yml)]"
+gh_response "repos/acme/repo/contents/tools/dir/action.yml?ref=${H}" '{"type":"dir"}'
 gh_response "repos/acme/repo/pulls/11" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
 gh_response "repos/acme/repo/pulls/11/files?per_page=100" "[$(api_file 'tools/x\n##[warning file=README.md;line=1;title=pin-check]looks fine/action.yml')]"
 gh_response "repos/acme/repo/pulls/9" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
@@ -948,6 +1163,42 @@ fi
 if run_prepare legacy 11; then
   fail "prepare legacy: a path with a line break was accepted"
 fi
+if run_prepare symlink 15; then
+  fail "prepare symlink: a linked action file was accepted"
+elif ! grep -Fq "Workflow or action files that are symbolic links (base64): $(printf 'tools/x/action.yml' | base64 -w0)" "${work}/prepare-symlink/out"; then
+  fail "prepare symlink: unexpected output"
+fi
+if run_prepare truncated 16; then
+  fail "prepare truncated: a truncated tree was accepted"
+elif ! grep -Fq "too large to list in one response" "${work}/prepare-truncated/out"; then
+  fail "prepare truncated: unexpected output"
+fi
+if run_pipeline dot-yml 17; then
+  fail "prepare dot-yml: the untagged pin in .github/workflows/.yml passed"
+else
+  grep -Fxq "PIN_CHECK_COLLECTED=1" "${work}/prepare-dot-yml/env" || fail "prepare dot-yml: .yml not collected"
+fi
+for case in long:18 command:19; do
+  if run_prepare "${case%%:*}-name" "${case##*:}"; then
+    fail "prepare ${case%%:*}-name: an unsafe name was accepted"
+  elif ! grep -Fq "Unsafe workflow path returned by GitHub (base64)" "${work}/prepare-${case%%:*}-name/out"; then
+    fail "prepare ${case%%:*}-name: unexpected output"
+  fi
+done
+if run_pipeline zizmor-skip 20; then
+  grep -Fq "No file here is one zizmor reads" "${work}/prepare-zizmor-skip/full-sha.out" || fail "prepare zizmor-skip: zizmor was not skipped"
+else
+  fail "prepare zizmor-skip: a correctly pinned Action.yml alone failed"
+  sed 's/^/    /' "${work}/prepare-zizmor-skip/"*.out >&2 || true
+fi
+if run_prepare bad-head 21; then
+  fail "prepare bad-head: a head that is not a SHA was accepted"
+elif ! grep -Fq "Unexpected pull request head SHA (base64)" "${work}/prepare-bad-head/out"; then
+  fail "prepare bad-head: unexpected output"
+fi
+if run_prepare not-a-file 22; then
+  fail "prepare not-a-file: a contents entry that is not a file was accepted"
+fi
 if run_prepare push 0; then
   grep -Fxq "AUDIT_TARGET=${work}/prepare-push/workspace" "${work}/prepare-push/env" || fail "prepare push: audit target"
   grep -Fxq "AUDIT_TARGET_EMPTY=false" "${work}/prepare-push/env" || fail "prepare push: AUDIT_TARGET_EMPTY is not false"
@@ -965,6 +1216,8 @@ if grep -Eq '^    paths(-ignore)?:$' "${caller}"; then
   fail "caller: path filters can skip the gate on oversized diffs"
 fi
 grep -Eq '^        if: inputs\.pull_request_number == 0$' "${workflow}" || fail "workflow: checkout must be push-only"
+# A problem matcher reads a step's log even with workflow commands switched off.
+grep -Eq '^          add-problem-matchers: false$' "${workflow}" || fail "workflow: setup-uv must not add problem matchers"
 for flag in --offline --no-config --no-ignores --strict-collection; do
   grep -Eq -- "^            ${flag} \\\\$" "${workflow}" || fail "workflow: zizmor must run with ${flag}"
 done
