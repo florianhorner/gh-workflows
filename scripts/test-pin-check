@@ -1175,6 +1175,14 @@ jobs:
       - uses: acme/tool@${C} # v1.2.0"
 gh_sequence "repos/acme/repo/pulls/29" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}" 'not json'
 gh_response "repos/acme/repo/pulls/29/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+# The base branch: an event that named another base, and a base retargeted
+# during collection, which changes the file list without moving the head.
+gh_response "repos/acme/repo/pulls/30" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"main\"}}"
+gh_response "repos/acme/repo/pulls/30/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_sequence "repos/acme/repo/pulls/31" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"main\"}}" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"release\"}}"
+gh_response "repos/acme/repo/pulls/31/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
 gh_response "repos/acme/repo/pulls/28" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
 gh_response "repos/acme/repo/pulls/28/files?per_page=100" "[$(api_file '.github/workflows/a b#c.yml')]"
 contents_response acme/repo '.github/workflows/a%20b%23c.yml' "${H}" "name: encoded
@@ -1194,7 +1202,7 @@ run_prepare() {
   local status=0
   GITHUB_ENV="${dir}/env" RUNNER_TEMP="${dir}/temp" GITHUB_WORKSPACE="${dir}/workspace" \
     GITHUB_REPOSITORY=acme/repo PULL_REQUEST_NUMBER="$2" EVENT_HEAD_SHA="${EVENT_HEAD_SHA:-}" \
-    PATH="${fakebin}:${PATH}" \
+    EVENT_BASE_REF="${EVENT_BASE_REF:-}" PATH="${fakebin}:${PATH}" \
     bash --noprofile --norc -eo pipefail "${work}/prepare.sh" > "${dir}/out" 2>&1 || status=$?
   no_forged_commands "${dir}/out"
   return "${status}"
@@ -1325,7 +1333,7 @@ if run_prepare not-a-file 22; then
 fi
 if run_prepare moved 25; then
   fail "prepare moved: a head that moved during collection was accepted"
-elif ! grep -Fq "The pull request head moved while its files were collected" "${work}/prepare-moved/out"; then
+elif ! grep -Fq "moved to another head or base branch while its files were collected" "${work}/prepare-moved/out"; then
   fail "prepare moved: unexpected output"
   sed 's/^/    /' "${work}/prepare-moved/out" >&2
 fi
@@ -1343,6 +1351,22 @@ fi
 if ! EVENT_HEAD_SHA="${H}" run_prepare event-same 26; then
   fail "prepare event-same: the event's own head failed"
   sed 's/^/    /' "${work}/prepare-event-same/out" >&2
+fi
+if EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=release run_prepare base-old 30; then
+  fail "prepare base-old: files listed against another base than the event's were accepted"
+elif ! grep -Fq "no longer targets the base branch this run was started for" "${work}/prepare-base-old/out"; then
+  fail "prepare base-old: unexpected output"
+  sed 's/^/    /' "${work}/prepare-base-old/out" >&2
+fi
+if ! EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=main run_prepare base-same 30; then
+  fail "prepare base-same: the event's own base failed"
+  sed 's/^/    /' "${work}/prepare-base-same/out" >&2
+fi
+if EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=main run_prepare base-moved 31; then
+  fail "prepare base-moved: a base retargeted during collection was accepted"
+elif ! grep -Fq "moved to another head or base branch while its files were collected" "${work}/prepare-base-moved/out"; then
+  fail "prepare base-moved: unexpected output"
+  sed 's/^/    /' "${work}/prepare-base-moved/out" >&2
 fi
 if run_pipeline pinned 27; then
   grep -Fq "acme/tool@${A} # v1.2.0" "${work}/prepare-pinned/temp/pin-check-audit/.github/workflows/pinned.yml" \
@@ -1380,9 +1404,16 @@ grep -Eq '^          add-problem-matchers: false$' "${workflow}" || fail "workfl
 for flag in --offline --no-config --no-ignores --strict-collection; do
   grep -Eq -- "^            ${flag} \\\\$" "${workflow}" || fail "workflow: zizmor must run with ${flag}"
 done
-# shellcheck disable=SC2016 # the expression is matched literally
+# shellcheck disable=SC2016 # the expressions are matched literally
 grep -Fxq '          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' "${workflow}" \
   || fail "workflow: the collection step must be given the event's head"
+# shellcheck disable=SC2016
+grep -Fxq '          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}' "${workflow}" \
+  || fail "workflow: the collection step must be given the event's base branch"
+# A base-branch change sends `edited`; without it the caller keeps a result
+# measured against the old base.
+grep -Fxq '    types: [opened, synchronize, reopened, edited]' "${caller}" \
+  || fail "caller: must run on opened, synchronize, reopened and edited"
 
 # --- online: this repository's own pins, and one real mismatch
 if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then

@@ -8,6 +8,10 @@ name: pin-check-caller
 
 on:
   pull_request_target:
+    # `edited` is what GitHub sends when a pull request's base branch changes;
+    # without it, a check made against one base stays on a pull request that
+    # now targets another.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 

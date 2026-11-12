@@ -96,15 +96,24 @@ mappings are refused, because they can hide a `uses:` or change a grant.
 Pull requests use `pull_request_target` and, as `checkout-credentials` does,
 read through GitHub's API instead of checking anything out: the changed workflow
 and action YAML, any unchanged local workflow a changed one calls, and the head
-commit's file list. Every file is read at the commit the run was started for.
-If the pull request has moved on by then, or moves while its files are
-collected, the run fails and the new head's own run checks it. Pushes check the
-complete repository.
+commit's file list. Every file is read at the commit the run was started for,
+and the changed files are those GitHub lists against the base branch the run was
+started for. If the pull request has another head or base branch by the time
+its files are read, or when collection ends, the run fails without checking; the
+push or edit that changed it starts a run of its own. A change made and undone
+within one collection is not seen, but undoing it starts a run on that same
+commit, which replaces the earlier result. Pushes check the complete
+repository.
+
+List `edited` with the other event types, as below: it is the event GitHub
+sends when a pull request's base branch changes. Without it, a check made
+against one base stays on a pull request that now targets another.
 
 ```yaml
 name: pin-check
 on:
   pull_request_target:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 permissions:
@@ -130,8 +139,8 @@ Limits:
   workflow is not compared against callers that did not change. The next push
   to the default branch checks the complete repository.
 - Called with a pull request number from an event that is not a pull request
-  event, such as `workflow_dispatch`, the run has no event head to compare and
-  checks the pull request's head as it finds it.
+  event, such as `workflow_dispatch`, the run has no event head or base to
+  compare and checks the pull request as it finds it.
 - Permissions are compared one call deep; a called workflow's own nested calls
   are not followed.
 - A `docker://` image is checked only for a tag or digest. A local `./`
