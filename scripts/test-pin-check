@@ -372,6 +372,25 @@ expect_fail cr-name "::error file=.github/workflows/a%0Db.yml,line=8,title=pin-c
 step_workflow upper-case-wrong "acme/tool@${E_UPPER} # v1.2.0"
 expect_fail upper-case-wrong "tag v1.2.0 of acme/tool is at 111111111111, not abcdefabcdef; abcdefabcdef is tagged v3.0.0"
 
+# An image needs a tag or a digest.
+for case in "docker-untagged-check:docker://alpine" "docker-registry-port:docker://localhost:5000/img"; do
+  step_workflow "${case%%:*}" "${case#*:}"
+  expect_fail "${case%%:*}" "${case#*:} names no image tag or digest"
+done
+
+# Merge keys are refused anywhere, not only where a uses could hide.
+write_file merge-permissions .github/workflows/test.yml "name: test
+on: pull_request
+x-grant: &grant
+  contents: read
+  actions: read
+jobs:
+  lint:
+    permissions:
+      <<: *grant
+    uses: acme/wf/.github/workflows/lint.yml@${A} # v1.2.0"
+expect_fail merge-permissions "YAML merge keys are not supported (line 9)"
+
 # Local and docker references are not pins; the check passes over them.
 write_file not-pins .github/workflows/test.yml "name: test
 on: push
@@ -684,7 +703,7 @@ expect_fail callee-write-all "job 'lint' grants less than write-all, which acme/
 # which is not visible here. It must declare what it passes on; declared, it
 # is checked here and its own caller's grant one level up.
 reusable_workflow reusable-caller '' '' "${lint_pin}" workflow_call
-expect_fail reusable-caller "job 'lint' declares no permissions and its workflow runs only on workflow_call"
+expect_fail reusable-caller "job 'lint' declares no permissions and its workflow runs on workflow_call"
 
 reusable_workflow reusable-caller-declared '' '    permissions:
       contents: read
@@ -708,7 +727,7 @@ reusable_workflow reusable-caller-missing-callee '' '' "acme/wf/.github/workflow
 expect_fail reusable-caller-missing-callee "gh: Not Found (HTTP 404)"
 
 reusable_workflow reusable-and-push '' '' "${lint_pin}" '[workflow_call, push]'
-expect_fail reusable-and-push "job 'lint' declares no permissions, but ${lint_ref} asks for actions: read. Under the restricted default token"
+expect_fail reusable-and-push "job 'lint' declares no permissions and its workflow runs on workflow_call"
 
 reusable_workflow local-callee '' '    permissions:
       issues: read' './.github/workflows/callee.yml'
@@ -1065,6 +1084,24 @@ runs:
   using: composite
   steps:
     - uses: acme/tool@${A} # v1.2.0"
+gh_response "repos/acme/repo/pulls/23" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/23/files?per_page=100" "[$(api_file .github/workflows/.yaml)]"
+contents_response acme/repo .github/workflows/.yaml "${H}" "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+gh_response "repos/acme/repo/pulls/24" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/24/files?per_page=100" "[$(api_file tools/img/Action.yml)]"
+contents_response acme/repo tools/img/Action.yml "${H}" "name: img
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: docker://alpine"
 gh_response "repos/acme/repo/pulls/21" '{"changed_files":1,"head":{"sha":"not-a-sha"}}'
 gh_response "repos/acme/repo/pulls/22" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
 gh_response "repos/acme/repo/pulls/22/files?per_page=100" "[$(api_file tools/dir/action.yml)]"
@@ -1186,10 +1223,19 @@ for case in long:18 command:19; do
   fi
 done
 if run_pipeline zizmor-skip 20; then
-  grep -Fq "No file here is one zizmor reads" "${work}/prepare-zizmor-skip/full-sha.out" || fail "prepare zizmor-skip: zizmor was not skipped"
+  grep -Fq "zizmor found no file it reads" "${work}/prepare-zizmor-skip/full-sha.out" || fail "prepare zizmor-skip: zizmor's verdict was not taken as a skip"
 else
   fail "prepare zizmor-skip: a correctly pinned Action.yml alone failed"
   sed 's/^/    /' "${work}/prepare-zizmor-skip/"*.out >&2 || true
+fi
+if ! run_pipeline dot-yaml-ok 23; then
+  fail "prepare dot-yaml-ok: a correctly pinned .github/workflows/.yaml alone failed"
+  sed 's/^/    /' "${work}/prepare-dot-yaml-ok/"*.out >&2 || true
+fi
+if run_pipeline image-only 24; then
+  fail "prepare image-only: an untagged image in an Action.yml passed"
+elif ! grep -Fq "docker://alpine names no image tag or digest" "${work}/prepare-image-only/check.out"; then
+  fail "prepare image-only: unexpected output"
 fi
 if run_prepare bad-head 21; then
   fail "prepare bad-head: a head that is not a SHA was accepted"

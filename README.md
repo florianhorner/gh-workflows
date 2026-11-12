@@ -54,9 +54,11 @@ workflow and composite-action definitions:
    this, and its default policy requires a hash for `actions/*` too. The next
    check requires it again of every reference zizmor lets through, including one
    zizmor reads as a hash pin whose path the check cannot parse. zizmor skips
-   files a `.gitignore` covers and action files in other letter cases, and is
-   not run when it would have nothing to read; the next check reads them all. A
-   reference zizmor cannot parse at all stops the job in zizmor's step.
+   files a `.gitignore` covers, action files in other letter cases and some file
+   names, and its step passes when it finds nothing to read; the next check reads
+   them all. A
+   reference zizmor cannot parse at all stops the job in zizmor's step. A
+   `docker://` image needs a tag or a digest in both checks.
 2. The trailing version comment names a tag of the same repository, and that
    tag is at the pinned commit. When the tag is an alias that has since moved
    (`v4`), a release tag in its line (`v4.x.y`) must still be at the pinned
@@ -67,10 +69,11 @@ workflow and composite-action definitions:
    not grant. GitHub refuses such a run before it starts, with no logs and no
    check run. A job that declares no permissions, in a workflow that declares
    none either, is compared against GitHub's restricted default token
-   (`contents: read`, `packages: read`). In a workflow that runs only on
-   `workflow_call`, such a job passes on whatever its own caller grants, which
-   is not visible here, so it must declare the permissions the called workflow
-   asks for; its caller is then checked one level up. A called workflow that
+   (`contents: read`, `packages: read`). In a workflow that runs on
+   `workflow_call`, with or without other triggers, such a job passes on
+   whatever its own caller grants, which is not visible here, so it must declare
+   the permissions the called workflow asks for; its caller is then checked one
+   level up. A called workflow that
    asks for `read-all` or `write-all` needs that shorthand granted: a list of
    scopes does not count as one here. Each job is read on its own, so job ids
    that YAML 1.1 would read as one key (`yes`, `on`, `true`) and repeated ids
@@ -88,8 +91,8 @@ with workflow commands switched off, and an unsafe file name is shown
 base64-encoded, and the Python problem matcher that setup-uv would add is left
 off. Action files are found in any letter case (`Action.yml`), as a runner on a
 case-insensitive file system would load them. YAML anchors are read; YAML merge
-keys (`<<`) and steps that are not plain mappings are refused, because they can
-hide a `uses:` from the check.
+keys (`<<`), anywhere in a checked or called file, and steps that are not plain
+mappings are refused, because they can hide a `uses:` or change a grant.
 
 Pull requests use `pull_request_target` and, as `checkout-credentials` does,
 read through GitHub's API instead of checking anything out: the changed workflow
@@ -126,9 +129,11 @@ Limits:
   to the default branch checks the complete repository.
 - Permissions are compared one call deep; a called workflow's own nested calls
   are not followed.
-- A `docker://` image gets only zizmor's check, which fails an image with no
-  tag. A local `./` reference gets no SHA or tag check, but a local reusable
-  workflow is still compared for permissions.
+- A `docker://` image is checked only for a tag or digest. A local `./`
+  reference gets no SHA or tag check, but a local reusable workflow is still
+  compared for permissions.
+- Action files inside git submodules are not checked: neither mode checks out
+  submodules.
 - Workflow and action files may not be symbolic links: a runner loads
   whatever a link points at, which a pull request can change without touching
   the link. In pull-request mode the head commit's file list is read to find

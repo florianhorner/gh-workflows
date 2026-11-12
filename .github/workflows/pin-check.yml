@@ -192,16 +192,6 @@ jobs:
           report="${RUNNER_TEMP}/zizmor-pin-check.json"
           log="${RUNNER_TEMP}/zizmor-pin-check.log"
 
-          # zizmor reads workflows and files named exactly action.yml or
-          # action.yaml, outside paths a .gitignore covers. When nothing to
-          # check is one of those (only an Action.yml, say), it would stop the
-          # job with nothing to read; the next step checks every file instead.
-          if [ -z "$(find "${AUDIT_TARGET}" -name .git -prune -o -type f \( \
-              -path "${AUDIT_TARGET}/.github/workflows/*.yml" -o -path "${AUDIT_TARGET}/.github/workflows/*.yaml" \
-              -o -name action.yml -o -name action.yaml \) -print -quit)" ]; then
-            echo "No file here is one zizmor reads; the next step checks the pins."
-            exit 0
-          fi
 
           # Offline on purpose. zizmor's online rules depend on API calls: one
           # failing call aborts the whole run, and ref-version-mismatch reports
@@ -221,6 +211,14 @@ jobs:
             --no-exit-codes \
             --format=json-v1 \
             "${AUDIT_TARGET}" > "${report}" 2> "${log}"; then
+            # zizmor skips some files the next step reads (an Action.yml, a
+            # workflow named .yml, paths a .gitignore covers). When those are
+            # all there is, it stops with nothing to read; the next step, which
+            # requires full SHAs too, then checks them.
+            if sed 's/\x1b\[[0-9;]*m//g' "${log}" | grep -qx 'error: no inputs collected'; then
+              echo "zizmor found no file it reads; the next step checks the pins."
+              exit 0
+            fi
             token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::error title=pin-check unpinned::zizmor could not read the checked files; its log follows, with workflow commands switched off."
             echo "::stop-commands::${token}"
@@ -413,6 +411,23 @@ jobs:
               raise Refused(f"unrecognised reusable workflow reference: {uses!r}")
 
 
+          def refuse_merge_keys(node, where):
+              """safe_load applies a merge key (`<<`) wherever it stands; GitHub does not, so none is read."""
+              stack, seen = [node], set()
+              while stack:
+                  current = stack.pop()
+                  if id(current) in seen:
+                      continue
+                  seen.add(id(current))
+                  if isinstance(current, yaml.MappingNode):
+                      for key, value in current.value:
+                          if key.tag == MERGE_TAG:
+                              raise Refused(f"{where}: YAML merge keys are not supported (line {key.start_mark.line + 1})")
+                          stack.extend((key, value))
+                  elif isinstance(current, yaml.SequenceNode):
+                      stack.extend(current.value)
+
+
           def construct(node):
               """The value safe_load would build for one composed node."""
               loader = yaml.SafeLoader("")
@@ -440,9 +455,11 @@ jobs:
               """
               top = normalize(load_yaml(text, where).get("permissions"), f"{where} (workflow permissions)")
               try:
-                  jobs = mapping_values(yaml.compose(text, Loader=yaml.SafeLoader), "jobs")
+                  document = yaml.compose(text, Loader=yaml.SafeLoader)
               except yaml.YAMLError as exc:
                   raise Refused(f"{where}: invalid YAML ({exc})") from None
+              refuse_merge_keys(document, where)
+              jobs = mapping_values(document, "jobs")
               if len(jobs) != 1 or not isinstance(jobs[0], yaml.MappingNode):
                   raise Refused(f"{where}: jobs is not a mapping")
               if any(key.tag == MERGE_TAG for key, _ in jobs[0].value):
@@ -538,7 +555,13 @@ jobs:
                       problems += 1
                       continue
                   uses = node.value.strip()
-                  if uses.startswith("docker://") or (uses.startswith("./") and "@" not in uses):
+                  if uses.startswith("docker://"):
+                      # zizmor checks images too, but not in files it does not read.
+                      if ":" not in uses[len("docker://"):].rsplit("/", 1)[-1]:
+                          error(shown, line, f"{uses} names no image tag or digest")
+                          problems += 1
+                      continue
+                  if uses.startswith("./") and "@" not in uses:
                       continue
                   try:
                       remote = None if uses.startswith("./") else parse_remote(uses)
@@ -600,14 +623,14 @@ jobs:
                       continue
                   if wanted is None or not any(level > 0 for level in wanted.values()):
                       continue
-                  if not declared and triggers(data) == {"workflow_call"}:
-                      # The job passes on whatever its own caller grants, which is not visible here.
-                      # Declared, the grant is checked here, and the caller's grant one level up.
+                  if not declared and "workflow_call" in triggers(data):
+                      # Called, the job passes on whatever its own caller grants, which is not visible
+                      # here. Declared, the grant is checked here, and the caller's grant one level up.
                       asks = ", ".join(f"{scope}: {NAMES[level]}" for scope, level in sorted(
                           (s, v) for s, v in wanted.items() if s is not ALL and v > 0))
                       if level_of(wanted, ALL) > 0:
                           asks = f"{NAMES[level_of(wanted, ALL)]}-all"
-                      error(shown, line, f"job {name!r} declares no permissions and its workflow runs only on "
+                      error(shown, line, f"job {name!r} declares no permissions and its workflow runs on "
                                          f"workflow_call, so the grant it inherits cannot be compared with what "
                                          f"{uses} asks for ({asks}). Declare those permissions on the job.")
                       problems += 1
@@ -652,7 +675,9 @@ jobs:
                   text = path.read_text()
                   try:
                       data = load_yaml(text, shown)
-                      found = uses_nodes(yaml.compose(text, Loader=yaml.SafeLoader))
+                      document = yaml.compose(text, Loader=yaml.SafeLoader)
+                      refuse_merge_keys(document, shown)
+                      found = uses_nodes(document)
                   except (Refused, yaml.YAMLError) as exc:
                       error(shown, 1, str(exc))
                       problems += 1
