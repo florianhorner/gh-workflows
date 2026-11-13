@@ -206,10 +206,11 @@ and run lookups and reusable-workflow ref resolution need `actions: read`.
 GitHub rejects a called workflow that requests more access than its caller
 allows.
 
-Pin `uses:` to a full 40-character commit SHA, with an optional version comment.
-Tags can move and change executed code without a caller diff. Dependabot's
-`github-actions` ecosystem can update the SHA and version comment. The workflow
-resolves its script checkout to the ref the caller pinned.
+Pin `uses:` to a full 40-character commit SHA with a version comment that names
+its tag, such as `# v1.6`; `pin-check` fails a pin without one. Tags can move
+and change executed code without a caller diff. Dependabot's `github-actions`
+ecosystem can update the SHA and version comment. The workflow resolves its
+script checkout to the ref the caller pinned.
 
 ### Proof syntax
 
