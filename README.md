@@ -2,22 +2,23 @@
 
 Reusable GitHub Actions workflows for `florianhorner/*` repositories.
 
-## `checkout-credentials` — focused checkout-token audit
+## `checkout-credentials`: audit checkout tokens
 
-This reusable workflow runs zizmor's offline `artipacked` audit over a caller's
-workflow and composite-action definitions. It fails when `actions/checkout`
-implicitly persists credentials and points to the exact file and line. Explicit
-`persist-credentials: true` remains an intentional opt-in; all other checkout
-steps should set it to `false`.
+The workflow runs zizmor's offline `artipacked` audit on workflows and
+composite actions. It reports the file and line when
+`actions/checkout` implicitly persists credentials. Set
+`persist-credentials: false` unless a later Git operation needs the token.
+Set it to `true` explicitly to persist credentials.
 
-Pull requests use `pull_request_target`, so GitHub loads the caller from the
-trusted base branch. The reusable workflow downloads only changed workflow and
-composite-action YAML through GitHub's API and never checks out or executes pull
-request code. Pushes still scan the complete checked-out repository.
+Pull requests use `pull_request_target` to load the caller from the trusted
+base branch. The audit downloads changed workflow and composite-action YAML
+through GitHub's API without checking out or executing pull request code.
+Pushes scan the complete checkout. Only `artipacked` findings fail this audit;
+other zizmor rules are outside its policy.
 
-Add a SHA-pinned caller. Do not add trigger-level path filters: GitHub evaluates
-only a bounded changed-file list for filtered events, while this security gate
-must run and fail closed even for oversized pull requests.
+Add a SHA-pinned caller without trigger-level path filters. GitHub evaluates a
+bounded changed-file list for filtered events, so filters can skip the audit
+on oversized pull requests.
 
 ```yaml
 name: checkout-credentials
@@ -39,11 +40,11 @@ jobs:
     uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha> # <tag>
 ```
 
-The workflow deliberately filters out every other zizmor rule. Broader GitHub
-Actions hardening belongs in a separately reviewed policy, so adopting this
-guard cannot unexpectedly expose unrelated legacy findings.
+`pull_request_number` defaults to `0`, which selects the complete checkout.
+For a PR, the audit checks the returned file count against the PR's
+changed-file count and refuses a partial result.
 
-## `pin-check` — action and reusable-workflow pins
+## `pin-check`: check action and reusable-workflow pins
 
 A dependency bot's pin bump rewrites a SHA and its version comment and nothing
 else, so nobody reads upstream code in that change. This reusable workflow
@@ -164,98 +165,25 @@ from the YAML, against fixtures with stand-in `git` and `gh`, plus two online
 cases against github.com (`PIN_CHECK_OFFLINE=1` skips them). `workflow-lint.yml`
 runs it on every change to workflows or scripts.
 
-## `verify-claims` — PR Proof Block Enforcement
+## `verify-claims`: validate PR proof blocks
 
-Every PR body must end with a `## Proof` block listing artifacts for each claim. This workflow validates that block server-side and blocks merge if it's missing or malformed.
+Include a `## Proof` section in each PR body. The workflow renders the body
+through GitHub's Markdown API and validates the returned HTML. Rendering
+failures fail the check. Configure it as a required status check to block
+merges with missing or malformed proof.
 
-### What it checks
+Draft PRs and PRs authored by `dependabot[bot]`, `pre-commit-ci[bot]` or
+`github-actions[bot]` are exempt.
 
-| Rule | Detail |
-|------|--------|
-| Rendered, not parsed | The body is rendered through GitHub's Markdown API (`POST /markdown`, the renderer behind the PR page) and the returned HTML is what gets validated. Whatever GitHub hides (code blocks, comments, escaped HTML) supplies no evidence; whatever it shows is validated. If the body cannot be rendered, the check fails |
-| Block present | The section opens at the first heading that reads as "Proof" — any level, any case, letters only, invisible characters dropped, Cyrillic and Greek lookalike letters mapped — and that heading must be a level-2 heading reading exactly `Proof` (`## Proof`, setext, inside a list or quote are all fine). A lookalike (`### Proof`, `## Proof:`, a soft hyphen or combining joiner inside the word, `Ргооf` in Cyrillic) is an error. A heading reads as Proof by its whole text, including text inside markup a proof line may not carry (`## <ins>Proof</ins>`). Every recognised Proof heading, whether it opens the section or appears later, must sit in the body itself, a list item, a quote, an alert or a table, or inside visible formatting (`<b>`, `<em>`, a link and the like, which an unclosed tag earlier in the body wraps around everything after it), with at most one `<code>`, `<tt>` or `<pre>` around it because GitHub draws each level smaller. Any other element around it is an error: `<details>` (nested or initially open too), ruby, `<template>`, `<sup>`, `<sub>`, `<small>`, `<del>`, `<s>`, `<span>`, a footnote and the rest. Collapsible notes without a Proof heading remain allowed |
-| Every box is a proof line | Every checkbox after that heading is a proof line, whatever list marker or nesting produced it, including boxes under a second `Proof` heading or in footnotes. Each must read `key: value` with a key that has no spaces; a box that does not is an error, never skipped |
-| Values as displayed | A line's value is its text as GitHub displays it. Markdown can change a file path: `scripts/__tests__/x.ts` displays as `scripts/tests/x.ts` with "tests" in bold. Put paths in backticks |
-| Plain proof lines | A proof line may contain only text, links, code (including the `<tt>` GitHub uses for a linked commit SHA), emphasis, emoji and footnote references. Any other markup GitHub keeps can hide, shrink, strike through or overlay part of the line — `<details>`, ruby, `~~…~~`, nested `<sup>`/`<sub>` — and is an error, as are invisible and text-direction characters. The rule lists what is allowed, not what is banned |
-| Checked boxes have real artifacts | `https://` URL, test name, or repo-relative file path. `n/a` on a checked box is an error |
-| Unchecked boxes | Either `n/a` with a non-empty reason after `—`, `–` or `-` (spacing optional), or a real artifact, which is then validated like a checked one |
-| CI run URLs | Must resolve to `conclusion=success` **and** describe the PR head's content (see below), and must have run in the PR's own repository, the one it merges into, as the API reports it: a run anywhere else is an error, even a green one on the same commit, and so is one in a fork PR's head repository, whose workflows the PR author controls. An old URL of a renamed repository still counts. The URL is canonicalised before matching: host case-insensitive, `www.` stripped, path percent-decoded, doubled slashes collapsed, and trailing autolink punctuation (`?!.,:;*_~)]`) ignored. In a value that starts with a URL (or a bare `www.` address) that URL is the artifact and the rest is a note, so `…/runs/1 (head abc, success)` is run 1; any run in the note is still looked up, even one joined to another URL by a comma, while a plain link or check page there is context. A link whose address cannot be parsed is an error. A check-run page (`/o/r/runs/<job>`, `/o/r/commit/<sha>/checks`) is an error: nothing here can look one up, so cite the Actions run. Every link to a run anywhere in the Proof section is looked up by its target: on a proof line or off one (nested bullets, paragraphs, tables, footnotes), written as `[CI run](…)`, a reference link, `<…>` or a relative href (`/o/r/actions/runs/1`, `../actions/runs/1`), which is resolved the way the PR page resolves it. Links on an unchecked `n/a` line are context for the reason and are not looked up. A run cited several times is fetched once and reported under every line that cites it |
-| Malformed run URLs | A run-shaped path whose id is not readable as digits, or whose host is not `github.com`, or which carries a non-default port, is an **error** — never a generic artifact |
-| Artifact URL scheme | `http://` is rejected |
-| File paths | Resolved **only** against `GITHUB_WORKSPACE`, via `realpath`, and confined to it — absolute paths, `../` traversal and symlinks pointing out are rejected, and the process cwd is never consulted. Must name a **file**, not a directory. Existence is not enough: when the workspace is a git checkout the path must be **tracked**, and so must the file a committed symlink points at, which is what excludes the nested `_gh_workflows/` checkout and its `node_modules`. If `.git` is present but git cannot be queried (`safe.directory`, dubious ownership) the check fails **closed** and says why |
-| Line endings | CRLF bodies (anything authored or edited in the GitHub web UI) render identically to LF |
-| Cross-owner PRs | `runtime: n/a` forbidden when head repo not in `owned_repos` |
-| Inline `[proof: key]` tokens | Every token in the rendered text must match a proof line key; `proof:` is read in any case and with any spacing (`[Proof: x]`, `[ proof : x ]`). Code examples (backtick spans, fenced and indented blocks) are excluded; a raw `<code>` wrapped around Markdown blocks renders as prose and is checked. Comments and HTML attributes are never rendered text |
-| Draft PRs | Exempt |
-| Bot authors | `dependabot[bot]`, `pre-commit-ci[bot]`, `github-actions[bot]` exempt |
+### Caller workflow
 
-### A cited CI run and the PR head
+Add `.github/workflows/verify-claims.yml` to the consuming repository:
 
-A run is accepted when its `head_sha` **is** the PR head, or when the PR head is
-that commit with base integrations on top and no content of its own. Git's own
-three-way merge of the run's commit with the integrated parent must produce
-exactly the head's tree, and that parent must be a state the PR's base branch
-has actually been in — a commit on its first-parent chain. Repeated integrations
-are fine; the head itself has to be the merge commit, so a commit pushed after
-the merge invalidates the block again.
-
-This exists because two rules were in direct conflict. Branch protection that
-requires a branch to be up to date means landing any PR forces every other open
-PR to integrate the base, which writes a new head SHA. Under strict SHA equality
-that invalidated a proof block the author never touched, and the only remedy was
-to wait a full CI cycle on the new head and repoint the URLs by hand. Measured
-across 1003 verifications on one repo: half of all branches burned at least one
-proof block, and a PR with a sibling landing while it was open burned 2.8x as
-many as one without.
-
-Anchoring the merged-in parent to the base branch is the condition that makes
-the rest safe, and it is worth being explicit about why. Without it the check
-only asks whether the head is a merge of the run's commit with *something*, and
-the author chooses the something: `git merge any-branch` satisfies every other
-condition by construction, so a head carrying code no run ever saw would be
-reported as proven.
-
-Reachability is not a strong enough anchor either, which cost a second round to
-learn. A base branch built from merged pull requests *reaches* every commit of
-every merged branch, including work-in-progress states it was never at, so
-`git merge some-previously-merged-branch` would have passed. The anchor is
-membership of the base branch's first-parent chain: the states the branch has
-actually been in.
-
-Still refused, each with its reason named in the message: content changed after
-the run, a conflicted or hand-resolved merge, an evil merge, `-s ours`, an
-octopus merge, a rebase, a run from an unrelated branch, a merge of anything the
-base branch was never at (including a branch it merely reaches), a base ref that
-resolves only as a tag, a run whose commit the base already contained (which
-would make the comparison vacuous), and any state git cannot adjudicate — a
-shallow clone, a missing object, an unreadable first-parent chain, a
-`merge-tree` too old to answer. Every one of those fails closed.
-
-The predicate is `scripts/clean-integrate-witness.ts`. It reads the head's
-ancestry with git, so the reusable workflow checks the PR head out with full
-history and passes the base ref on your behalf; callers need no change. That
-deep fetch is only paid when the body cites a CI run at all — on a large repo it
-is the expensive part of the job, and a body with no run URL never asks git
-about history. (A file-path proof line asks git only whether the file is
-tracked, which a shallow checkout can answer.)
-
-### Proof block template (own-repo PR)
-
-```markdown
-## Proof
-
-- [x] build: <ci-run-url> [proof: build]
-- [x] tests: <ci-run-url> OR TestFunctionName [proof: tests]
-- [x] lint: <ci-run-url> [proof: lint]
-- [ ] runtime: <artifact-url> OR "n/a — <reason>" [proof: runtime]
-- [ ] schema: "n/a — no MQTT or HA interface changes" OR <diff-url> [proof: schema]
-```
-
-For **cross-owner / upstream PRs**, `runtime:` must be checked with a real artifact — `n/a` is not accepted.
-
-### Caller workflow (5-line setup per repo)
-
-Add `.github/workflows/verify-claims.yml` to your repo:
+The example pins `v1.6`
+([`6b69633101c7086ed53dbfc12233f26a782a1632`](https://github.com/florianhorner/gh-workflows/commit/6b69633101c7086ed53dbfc12233f26a782a1632)),
+the first release with GitHub-rendered validation and the clean-integration
+witness. `v1.5` and earlier tags lack both features and do not provide the
+validation described below; do not substitute `v1.5`.
 
 ```yaml
 name: verify-claims
@@ -267,446 +195,353 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@fde64f42deb15511c2c71cb9798c2d6685379e38 # v1.5
+    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@6b69633101c7086ed53dbfc12233f26a782a1632 # v1.6
     with:
       owned_repos: "florianhorner/govee2mqtt,florianhorner/mammamiradio"
 ```
 
-That's it. The reusable workflow handles checkout, Bun setup, and parser execution.
-Keep the `permissions:` block: the reusable workflow needs `actions: read` to look
-up cited runs, and a called workflow cannot raise its caller's token. Under a
-restricted default token the run is refused before it starts.
+The workflow checks out the code, installs Bun and runs the parser. Keep both
+permissions: checkouts and private-resource rendering need `contents: read`,
+and run lookups and reusable-workflow ref resolution need `actions: read`.
+GitHub rejects a called workflow that requests more access than its caller
+allows.
 
-### Pin to a SHA, not a tag
+Pin `uses:` to a full 40-character commit SHA with a version comment that names
+its tag, such as `# v1.6`; `pin-check` fails a pin without one. Tags can move
+and change executed code without a caller diff. Dependabot's `github-actions`
+ecosystem can update the SHA and version comment. The workflow resolves its
+script checkout to the ref the caller pinned.
 
-Pin the `uses:` line to a full 40-character commit SHA with the version in a trailing
-comment, as above. Dependabot updates both halves — add the `github-actions` ecosystem to
-`.github/dependabot.yml` and bumps arrive as reviewable PRs.
+### Proof syntax
 
-A tag is mutable: anyone who gains write access to this repo can move `v1` or `v1.3` to
-different code, and every consumer picks it up on its next run with no diff in their own
-repository. That is exactly how `tj-actions/changed-files` (CVE-2025-30066) and
-`aquasecurity/trivy-action` were exploited. A SHA cannot be moved.
+Choose one alternative per line and remove `OR` with the unused alternative.
+Replace each placeholder with an artifact or a reason for `n/a`:
 
-Earlier revisions of this README recommended `@v1`. That is no longer advised — it gives the
-consumer no audit trail when the code underneath changes.
+```markdown
+## Proof
 
-### Accepted artifact types for `runtime:`
+- [x] build: <ci-run-url> [proof: build]
+- [x] tests: <ci-run-url> OR TestFunctionName [proof: tests]
+- [x] lint: <ci-run-url> [proof: lint]
+- [ ] runtime: <artifact-url> OR n/a — <reason> [proof: runtime]
+- [ ] schema: n/a — no MQTT or HA interface changes OR <diff-url> [proof: schema]
+```
 
-- GitHub Actions run URL (`https://github.com/{owner}/{repo}/actions/runs/{id}`)
-- Gist URL with timestamped log
-- Release asset URL
-- A repository-relative file committed to the PR branch (a `proof/` directory is the convention, not a requirement)
-- Screenshot URL (for UI/HA dashboard changes)
+| Item | Requirement |
+|------|-------------|
+| Heading | The first recognised Proof heading must be level 2 and read exactly `Proof` |
+| Checkbox | Every checkbox after the heading must read `key: value`; keys cannot contain spaces |
+| Checked value | An artifact such as an HTTPS URL, test name or repository-relative file path; `n/a` is rejected |
+| Unchecked value | A validated artifact, or `n/a` followed by a non-empty reason after `—`, `–` or `-` |
+| Cross-owner runtime | `runtime: n/a` is rejected when the head repository is absent from `owned_repos` |
+| Inline claim | Each rendered `[proof: key]` token must match a proof-line key |
 
-All URL forms must be `https://`. File paths must be repository-relative and
-**committed** — they are resolved against the PR checkout (`GITHUB_WORKSPACE`)
-and checked against `git ls-files`, so an uncommitted file sitting in the
-checkout is an error, as is a path that escapes it.
+The validator reads values as GitHub displays them. Backtick file paths:
+Markdown can turn `scripts/__tests__/x.ts` into `scripts/tests/x.ts` with bold
+text. CRLF and LF bodies render the same way.
 
-### Running the parser locally
+The validator checks every task-list checkbox in the section, including nested bullets,
+numbered lists, boxes beneath another Proof heading and footnotes. A value may
+continue on the next line. Malformed boxes are errors. The key is the text
+before the first `: ` in the list item's displayed text, with nested lists
+excluded and whitespace collapsed.
+
+Proof lines may contain text, links, code, emphasis, emoji and footnote
+references, including GitHub's `<tt>` markup for linked commits. Other markup,
+invisible characters and text-direction characters are rejected. Elements such
+as `<details>`, ruby and nested `<sup>` or `<sub>` can hide or distort an artifact
+and are rejected.
+
+Heading recognition folds compatibility forms, drops default-ignorable
+characters and maps a short table of Cyrillic and Greek lookalikes. Case,
+punctuation and heading level are then checked. Headings such as `### Proof`,
+`## Proof:` or Cyrillic `Ргооf` are errors. Recognition uses the whole text,
+including text inside markup such as `<ins>`.
+
+Every recognised Proof heading must sit within the body, lists,
+quotes, alerts, tables, divs or visible formatting (`a`, `b`, `em`, `i`,
+`strong`, `tt`, `u`), with at most one `code`, `tt` or `pre` ancestor. Other
+containers are rejected, including `<details>` even when open, ruby,
+`<template>`, `<sup>`, `<sub>`, `<small>`, `<del>`, `<s>`, `<span>` and
+footnotes. Collapsible notes without a Proof heading remain allowed.
+
+Inline claim tokens accept case and spacing variants such as `[Proof: x]` and
+`[ proof : x ]`. Code examples, comments and HTML attributes do not supply
+claims. A raw `<code>` around Markdown blocks still renders as prose and is
+checked. The HTML walk uses `parse5` and iterative traversal for deeply nested
+bodies.
+
+### CI run artifacts
+
+A cited Actions run must have `conclusion=success`. The API must identify its
+repository as the PR's base repository, and the run must describe the PR head's
+content. A run
+from another repository is rejected even on the same commit. A fork PR's head
+repository does not qualify; an old URL for a renamed base repository can.
+
+The validator checks run links throughout the Proof section, including paragraphs,
+nested bullets, tables and footnotes. Markdown links, reference links,
+autolinks and relative hrefs are resolved by target. A repeated run is fetched
+once and reported for every line that cites it. Run links on an unchecked
+`n/a` line are context for its reason and are not looked up.
+
+URL matching ignores host case and `www.`, percent-decodes paths, collapses
+doubled slashes and removes trailing autolink punctuation (`?!.,:;*_~)]`). A
+URL at the start of a value supplies the artifact; following text is a note. Runs in
+that note are still checked, including comma-joined URLs. A plain link or
+check page in the note remains context. A decoded `#` in an owner or repository
+name cannot retarget a run lookup.
+
+Use `https://github.com/{owner}/{repo}/actions/runs/{id}`. A run-shaped URL with
+an ID that is not digits, a different host or a non-default port is an error.
+Malformed link targets and check-run pages such as `/o/r/runs/<job>` or
+`/o/r/commit/<sha>/checks` are rejected. Artifact URLs must use HTTPS.
+
+A run describes the PR head when its `head_sha` equals that head, or when the
+head contains only clean base integrations since the run. Git's three-way
+merge of the run commit and integrated parent must reproduce the head tree
+exactly. The integrated parent must be on the base branch's first-parent
+chain. Reachability alone would admit intermediate feature-branch states
+that the base branch never held.
+
+Repeated base integrations are allowed, but the head must remain the merge
+commit. A later content commit, hand-resolved conflict, extra content in the
+merge, `-s ours`, octopus merge, rebase or unrelated run fails this test. So
+does a run already contained by the base, a base ref resolving only as a tag,
+missing objects, shallow history, an unreadable first-parent chain or an
+unavailable `merge-tree`. Failures report why the run is stale.
+
+`scripts/clean-integrate-witness.ts` implements this predicate. The workflow
+fetches full PR history only when the body cites a CI run and passes
+`PR_BASE_REF` to anchor the integrated parent. Checking whether a file is
+tracked needs only a shallow checkout.
+
+### Other artifacts and file paths
+
+Runtime artifacts may be Actions run URLs, timestamped Gist logs, release
+assets, screenshot URLs or committed repository-relative files. A `proof/`
+directory is a convention, not a requirement.
+
+File paths resolve only against `GITHUB_WORKSPACE`, through `realpath`.
+Absolute paths, traversal outside the checkout, escaping symlinks and
+directories are rejected. In a Git checkout, both the path and any symlink
+target must be tracked; untracked nested checkouts and `node_modules` cannot
+supply proof. An unreadable Git checkout fails closed, including Git ownership
+or `safe.directory` errors.
+
+### Local use and tests
 
 ```bash
 cd scripts
-bun install
+bun install --frozen-lockfile
 cat your-pr-body.md | bun verify-proof-block.ts
 # or
 bun verify-proof-block.ts --body-file your-pr-body.md
 ```
 
-Every run sends the body to `https://api.github.com/markdown` to have it
-rendered, so it needs network access. [GitHub's Markdown API documentation](https://docs.github.com/en/rest/markdown/markdown)
-requires `contents: read` for private-resource rendering. Some labels may also
-need `issues: read` or `pull-requests: read`. Public-resource rendering can run
-without `GITHUB_TOKEN`, with the unauthenticated limit of 60 requests an hour.
+The parser sends the body to `https://api.github.com/markdown` in `gfm` mode
+with the base repository as context. Network access is required. Private
+rendering needs `contents: read`; some labels may need `issues: read` or
+`pull-requests: read`, which the workflow does not grant. Public rendering can
+run without a token, subject to GitHub's unauthenticated rate limit.
+See [GitHub's Markdown API documentation](https://docs.github.com/en/rest/markdown/markdown).
+The parser retries server errors and throttling. Failed retries fail the check;
+the workflow stops after 10 minutes.
 
-Env vars for full validation of CI-run and file-path artifacts:
+| Environment variable | Purpose |
+|----------------------|---------|
+| `GITHUB_TOKEN` | `actions: read` for run lookups; `contents: read` for private rendering |
+| `PR_HEAD_SHA` | Expected PR head commit |
+| `PR_BASE_REF` | Base branch anchoring clean integrations; for example, `main` |
+| `GITHUB_WORKSPACE` | PR checkout at `PR_HEAD_SHA`; the only root for proof-file resolution |
+| `GITHUB_API_URL` | Optional API endpoint, default `https://api.github.com`; a test hook, not GHES support, since run URLs must use `github.com` |
+| `PR_HEAD_REPO_FULL_NAME` | Head repository; for example, `florianhorner/your-repo` |
+| `PR_BASE_REPO_FULL_NAME` | Repository in which a cited run must have run; falls back to the head repository |
+| `OWNED_REPOS` | Comma-separated repositories allowed to use `runtime: n/a`; for example, `florianhorner/govee2mqtt,florianhorner/mammamiradio` |
+| `PROOF_FETCH_TIMEOUT_MS` | Optional per-request timeout, default `20000` |
 
-```
-GITHUB_TOKEN=...                         # actions: read for run lookups;
-                                         # contents: read for private rendering
-PR_HEAD_SHA=<commit sha>
-PR_BASE_REF=main                         # base branch; the clean-integrate
-                                         # witness anchors a merge's integrated
-                                         # parent to it and refuses without it
-GITHUB_WORKSPACE=/path/to/a/full/clone   # the witness runs git here, and checks
-                                         # this checkout is actually PR_HEAD_SHA.
-                                         # NOTE: this is also the ONLY root that
-                                         # file-path proof lines resolve against,
-                                         # and the "we are in CI" signal that
-                                         # makes a missing proof file a hard
-                                         # failure. Unset, existence is not
-                                         # checked at all, but an absolute or
-                                         # escaping path is still rejected
-GITHUB_API_URL=https://api.github.com    # optional; where the body is rendered
-                                         # and runs are looked up. A hook for
-                                         # the test suite, not GHES support:
-                                         # run URLs must be on github.com
-PR_HEAD_REPO_FULL_NAME=florianhorner/your-repo
-PR_BASE_REPO_FULL_NAME=florianhorner/your-repo   # a cited run must have run here
-                                                 # (falls back to the head repo)
-OWNED_REPOS=florianhorner/govee2mqtt,florianhorner/mammamiradio
-PROOF_FETCH_TIMEOUT_MS=20000             # optional: per-request limit for every
-                                         # GitHub call; tests shorten it
-```
+Set `GITHUB_TOKEN` and `PR_HEAD_SHA` for CI-run validation. Without
+`GITHUB_WORKSPACE`, the parser skips file-existence checks, but still rejects
+absolute and escaping paths. With it, a missing proof file is an error and the
+witness checks that the checkout is at `PR_HEAD_SHA`.
 
-### Running tests
+Run the parser and witness tests from `scripts/`:
 
 ```bash
-cd scripts
-bun install
 bun test
 ```
 
-Normal test runs never call GitHub. The Markdown compatibility tests use a
-local stub that answers `POST /markdown` with GitHub renderings recorded in
-`scripts/__tests__/fixtures/github-renders.json`. A body without a recording
-fails its test and names the fix. HTML-walk boundary tests also inject synthetic
-HTML; those cases are not recordings of GitHub output. After adding or changing
-a recorded test body:
+Tests use a local API stub. Markdown compatibility
+cases use saved GitHub renderings in
+`scripts/__tests__/fixtures/github-renders.json`; missing recordings fail with
+a message naming the missing recording. Tests of the HTML walker also inject
+synthetic HTML. To record a new or changed Markdown test body:
 
 ```bash
 RECORD_GITHUB_RENDERS=1 GITHUB_RENDER_TOKEN="$(gh auth token)" bun test
 ```
 
-## `body-lint` — editorial boundary for PR bodies, issue bodies and changelogs
+Recording sends test bodies to GitHub. Use synthetic test content and a token
+appropriate for the public rendering contexts.
 
-Public bodies describe user-visible outcomes. Review archaeology, agent
-provenance, operator telemetry and process narrative belong in the private
-durable record. `body-lint` enforces that server-side.
+### Known limitations
 
-It exists because the local `PreToolUse` hook only runs on the maintainer's
-machine: the GitHub web UI, cloud agents and MCP clients all reach a public body
-with no gate at all unless CI holds the line.
+- The gate follows GitHub's Markdown API if its output differs from the PR
+  page. It validates the body in the triggering event; an `edited` event uses
+  the new body. Unauthenticated local rendering is limited to public resources
+  and GitHub's rate limit.
+- The heading-confusable table is incomplete. An unrecognised lookalike paired
+  with a visible canonical Proof heading can leave boxes before that heading
+  unchecked. A hidden canonical heading is rejected.
+- A green run is bound to the PR's repository and content, not to a workflow
+  that tests the claim. Any successful workflow on that content can qualify,
+  including one added or changed by the PR.
+- Mermaid and math claims are read as code and skipped. A token pointing to an
+  unchecked `n/a` line counts as backed.
+- Strict ownership mode keys on the head repository. The cross-owner runtime
+  rule recognises only the key `runtime` and a value starting with `n/a`.
+  No particular proof key is mandatory.
+- Values without a slash can be accepted as test-name or prose artifacts.
+  The gate does not establish that those tests ran.
 
-### Shapes, not phrases
+## `body-lint`: check public prose
 
-The predecessor was a literal-phrase denylist grown one incident at a time. It
-held `findings (raised|confirmed|refuted)` and still passed "Findings from
-review"; it held `adversarially verif` and still passed "mutation testing
-found". Every escape was a new wording of an already-banned class.
-
-`scripts/lint-patterns.sh` matches the *grammatical frame* instead — a review
-noun near a discovery verb, a review actor mid-action, a telemetry possessive —
-so paraphrase does not walk through. Patterns are POSIX ERE and must behave
-identically under BSD grep (the local hook) and GNU grep (CI).
-
-### Caller workflow
+The workflow flags selected patterns of review narration, agent provenance,
+operator telemetry and writing style in PR bodies, issue bodies and
+changelogs. Patterns use POSIX ERE and must behave the same under BSD grep on
+macOS and GNU grep in CI.
 
 ```yaml
 jobs:
   pr-body:
-    permissions: { contents: read, actions: read }   # both lines required
-    uses: florianhorner/gh-workflows/.github/workflows/body-lint.yml@<sha> # <tag>
+    permissions: { contents: read, actions: read }
+    uses: florianhorner/gh-workflows/.github/workflows/body-lint.yml@<full-commit-sha> # <tag>
     with:
       target: pr-body
       extra_patterns: scripts/lint-patterns.sh   # optional, repo-local additions
 ```
 
-`target` is `pr-body`, `issue-body` or `changelog`. Repo-local patterns are
-**unioned** with the baseline — a repo may only ADD. Removing a baseline pattern
-is a PR to this repo, not a local override. The workflow checks out the caller's
-**base** ref, so a PR cannot weaken the gate judging it in the same change.
+| Input | Values and default |
+|-------|--------------------|
+| `target` | Required: `pr-body`, `issue-body` or `changelog` |
+| `extra_patterns` | Optional file on the caller's base ref; default empty |
+| `changelog_paths` | Space-separated files for `changelog`; default `CHANGELOG.md` |
 
-### Adding or changing a pattern
+The caller needs `contents: read` and `actions: read` for checkout and pinned
+ref resolution. Extra files supply a `LINT_PATTERNS` array added to the
+baseline. Consumers cannot remove baseline patterns through an override.
+Extra-pattern files come from the caller's base ref, so a PR cannot weaken the
+rules judging it in the same change.
 
-A pattern is not shipped until it has been measured. Guessing produces gates
-that fire on legitimate prose and then get disabled.
+For a pull request, `target: changelog` also reads the changelog from the base
+ref, so a passing check does not validate the proposed changelog. Check that
+file separately before merge.
+
+PR and issue bodies use CORE, BODY and PROSE_STYLE patterns. Changelogs use
+CORE only. The em-dash style rule blocks body prose; proof checkbox lines and
+`n/a — <reason>` lines are exempt. Drafts are linted. The bot authors exempt
+from `verify-claims` are also exempt from PR-body lint. Empty bodies and absent
+changelog files are skipped; absent changelogs produce a notice. A missing
+configured extra-pattern file fails the job.
+
+### Updating patterns
 
 ```bash
-bash scripts/lint-pattern-report.sh > /tmp/report.tsv   # every hit, with the matched span
-bash tests/test-lint-patterns.sh                        # compile / recall / precision / drift
+bash scripts/lint-pattern-report.sh > /tmp/report.tsv
+bash tests/test-lint-patterns.sh
 ```
 
-- **Ship gate:** no pattern ships while any row for it is marked `FP` in
-  `tests/expected/lint-pattern-baseline.tsv`. That is a count on an adjudicated
-  column, not a hit-rate threshold, so it is immune to the "four counts, four
-  answers" problem.
-- **Admission to `LINT_BASELINE_CORE`** (the set applied to changelogs and docs)
-  requires **zero** hits against the consuming repo's real changelogs. One hit
-  turns `main` red on merge day.
-- **The em-dash rule blocks.** It shipped advisory first, since it matched 141 of 161
-  historical bodies — but that counts bodies written before the rule existed. The
-  proof-block carve-out (`n/a — <reason>` lines are exempt) is what makes blocking
-  safe, since the proof gate and this gate run on the same body.
-- **A pattern with zero corpus hits is unfalsified, not validated.** It needs
-  hand-written paraphrases in `tests/fixtures/lint-known-bad.txt` before it
-  counts as covered — that is the exact profile the old denylist had the day
-  before it failed.
+The report includes each match's class, pattern, synthetic source ID, line,
+matched span and full text. It accepts an optional corpus-file argument.
+Review changed matches before updating
+`tests/expected/lint-pattern-baseline.tsv`. Preserve synthetic positive cases
+and legitimate-prose controls for every pattern. A pattern must not ship with
+unresolved false-positive (`FP`) rows; acceptable exceptions use `ALLOW`.
+Patterns added to CORE must produce zero hits against the consuming
+repository's changelogs.
 
-### The Claude Code cloud footer
+### Claude Code cloud footer
 
-A Claude Code cloud session appends two lines to every PR body it creates or
-edits, and its author cannot remove them from inside the session:
+In body mode, the linter excludes this exact pair when it forms the last
+non-blank lines:
 
 ```text
 ---
 _Generated by [Claude Code](https://claude.ai/code/session_<id>)_
 ```
 
-In `pr-body` and `issue-body` mode the lint drops exactly that pair when it
-forms the last non-blank lines of the body, and says so in its output. The same
-words anywhere else in the body, a near-miss of the pair (another host, no rule
-above it, text after it) and every changelog are still linted, so authored
-provenance fails as before. The two expressions live in `scripts/lint-patterns.sh`
-(`LINT_PLATFORM_FOOTER_RULE`, `LINT_PLATFORM_FOOTER_LINE`); step 6 of
-`tests/test-lint-patterns.sh` pins both directions. `verify-claims` needs no
-exemption: the footer carries no checkbox and no run link, so it is neither a
-proof line nor looked up.
+It reports the exclusion while preserving original line numbers. The same
+words elsewhere, a different host, a missing separator, text after the footer
+and every changelog remain subject to lint. The expressions are
+`LINT_PLATFORM_FOOTER_RULE` and `LINT_PLATFORM_FOOTER_LINE` in
+`scripts/lint-patterns.sh`. The footer has no proof checkbox or run link, so
+`verify-claims` needs no exemption.
 
-### What it cannot catch
+### Limits
 
-Regex reaches lexical tells, not meaning. Of six phrases that escaped the old
-gate, five are now caught; `two guards that needed teeth` is pure metaphor with
-no lexical signal and is not reachable this way. Renaming a `## Findings`
-section to `## Notes` also defeats the heading rule, which matches the label and
-never the content. Treat a pass as a tripwire on habitual violations, not as
-evidence that a body is clean.
+Regexes recognise selected wording. Changing a heading from `## Findings` to
+`## Notes` can bypass a heading pattern without changing the content. Semantic
+privacy review is still needed; a lint pass does not establish that a body is
+appropriate to publish.
 
 ## Release notes
 
-### Unreleased — `pin-check` checks pins against their tags and callers
+### Synthetic editorial fixtures and clearer documentation (unreleased)
 
-New reusable workflow `pin-check.yml`, with a dogfood caller
-(`pin-check-caller.yml`) and fixtures in `scripts/test-pin-check`, which
-`workflow-lint.yml` runs. See "`pin-check`" above.
+Synthetic cases check each editorial pattern and record its matched text.
+The documentation groups setup instructions and validator limitations by
+workflow. Inputs and validation rules are unchanged.
 
-### Unreleased — body-lint ignores the Claude Code cloud footer
+### `pin-check` (v1.6)
 
-PRs opened from a Claude Code cloud session failed `Editorial body lint` on the
-two footer lines the session appends and its author cannot remove. Body mode now
-drops exactly that pair at the end of a body before any pattern runs (see "The
-Claude Code cloud footer" above). Callers pick it up by bumping their
-`body-lint.yml` pin; no input changes.
+New reusable workflow `pin-check.yml` checks pins against their tags and
+callers, with a dogfood caller (`pin-check-caller.yml`) and fixtures in
+`scripts/test-pin-check`, which `workflow-lint.yml` runs. See "`pin-check`"
+above.
 
-### Unreleased — a cited CI run may be the head minus a clean base integration
+### Cloud-footer support (v1.6)
 
-`verify-claims` no longer requires a cited run's `head_sha` to equal the PR head
-exactly. A run whose commit the head integrates its base on top of, changing no
-content of its own, is accepted; the integrated parent must be content the base
-branch already carries. Everything else still reports `Run is stale`, now with
-the reason named. The reusable workflow's PR-head checkout moved to
-`fetch-depth: 0` and it passes `PR_BASE_REF`; callers need no change. See
-"A cited CI run and the PR head" above and `scripts/clean-integrate-witness.ts`.
+PR and issue bodies can end with the recognised Claude Code cloud footer
+without failing editorial lint. Only the trailing pair is excluded; other
+provenance text and changelogs retain their existing checks.
 
-`scripts/__tests__` now runs in CI (`workflow-lint.yml`), which it did not before.
+### Proof after clean base integrations (v1.6)
+
+A successful CI run can remain valid after the PR integrates its base without
+adding content. The witness anchors the integrated parent to the base
+branch's first-parent history and verifies Git's merge result. Parser and
+witness tests run in `workflow-lint.yml`.
+
+### Rendered proof validation (v1.6)
+
+The validator checks GitHub-rendered proof sections, including nested boxes,
+footnotes and linked run artifacts. Run URLs are canonicalised and tied to the
+PR's base repository and content. Malformed URLs, hidden proof markup,
+escaping or untracked files and unreadable Git state fail the check. CRLF
+bodies, nested fences and comment syntax inside inline code are handled.
+`parse5` is the only runtime dependency and is pinned exactly.
 
 ### Parser fixes (v1.2)
 
-- **strip trailing `[proof: <KEY>]` suffix from the artifact value before
-  validation.** Pre-fix, the parser captured the self-reference tag (e.g.
-  `proof/bootstrap.txt [proof: runtime]`) as part of the file path,
-  causing `existsSync()` to fail. This blocked every commit-message-
-  standards bootstrap PR. Inline `[proof: KEY]` token validation is
-  unaffected — it still scans the original PR body.
-- **check URL artifacts before file-path artifacts.** Non-CI URLs
-  (gist links, screenshots, release assets) contain `/` and were
-  previously misrouted into the file-path branch, then failed
-  `existsSync()` whenever `GITHUB_WORKSPACE` was set (i.e. always in CI).
-  Reordering the branches makes the URL fast-path match before the
-  file-path branch.
+Artifact paths can carry a trailing `[proof: KEY]` suffix without treating it
+as part of the filename. Non-CI HTTPS artifacts are classified as URLs before
+file-path checks. Inline claim validation still reads the original body.
+These fixes preserve templates, function signatures and tag naming.
 
-Both fixes are backwards-compatible — no template change required, no
-function signature change, no tag scheme change.
+### Upgrade and compatibility
 
-### Unreleased — the gate fails closed and reads the body GitHub renders
-
-A set of inputs made the validator exit 0 when it should have exited 1, and a
-smaller set made it exit 1 on valid markdown. Each was reproduced against the
-previous parser before being fixed, and each has a regression test that fails
-against it.
-
-**Fail-open inputs, now rejected:**
-
-- **CI-run URLs are recognised by canonical host, not by exact string.** The old
-  pattern was host-exact, case-sensitive and `https`-only, and the generic
-  `^https?://` accept sat directly behind it returning unconditionally. So
-  `https://GitHub.com/o/r/actions/runs/1` skipped the `conclusion=success` and
-  head_sha checks entirely — one capital letter — while the PR body still
-  rendered a live link to the same run page. `http://` is now rejected, and a
-  run-shaped path on a lookalike host or a non-default port is an error rather
-  than a generic artifact. The run-id slot captures anything and is judged
-  separately: the punctuation GFM strips from the end of an autolink is
-  ignored, so `…/runs/123.` is looked up as run 123, and an id that is still
-  not digits (`…/runs/12a`) is an error. Percent-encoding and
-  doubled slashes are normalised the way github.com routes them, and a decoded
-  `#` in an owner or repo name cannot retarget the API request.
-- **The unchecked branch is exhaustive.** `if (value && value !== "n/a") return;`
-  was a silent accept that skipped every check. Once the `[proof: KEY]` strip
-  shortened `n/a — [proof: runtime]` to `n/a —`, the `n/a` classifier stopped
-  recognising it and it fell into that hole, taking the cross-owner `runtime: n/a`
-  prohibition with it. An `n/a` now needs a non-empty reason, a spaced ASCII
-  hyphen counts as a separator, and an unchecked box carrying a real artifact is
-  validated instead of waved through.
-- **File paths are confined to the checkout.** `existsSync(value)` was tried bare
-  first, i.e. against the process cwd — which under the reusable workflow is the
-  nested gh-workflows checkout, so `__tests__/...` or `node_modules/<anything>`
-  satisfied "committed to the PR branch". There was no containment check at all
-  despite the code claiming one, so `/etc/passwd` and `../../../../etc/hosts`
-  both passed. Resolution is now only ever against `GITHUB_WORKSPACE`, through
-  `realpath`, so a committed symlink pointing out is rejected too. The path must
-  name a tracked file: `git ls-files` is queried with a literal pathspec (a lone
-  `.`, or an untracked file named `*` beside a tracked one, used to satisfy it),
-  directories are rejected, and when git cannot answer
-  the check fails closed and says why.
-- **CRLF bodies are read.** `.` excludes `\r` and `$` was not multiline-anchored, so
-  on a CRLF body every proof line was dropped while the heading survived — the
-  error blamed a missing checkbox list. GitHub stores web-UI-authored and
-  web-UI-edited bodies with CRLF, and the caller's `types: [edited]` re-runs the
-  gate the moment someone fixes a typo in the description.
-- **The gate reads the body GitHub renders.** The line scanner and the parser
-  that briefly replaced it both disagreed with GitHub, and each disagreement
-  was a bypass: a checkbox inside a code fence, a tilde fence with tildes in its
-  info string, a 4-space-indented fence, a box or heading after a closing fence
-  indented more than three spaces, raw HTML lookalikes and claims after a
-  dangling `<!--` counted while GitHub showed none of them; a raw `<code>` or
-  `<plaintext>` line, a `<!x` declaration, an `<xmp>` block or a footnote hid
-  boxes and claims GitHub shows. The body is now rendered by GitHub itself; see
-  "How the body is read" below.
-- **No box after `## Proof` is skipped.** `* [x]`, `+ [x]`, `1. [x]`, nested
-  boxes, a box whose URL sits on the next line, boxes under a second `Proof`
-  heading and boxes in footnotes all used to be ignored while GitHub rendered
-  them as checked boxes. Each is now validated, and a box that does not read
-  `key: value` (`runtime:URL`, `e2e : URL`, `done`) is an error.
-- **Run links are looked up by their target.** A run cited as
-  `[CI run](…/actions/runs/1)`, a reference link, `<…/actions/runs/1>` or a
-  relative href used to miss run recognition and fail as a missing file path;
-  now the run is checked, and so is a run linked from anywhere else in the
-  section: a nested bullet, a paragraph, a table, a footnote.
-- **A lookalike heading cannot redirect the gate.** `## Proof` with an invisible
-  soft hyphen or combining joiner, `### Proof`, `## Proof:` or a Cyrillic
-  `Ргооf` used to be passed over while a real `## Proof` hidden in a collapsed
-  `<details>` further down was validated instead.
-- **A proof line cannot hide part of itself.** GitHub keeps markup that hides
-  or shrinks text: `<rp>` fallback text, a collapsed `<details>`, a URL struck
-  through or nested eight `<sup>`/`<sub>` deep until it is two pixels tall.
-  Hidden text in front of a value stood in for the visible artifact, and a
-  hidden `n/a` excused a visible run link. A proof line may now contain only
-  text, links, code, emphasis, emoji and footnote references, and no invisible
-  or text-direction characters.
-- **A Proof heading cannot be hidden.** A Proof heading may sit only in the body
-  itself, a list item, quote, alert or table, or visible formatting such as
-  `<b>` or a link, and so must a second Proof heading after a visible one. `<details>` (nested and initially open ones
-  included), ruby fallback text, `<template>`, nested `<sup>`, `<sub>` or
-  `<small>`, `<del>`, a footnote, more than one level of `<code>`, `<tt>` or
-  `<pre>`, or any other element around it is an error;
-  the message says to backtick a tag the prose mentions.
-  A heading counts as Proof by its whole text, so `## <ins>Proof</ins>` can no
-  longer be passed over either. This prevents a visible lookalike from steering
-  validation to a canonical heading the reviewer cannot see. Notes-only
-  disclosures remain allowed.
-- **A cited run must belong to the PR.** A run was looked up in whatever
-  repository its URL named, so the PR's head commit pushed to any other public
-  repository, with an always-green workflow, produced a run that passed both
-  the `conclusion=success` and the head_sha check. A cited run must now have
-  run in the PR's own repository, by the API's account of it. A fork PR's head
-  repository does not count: its author controls its workflows, and the
-  checks of a fork PR run in the repository it merges into. When runs are
-  looked up (`GITHUB_TOKEN` and `PR_HEAD_SHA` set) and neither repository
-  variable is, a run cannot be attributed and is an error.
-- **Check-run pages are not generic links.** `…/runs/<job>` and
-  `…/commit/<sha>/checks` show a result the gate cannot look up, so citing one is
-  an error instead of a pass.
-
-**Behaviour changes for existing bodies:** a file path is read as displayed, so
-a path Markdown reformats (`__tests__` renders as bold "tests") fails until it
-is put in backticks, and the error says so. A checkbox after `## Proof` whose
-key has a space (`- [x] python compile: …`) used to be skipped and is now an
-error. A `Proof` heading written any way GitHub renders as a level-2 heading
-now opens the section, and a failed claim under an earlier `Proof` heading is
-no longer ignored. A run URL followed by a note (`…/runs/1 (head abc)`) is read
-as the run. A Proof section previously wrapped in `<details>` must be moved
-outside the disclosure, even if it uses the `open` attribute, and so must one
-in any element other than those listed under "How the body is read" below. A
-run in a fork PR's head repository no longer counts as proof.
-
-**False rejections, now accepted:** a fence at a nested list item's content
-column, and an unbalanced `<!--` inside inline code, which used to swallow the
-rest of the body so a PR that *discusses* comment stripping could not pass.
-
-**Dependencies:** `parse5` is the only runtime dependency of `scripts/`, exactly
-pinned. `remark`, `remark-parse`, `unified` and `unist-util-visit`, declared on
-`main` and imported but never used, are gone.
-
-### How the body is read
-
-The verifier sends the PR body to GitHub's Markdown API (`POST /markdown`, mode
-`gfm`, with the base repository as context) and validates the HTML it gets back.
-That is the renderer behind a PR's `body_html`: for this repository's PR #15 the
-two were identical byte for byte when checked. Private-resource rendering uses
-the workflow's existing `contents: read`. GitHub documents additional
-`issues: read` or `pull-requests: read` access for some label rendering; the
-workflow does not grant those optional permissions. Public resources can be
-rendered without a token. The call is retried on server errors and throttling;
-when it still fails, the check fails. The job stops after 10 minutes, so a hung
-call fails the check instead of leaving it pending.
-
-Earlier versions emulated GitHub instead: a line scanner, then
-`unified`/`remark-parse`/`rehype-raw`. GitHub renders with cmark-gfm on
-CommonMark 0.29 and then sanitizes the HTML; the emulation followed CommonMark
-0.31 and browser HTML rules. Wherever the two disagreed, the gate and the
-reviewer read different documents. Asking GitHub removes that whole class
-rather than patching its members one at a time.
-
-From the rendered HTML:
-
-- the section opens at the first heading of any level whose letters, with
-  compatibility forms folded, default-ignorable characters dropped and a short
-  table of Cyrillic and Greek lookalikes mapped, spell "proof" in any case;
-  unless it is an `<h2>` reading exactly `Proof`, that is an error;
-- a heading is recognised by its whole text, markup included; every recognised
-  Proof heading, whether it opens the section or appears later, may have only
-  lists, quotes, divs, code blocks, tables and visible formatting (`a`, `b`,
-  `em`, `i`, `strong`, `tt`, `u`) around it, and at most one `code`, `tt` or
-  `pre`. The HTML walk carries
-  that ancestry through nested elements and template content;
-- every task-list checkbox after it is a proof line. GitHub's sanitizer strips
-  raw `<input>` elements, so a checkbox can only come from task-list syntax;
-- a proof line's text is its list item without the lists nested under it, with
-  whitespace collapsed; the key is the text before the first `: `. The line may
-  contain only text, links, code, emphasis, emoji and footnote references, and
-  no invisible or text-direction characters; anything else is an error;
-- every link in the section that points at an Actions run is looked up, after
-  resolving it against `https://github.com/<base>/pull/`, and must have run in
-  the base repository;
-- `[proof: key]` tokens are read from all rendered text, folded the same way as
-  headings, except code examples: a `<code>` or `<pre>` holding only inline
-  content.
-
-The HTML is parsed with `parse5` and walked iteratively, so a deeply nested
-body gets a verdict rather than a stack overflow.
-
-### Known gaps
-
-The gate trusts GitHub's Markdown API to render the body the way the PR page
-does. The two matched when checked; if GitHub's renderers ever diverge, the gate
-follows the API. It renders the body from the triggering event, which for an
-`edited` event is the new body. Local runs without `GITHUB_TOKEN` can render
-public resources only and are limited to 60 renders an hour.
-
-Heading lookalikes are matched with a short table, not Unicode's full
-confusables data. A heading spelled with letters outside it (Coptic, small
-capitals, Cherokee, digits drawn like `o`), or carrying characters that are
-never drawn or drawn too small to see, may still read as "Proof" to a person but
-is not recognised by the gate. It cannot supply the required canonical heading,
-and pairing it with a canonical heading the reviewer cannot see is rejected. Paired with a visible canonical `## Proof` further down, the boxes under
-the lookalike are not validated: the reviewer sees two Proof sections and only
-the second one is checked.
-A cited run is tied to the PR's repository and head commit, not to a workflow
-that tests the claim: a green run of any workflow on that commit counts,
-including one the PR itself adds or changes.
-Claims inside a mermaid diagram or math are read as code and not checked.
-A claim that points at an unchecked `n/a` line counts as backed.
-
-**Also open, unchanged:** strict mode keys on the *head* repo rather than the
-base (`PR_BASE_REPO_FULL_NAME` is the rendering context and the repository a
-cited run must be in), and the
-cross-owner `runtime` rule only recognises the key spelled `runtime` and a
-value starting with `n/a`; nothing requires any given proof key to be present;
-and the terminal `// Anything else: accept` still passes arbitrary prose,
-including a value with no `/` in it, which never reaches the file-path branch at
-all. These change semantics for existing PR bodies and are tracked separately.
+- The `verify-claims` caller example pins `v1.6`, the first release with the
+  checks documented here. Cloud-footer support requires a `body-lint.yml` pin
+  at `v1.6` or later; inputs do not change.
+- Clean-integration support passes `PR_BASE_REF` and fetches full history when
+  the body cites a CI run. Existing callers need no new inputs.
+- Backtick paths that Markdown reformats. Move Proof headings outside
+  `<details>` and other disallowed containers, including open disclosures.
+  Use a space-free proof key and a non-empty `n/a` reason; real artifacts on
+  unchecked lines are validated too.
+- Cite an Actions run rather than a check-run page. Fork-head runs cannot
+  supply proof for the base repository. A run URL may include a trailing note.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

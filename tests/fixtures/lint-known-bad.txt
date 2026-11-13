@@ -1,108 +1,102 @@
-# lint-known-bad.txt - every line here MUST be caught by at least one pattern.
-#
-# Two kinds of line live here:
-#
-#   1. REAL ESCAPES. Text that actually shipped in a public PR body and that the
-#      gate of the day failed to stop. These are the regression cases; a pattern
-#      edit that stops catching one of them is a coverage loss, and the test says
-#      so in those words.
-#
-#   2. HAND-WRITTEN PARAPHRASES. Written at pattern-authoring time, 5-10 per
-#      class. These exist because 17 of the 23 baseline patterns hit NOTHING in
-#      the frozen corpus. A zero-hit pattern is unfalsified, not validated - it
-#      is precisely the profile the old literal denylist had the day before it
-#      failed. Paraphrases are what make incident-driven growth cumulative
-#      instead of literal.
-#
-# Lines starting with '#' are comments and are not asserted.
-# Blank lines are ignored.
+# Synthetic rejection examples for each editorial pattern.
+# All changes and reviews described below are fictional.
+# Non-comment, nonblank lines must match at least one baseline pattern.
+# A line starting with "# " is a comment; Markdown heading cases use "##" or
+# deeper and are asserted like any other line.
 
-# --- REAL ESCAPES: PR #994 / #995, 2026-08-21 -------------------------------
-# Two of the six escapes are absent by design. "the station's own operator
-# preference data rejected most of that tier" is covered below, but
-# "A fresh install started with music nobody had chosen" and
-# "two guards that needed teeth" are SEMANTIC - they carry no lexical tell, and
-# no regex reaches them. That residual risk is documented, not papered over.
-Findings from review
-mutation testing found two gaps in the licence binding
-Two guards were tightened after a reviewer flagged them
-the station's own operator preference data rejected most of that tier
+# Review noun followed by a discovery verb.
+The review found a missing queue limit
+An audit surfaced an empty configuration value
+Fuzzing caught an invalid record length
+Mutation testing flagged a missing retry condition
+The reviewer revealed an unchecked result
+Reviewers turned up a duplicate branch
+Code review flagged an unused fallback
 
-# --- R1: review noun near a discovery verb ----------------------------------
-The audit surfaced a race in the queue drain
-Fuzzing found an off-by-one in the segment parser
-A reviewer caught the missing timeout before merge
-The security review revealed a weakened ban fence
-Code review turned up two more defects in the same helper
-mutation testing flagged an unkilled mutant in the retry guard
+# Review actor followed by a progressive verb.
+a reviewer checking the retry counter
+A reviewer comparing the timeout values
+a review pass inspecting the cache key
+A reviewer bot suggesting an explicit return type
+a reviewer asking about the default interval
 
-# --- R1b: review actor mid-action, no discovery verb ------------------------
-a reviewer ticking the box on the admin checklist
-A reviewer noticing the stale pin filed it separately
-a review pass questioning the fallback order
-a reviewer asking about the licence binding
-A reviewer bot suggesting the narrower type
+# Discovery verb followed by a review noun.
+A missing field was found during review
+The duplicate entry was caught in the audit
+A timeout mismatch surfaced during the review
+The unchecked result was flagged by the reviewer
 
-# --- R2: discovery verb first, review noun after ----------------------------
-Two gaps found during review are closed here
-The regression was caught in the audit rather than in CI
-A cache-staleness risk surfaced during review
-Three issues raised by review, all fixed
-
-# --- R3: review-artifact section headings -----------------------------------
+# Review headings and summaries.
 ## Pre-Landing Review
-## Pre Landing Review
+## PreLanding Review
 ### Findings
 ## Review notes
 ## Review findings
-## What I cut
+## What I removed
+Findings from code review
 Findings from the review
 
-# --- R4: first-person debrief register --------------------------------------
-What I cut for slop: every em dash outside the proof lines
-I should have applied that boundary when I wrote them
-I drafted the bodies as a debrief
-I rewrote the retry loop after the second pass
-I initially reached for a semaphore here
+# First-person debriefs.
+What I cut was the unused helper
+I should have checked the return value
+I drafted a different error message
+I rewrote the configuration loader
+I initially used a shared counter
 
-# --- R5: process tallies ----------------------------------------------------
-24 findings, 9 rated critical
-Two findings, both fixed before this PR
-0 findings from the specialist pass
-Three review rounds on this diff
-2 review passes over the fix itself
-3 of 5 reviewers agreed the design was sound
-findings raised during the adversarial pass
-findings confirmed by the second reviewer
-adversarially verified against the previous behaviour
+# Review tallies.
+Two findings concern the parser
+3 review passes checked the error path
+Three review rounds covered the patch
+2 of 4 reviewers checked the fixture
+3 of 4 models accepted the patch
+1 of 2 agents proposed the same change
+findings raised for the configuration reader
+findings confirmed for the retry helper
+findings refuted by the fixture
+findings applied to the branch
+adversarially verified with a stub server
+Adversarial verification covered the retry helper
 
-# --- R6: operator telemetry -------------------------------------------------
-operator preference data
-The service's own telemetry data revealed the skip pattern
-Listening data showed most sessions ended early
-usage data confirmed the tier was unpopular
-The station's own playback data rejected that whole tier
+# Fictional telemetry statements exercise grammar, not real observations.
+The app's own diagnostic data showed an empty field
+The service's own sample data revealed a duplicate entry
+Usage data showed a missing label
+Listening data revealed a blank title
+Telemetry data confirmed an invalid counter
+operator preference data is included in this invented example
 
-# --- R7: product judgement framed as fact -----------------------------------
-A fresh install started with music nobody had chosen
-The default tier shipped tracks nobody wanted
-It surfaced a crate nobody had picked
+# Unsupported product judgements.
+The example menu contains an option nobody had chosen
+The sample bundle contains a theme nobody wanted
+The fictional picker includes a preset nobody has picked
 
-# --- CORE: agent and tool provenance ----------------------------------------
-Ran /autoplan over the design doc before implementing
-Codex review found no blocking issues
-Codex independent review agreed with the approach
-Claude review confirmed the fix
-Generated with Claude Code
-See CLAUDE.md for the editorial boundary
-🤖 Generated with something
+# Tool provenance.
+The patch followed /autoplan instructions
+Codex review checked the retry helper
+Codex independent review checked the error path
+Claude review checked the fixture
+This example was written with Claude Code
+The fictional instructions are in CLAUDE.md
+🤖 Generated with a sample assistant
 
-# --- CORE: workspace archaeology --------------------------------------------
-The earlier attempt is parked in stash@{0}
-This was sitting on an unpushed branch until today
-An un-pushed branch carried the earlier fix
-The worktree had untracked files from the previous run
-untracked code in the sibling worktree explained the discrepancy
-Reproduced in this Conductor workspace
-The Conductor session that produced this is gone
-A Conductor agent opened the original PR
+# Local working-state narration.
+The example began in stash@{2}
+The fix is on an unpushed branch
+An un-pushed branch contains the helper
+The example mentions untracked files
+The example mentions untracked code
+The draft was written in a Conductor workspace
+A Conductor session produced this example
+A Conductor agent produced this example
+
+# Alternatives that need a positive case of their own.
+Findings from review are listed below
+Two edge cases were raised during review of the parser
+One finding was left open after the change
+Four findings were closed in this change
+12 findings were deferred to a follow-up
+The station's own listening data drove the change
+The draft was written in this Conductor workspace
+
+# Prose punctuation.
+The retry counter is reset — the connection stays open

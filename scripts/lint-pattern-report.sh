@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Run every baseline pattern over the frozen corpus and emit adjudicatable TSV.
+# Run baseline patterns over a corpus and emit TSV for match review.
 #
 #   lint-pattern-report.sh [corpus-file]
 #
 # Output columns: class, pattern, source, line, matched_text, full_line
 #
-# `matched_text` is emitted SEPARATELY from `full_line` on purpose. Every
-# narrowing decision comes from reading the span the regex actually matched, not
-# the line it happened to sit on — a report that only shows lines hides the
-# reason a pattern is too broad.
-#
-# This is a local tuning tool. It is not run in CI: the regression test diffs
-# against the adjudicated baseline instead, so CI never needs the corpus
-# regenerated or the network touched.
+# Numeric source IDs identify synthetic cases. The report shows each matched
+# span alongside its full line so reviewers can spot overly broad patterns.
+# The regression harness compares this output with the checked-in baseline.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,19 +25,16 @@ fi
 # shellcheck source=scripts/lint-patterns.sh
 source "$SCRIPT_DIR/lint-patterns.sh"
 
-# The corpus stores provenance as a "#<pr>:" line prefix. Grepping it directly
-# makes every ^-anchored pattern structurally unable to match — a heading rule
-# like `^#{1,6}[[:space:]]*Findings` would be reported as "zero hits" when it was
-# never given a chance to fire. Strip the prefix into a parallel file, match
-# against that, and map line numbers back through an index.
+# Strip the #<case-id>: prefix before matching so ^-anchored patterns see
+# the original line. A parallel index maps each match to its source case.
 STRIPPED="$(mktemp)"
 INDEX="$(mktemp)"
 trap 'rm -f "$STRIPPED" "$INDEX"' EXIT
-sed 's/^#[0-9]*://' "$CORPUS" > "$STRIPPED"
-sed -n 's/^\(#[0-9]*\):.*/\1/p' "$CORPUS" > "$INDEX"
+sed 's/^#[0-9][0-9]*://' "$CORPUS" > "$STRIPPED"
+sed -n 's/^\(#[0-9][0-9]*\):.*/\1/p' "$CORPUS" > "$INDEX"
 
 if [ "$(wc -l < "$STRIPPED")" -ne "$(wc -l < "$INDEX")" ]; then
-  echo "ERROR: corpus line/index mismatch — every line must carry a #<pr>: prefix." >&2
+  echo "ERROR: corpus line/index mismatch: every line needs a #<case-id>: prefix." >&2
   exit 2
 fi
 

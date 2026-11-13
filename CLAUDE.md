@@ -23,10 +23,6 @@ and handle each one like a bot finding: fix it, or answer it with a reason.
   `pin-check-caller.yml` run on `pull_request_target`, which loads the workflow
   from the base branch, so a pull request's edits to those gates take effect
   only after merge. Watch the first run after merging such a change.
-- **Why provisional.** On three past trust-boundary changes, the most capable
-  models found about twice as many of the problems that later fixes proved as
-  the cheapest configuration did, and on the one change with a record of what
-  the review bots raised, the most capable model found more. At effort `high`
-  that costs a few dollars and about six minutes per review; effort `max` found
-  little more at about three times the cost. One run per configuration cannot
-  size these gaps, so narrow or drop the rule if later reviews do not show them.
+- **Why provisional.** The rule rests on a small trial with one run per
+  configuration. Narrow or drop it if later reviews do not find problems that
+  the review bots miss.

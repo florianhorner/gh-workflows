@@ -10,12 +10,11 @@
 # array (the shape consuming repos already use) is unioned in. Repos may only
 # ADD; there is no suppression knob by design.
 #
-# Exit codes, and the distinction matters:
+# Exit codes:
 #   0  clean
 #   1  editorial violation
-#   2  gate error (missing/unreadable pattern source, empty pattern set, grep
-#      failure). Never let a broken gate read as clean — that is how a lint
-#      dies silently and nobody notices for four months.
+#   2  gate error (missing/unreadable pattern source, empty pattern set or
+#      grep failure). A failed check must not report clean input.
 set -euo pipefail
 
 MODE=""
@@ -157,10 +156,8 @@ for i in "${!PATTERNS[@]}"; do
   FAIL=1
 done
 
-# Prose style runs last and only on bodies, against an exempted copy. The
-# proof-block format `- [ ] runtime: n/a — <reason>` requires an em dash, so
-# linting the raw file would put this gate in permanent conflict with the proof
-# gate that runs on the same body.
+# Prose style runs last, on bodies only. Exempt proof lines so supported
+# punctuation such as `- [ ] runtime: n/a — <reason>` remains accepted.
 if [ "$MODE" = "body" ] && [ "${#LINT_BASELINE_PROSE_STYLE[@]}" -gt 0 ]; then
   STYLE_FILE="$(mktemp)"
   grep -vE -- "$LINT_PROSE_STYLE_EXEMPT" "$LINT_FILE" > "$STYLE_FILE" || true
@@ -177,14 +174,7 @@ if [ "$MODE" = "body" ] && [ "${#LINT_BASELINE_PROSE_STYLE[@]}" -gt 0 ]; then
       echo "ERROR: prose pattern '$PAT' failed (grep exit $RC)." >&2
       exit 2
     fi
-    # Blocking. Shipped advisory first because the rule matched 141 of 161
-    # historical bodies; that number describes bodies written before the rule
-    # existed, and holding a stated preference to an advisory tier forever
-    # because it was once violated often is how a rule stays decorative.
-    #
-    # The proof-block carve-out above is what makes blocking safe: `n/a — …`
-    # lines are exempt, so this gate cannot contradict the proof gate that runs
-    # on the same body in the same hook invocation.
+    # Non-exempt prose matches block the body, just like other editorial rules.
     while IFS= read -r line; do
       echo "FAIL: [prose-style] $line  [pattern: $PAT]"
       HITS=$((HITS + 1))

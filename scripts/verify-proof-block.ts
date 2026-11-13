@@ -20,7 +20,7 @@
  *                            context (how `#123` references link) and the
  *                            repository a cited run must have run in. Falls
  *                            back to PR_HEAD_REPO_FULL_NAME
- *   OWNED_REPOS            - comma-separated list of repos Florian owns
+ *   OWNED_REPOS            - comma-separated list of owned repositories
  *   PR_BASE_REF            - the PR's base branch, e.g. "main". Without it the
  *                            clean-integrate witness cannot anchor a merge and
  *                            refuses, so an integrated branch reads as stale.
@@ -69,16 +69,9 @@ const PR_HEAD_SHA = process.env.PR_HEAD_SHA ?? "";
 const PR_BASE_REF = process.env.PR_BASE_REF ?? "";
 const PR_HEAD_REPO = process.env.PR_HEAD_REPO_FULL_NAME ?? "";
 const PR_BASE_REPO = process.env.PR_BASE_REPO_FULL_NAME ?? "";
-// Honouring GITHUB_API_URL lets the test suite point the verifier at a local
-// stub and exercise the CI-run path end to end instead of only its parts.
-//
-// It is NOT GHES support, and an earlier version of this comment wrongly implied
-// it was. classifyArtifactUrl below only accepts `github.com` as a CI-run host, so
-// a GHES run URL never reaches validateCIRun at all: it is reported as a wrong-host
-// CI-run claim rather than validated.
-// Supporting GHES means teaching URL recognition the configured host and mapping
-// its API URL to its web URL, which nothing here exercises — so the claim is
-// dropped rather than the limitation hidden.
+// GITHUB_API_URL lets tests use a local stub. It does not add GHES support:
+// classifyArtifactUrl accepts only github.com run URLs. Supporting another host
+// would also require mapping its web URLs to the corresponding API endpoints.
 const GITHUB_API_URL = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
 const OWNED_REPOS = (process.env.OWNED_REPOS ?? "")
   .split(",")
@@ -215,22 +208,11 @@ function readBody(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The gate validates the document a reviewer sees, so it asks GitHub for it.
- *
- * Three earlier versions of this file emulated GitHub instead: a line scanner,
- * then a patched line scanner, then remark + rehype-raw. Each one hid text in
- * places GitHub shows it — a raw `<code>` or `<plaintext>` line, a `<!x`
- * declaration, a footnote, an `<xmp>` block — because GitHub renders with
- * cmark-gfm 0.29 and then sanitizes, while the emulation followed CommonMark
- * 0.31 and browser HTML rules. Every disagreement was a way to show reviewers a
- * checked box the gate never validated.
- *
- * `POST /markdown` in gfm mode is the renderer behind a PR's `body_html`
- * (identical output, checked on this repo's PR #15). Private-resource rendering
- * needs contents: read; labels may also need issues: read or pull-requests:
- * read. Public resources can be rendered without a token at 60 requests an
- * hour. Every run makes this call, so it is retried; a body that cannot be
- * rendered is a failure, never a pass.
+ * Render each body through POST /markdown in gfm mode and validate its HTML.
+ * Private-resource rendering needs contents: read; some labels also need
+ * issues: read or pull-requests: read. Public resources can render without a
+ * token, subject to GitHub's unauthenticated rate limit. Retry server errors
+ * and throttling; failure to render the body fails validation.
  */
 class RenderError extends Error {}
 

@@ -1,11 +1,6 @@
 name: body-lint
 
-# Editorial lint for PR and issue bodies, and for public changelogs.
-#
-# Server-side backstop for the local PreToolUse hook. The hook only exists on
-# the maintainer's machine, so every other path to a public body — the GitHub
-# web UI, a cloud agent, an MCP client, a phone — reaches GitHub with no gate at
-# all unless this runs.
+# Editorial lint for PR and issue bodies and public changelogs.
 
 on:
   workflow_call:
@@ -37,10 +32,7 @@ jobs:
     name: Editorial body lint
     runs-on: ubuntu-latest
 
-    # Bots are not held to the editorial boundary; their bodies are generated.
-    # Drafts ARE linted, unlike verify-claims: a draft body is already public,
-    # so exempting it would leave the leak open for exactly as long as the draft
-    # sits there.
+    # Lint public drafts; exempt the listed bot authors from PR-body lint.
     if: >-
       github.event_name != 'pull_request' ||
       !contains(fromJson('["dependabot[bot]","pre-commit-ci[bot]","github-actions[bot]"]'), github.event.pull_request.user.login)
@@ -55,9 +47,8 @@ jobs:
           path: _caller
           persist-credentials: false
 
-      # See verify-claims.yml for why this is necessary: no github context
-      # property carries the callee ref, so it is read back off the run's
-      # referenced_workflows[]. That is what `actions: read` is for.
+      # Resolve the pinned callee SHA through referenced_workflows[]; the github
+      # context exposes the caller ref. This lookup needs actions: read.
       - name: Resolve own ref
         id: self
         env:
@@ -69,7 +60,7 @@ jobs:
                          | select(.path | startswith("florianhorner/gh-workflows/.github/workflows/body-lint.yml@"))
                          | .sha' 2>/dev/null | head -n1 || true)"
           if [ -z "$sha" ]; then
-            # Local invocation (`uses: ./…`) — gh-workflows dogfooding itself.
+            # Local-path calls use this repository's triggering SHA.
             sha="${GITHUB_SHA}"
             echo "No referenced_workflows entry — local invocation, using ${sha}"
           fi
@@ -106,16 +97,13 @@ jobs:
         run: |
           set -uo pipefail
           LINT=_gh_workflows/scripts/check-body-lint.sh
-          # Array, not a bare string: an empty scalar expands to an empty
-          # argument that check-body-lint.sh would read as an unreadable
-          # pattern file and reject as a gate error.
+          # An array avoids passing an empty scalar as a pattern-file argument.
           EXTRA_ARGS=()
           if [ -n "$EXTRA" ]; then
             if [ -r "_caller/$EXTRA" ]; then
               EXTRA_ARGS=("_caller/$EXTRA")
             else
-              # Fail loud. A missing extra-pattern file means the caller's own
-              # rules are silently not being applied, which reads as "clean".
+              # A missing configured file must fail rather than omit rules.
               echo "::error::extra_patterns '$EXTRA' not found on the base ref"
               exit 1
             fi
@@ -136,8 +124,7 @@ jobs:
             bash "$LINT" --mode body /tmp/body.md ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"} || rc=$?
           fi
 
-          # 2 is a gate error, not a clean result. Surface it distinctly so a
-          # broken lint never reads as a passing one.
+          # Preserve the distinct exit code for an unavailable lint check.
           if [ "$rc" -eq 2 ]; then
             echo "::error::editorial lint could not run (gate error)"
             exit 2

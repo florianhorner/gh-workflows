@@ -19,9 +19,9 @@ import { runResponse, startApiStub, stubUrl } from "./github-api-stub";
 // do use a fake runner are the ones about git FAILING, which real git will not
 // do on demand.
 //
-// The fixtures are also sealed off from the machine's git configuration. On a
-// developer box `init.templateDir` plants a pre-commit hook into every new
-// repo, `core.hooksPath` applies a commit-message policy, and `core.excludesFile`
+// The fixtures are also sealed off from the machine's git configuration. A
+// global `init.templateDir` can add hooks to every new repository,
+// `core.hooksPath` can apply a commit-message policy, and `core.excludesFile`
 // could make `git add` of a fixture file fail for a reason no reader would
 // guess. Those three affect writes, which only the fixture performs — but
 // `merge.*` and `diff.renames` also change how the PREDICATE recomputes a merge,
@@ -130,9 +130,8 @@ describe("cleanIntegrateWitness — accepts", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The parent has to be the base. This is the condition an adversarial review
-// found missing, and it is the one that decides whether the whole acceptance
-// path is sound.
+// The integrated parent must be a state from the base branch's history.
+// An arbitrary branch can reproduce a merge tree without providing CI evidence.
 // ---------------------------------------------------------------------------
 
 describe("cleanIntegrateWitness — the merged-in parent must be the base", () => {
