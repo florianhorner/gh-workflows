@@ -128,9 +128,8 @@ const runIs =
 describe("verify-proof-block: paths no other test pins", () => {
   it("accepts a cited run only when its conclusion is success", async () => {
     // The API reports null while a run is going, and cancelled, skipped,
-    // neutral, timed_out and the rest for runs that proved nothing. Only
-    // `failure` was ever tried, so a check that turned away just that one
-    // value would have passed everything else.
+    // neutral, timed_out and the rest for runs that proved nothing. Each of
+    // them is tried here, so a check that turns away only `failure` fails.
     const notSuccess = [
       null, "cancelled", "skipped", "neutral", "timed_out", "action_required", "startup_failure", "stale",
     ] as const;

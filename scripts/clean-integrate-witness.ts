@@ -130,11 +130,10 @@ export interface WitnessInput {
  * as a local head. Nothing is guessed: if neither resolves, the caller fails
  * closed.
  *
- * A third candidate — the bare ref — used to sit at the end. It bought nothing
- * (the two explicit namespaces already cover CI and local clones) and cost
- * something: rev-parse resolves a bare name through refs/tags first, so a tag
- * sharing the base branch's name pointed the anchor at whatever the tag pointed
- * at. Narrow to reach, but a PR base is never a tag.
+ * The bare ref is deliberately not a candidate. The two explicit namespaces
+ * already cover CI and local clones, and rev-parse resolves a bare name through
+ * refs/tags first, so a tag sharing the base branch's name would point the
+ * anchor at whatever the tag points at. A PR base is never a tag.
  */
 function resolveBaseBranch(git: GitRunner, baseRef: string): string | null {
   for (const candidate of [`refs/remotes/origin/${baseRef}`, `refs/heads/${baseRef}`]) {

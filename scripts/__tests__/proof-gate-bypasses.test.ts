@@ -454,8 +454,8 @@ describe("a file-path artifact must be inside the PR checkout", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. `n/a` needed an em-dash, so the rule was one keystroke from unenforced,
-//    and an unchecked box carrying a real artifact skipped every check.
+// 6. Any dash form of `n/a` is an n/a, and an unchecked box carrying a real
+//    artifact is still checked.
 // ---------------------------------------------------------------------------
 
 describe("n/a and unchecked values are judged, not waved through", () => {
