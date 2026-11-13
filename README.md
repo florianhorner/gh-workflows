@@ -32,17 +32,138 @@ permissions:
 jobs:
   audit-pr:
     if: github.event_name == 'pull_request_target'
-    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha>
+    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha> # <tag>
     with:
       pull_request_number: ${{ github.event.pull_request.number }}
   audit-push:
     if: github.event_name == 'push'
-    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha>
+    uses: florianhorner/gh-workflows/.github/workflows/checkout-credentials.yml@<full-commit-sha> # <tag>
 ```
 
 `pull_request_number` defaults to `0`, which selects the complete checkout.
 For a PR, the audit checks the returned file count against the PR's
 changed-file count and refuses a partial result.
+
+## `pin-check`: check action and reusable-workflow pins
+
+A dependency bot's pin bump rewrites a SHA and its version comment and nothing
+else, so nobody reads upstream code in that change. This reusable workflow
+checks the parts of it a machine can verify, for every `uses:` in a caller's
+workflow and composite-action definitions:
+
+1. The pin is a full commit SHA. zizmor's offline `unpinned-uses` audit checks
+   this, and its default policy requires a hash for `actions/*` too. The next
+   check requires it again of every reference zizmor lets through, including one
+   zizmor reads as a hash pin whose path the check cannot parse. zizmor skips
+   files a `.gitignore` covers, action files in other letter cases and some file
+   names, and its step passes when it finds nothing to read; the next check reads
+   them all. A
+   reference zizmor cannot parse at all stops the job in zizmor's step. A
+   `docker://` image needs a tag or a digest in both checks.
+2. The trailing version comment names a tag of the same repository, and that
+   tag is at the pinned commit. When the tag is an alias that has since moved
+   (`v4`), a release tag in its line (`v4.x.y`) must still be at the pinned
+   commit. A pin without a version comment fails, and so does a pin to a commit
+   that no tag points at, which also rules out a commit that exists only in a
+   fork. Call an action from the same repository by local path (`./`).
+3. A called reusable workflow asks for no permission that the calling job does
+   not grant. GitHub refuses such a run before it starts, with no logs and no
+   check run. A job that declares no permissions, in a workflow that declares
+   none either, is compared against GitHub's restricted default token
+   (`contents: read`, `packages: read`). In a workflow that runs on
+   `workflow_call`, with or without other triggers, such a job passes on
+   whatever its own caller grants, which is not visible here, so it must declare
+   the permissions the called workflow asks for; its caller is then checked one
+   level up. A called workflow that
+   asks for `read-all` or `write-all` needs that shorthand granted: a list of
+   scopes does not count as one here. Each job is read on its own, so job ids
+   that YAML 1.1 would read as one key (`yes`, `on`, `true`) and repeated ids
+   are each compared.
+
+Tags are listed with `git ls-remote`. A remote called workflow is read through
+the contents API; a local one from the checkout or, in pull-request mode when it
+did not change, at the pull request's head. A lookup that fails fails the check, and so does a `uses:` the
+check cannot read. zizmor's online audits are not used: one failed API call
+aborts the whole run, and in zizmor 1.28 `ref-version-mismatch` does not audit
+reusable-workflow pins at all. Text from the checked files never reaches the log as a workflow command:
+annotations escape it, zizmor's own log is shown only when zizmor fails and then
+with workflow commands switched off, and an unsafe file name is shown
+base64-encoded, and the Python problem matcher that setup-uv would add is left
+off. Action files are found in any letter case (`Action.yml`), as a runner on a
+case-insensitive file system would load them. YAML anchors are read; YAML merge
+keys (`<<`), anywhere in a checked or called file, and steps that are not plain
+mappings are refused, because they can hide a `uses:` or change a grant.
+
+Pull requests use `pull_request_target` and, as `checkout-credentials` does,
+read through GitHub's API instead of checking anything out: the changed workflow
+and action YAML, any unchanged local workflow a changed one calls, and the head
+commit's file list. Every file is read at the commit the run was started for,
+and the changed files are those GitHub lists against the base branch the run was
+started for. If the pull request has another head or base branch by the time
+its files are read, or when collection ends, the run fails without checking; the
+push or edit that changed it starts a run of its own. A change made and undone
+within one collection is not seen, but undoing it starts a run on that same
+commit, which replaces the earlier result. Pushes check the complete
+repository.
+
+List `edited` with the other event types, as below: it is the event GitHub
+sends when a pull request's base branch changes. Without it, a check made
+against one base stays on a pull request that now targets another.
+
+```yaml
+name: pin-check
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  check-pr:
+    if: github.event_name == 'pull_request_target'
+    uses: florianhorner/gh-workflows/.github/workflows/pin-check.yml@<full-commit-sha> # <tag>
+    with:
+      pull_request_number: ${{ github.event.pull_request.number }}
+  check-push:
+    if: github.event_name == 'push'
+    uses: florianhorner/gh-workflows/.github/workflows/pin-check.yml@<full-commit-sha> # <tag>
+```
+
+Limits:
+
+- Pins to private or internal repositories fail. Tags are listed without
+  credentials, and the job's token can read no private or internal repository
+  but the caller's.
+- In pull-request mode only changed files are checked, so a change to a called
+  workflow is not compared against callers that did not change. The next push
+  to the default branch checks the complete repository.
+- Called with a pull request number from an event that is not a pull request
+  event, such as `workflow_dispatch`, the run has no event head or base to
+  compare and checks the pull request as it finds it.
+- Permissions are compared one call deep; a called workflow's own nested calls
+  are not followed.
+- A `docker://` image is checked only for a tag or digest. A local `./`
+  reference gets no SHA or tag check, but a local reusable workflow is still
+  compared for permissions.
+- Action files inside git submodules are not checked: neither mode checks out
+  submodules.
+- Workflow and action files may not be symbolic links: a runner loads
+  whatever a link points at, which a pull request can change without touching
+  the link. In pull-request mode the head commit's file list is read to find
+  them, and a list too large for one response fails the check. Directory links
+  are not followed: an action behind one is checked at its real path inside the
+  repository, and not at all if the link points outside it.
+- A tab between a pin and its `#` comment fails as invalid YAML (PyYAML rejects
+  it); separate them with spaces.
+- It reviews no upstream code; it reads a called workflow only for the
+  permissions it asks for. A tagged release can still be malicious.
+
+`bash scripts/test-pin-check` runs the workflow's three `run:` steps, extracted
+from the YAML, against fixtures with stand-in `git` and `gh`, plus two online
+cases against github.com (`PIN_CHECK_OFFLINE=1` skips them). `workflow-lint.yml`
+runs it on every change to workflows or scripts.
 
 ## `verify-claims`: validate PR proof blocks
 
@@ -293,7 +414,7 @@ macOS and GNU grep in CI.
 jobs:
   pr-body:
     permissions: { contents: read, actions: read }
-    uses: florianhorner/gh-workflows/.github/workflows/body-lint.yml@<sha>
+    uses: florianhorner/gh-workflows/.github/workflows/body-lint.yml@<full-commit-sha> # <tag>
     with:
       target: pr-body
       extra_patterns: scripts/lint-patterns.sh   # optional, repo-local additions
@@ -360,26 +481,33 @@ appropriate to publish.
 
 ## Release notes
 
-### Unreleased: synthetic editorial fixtures and clearer documentation
+### Synthetic editorial fixtures and clearer documentation (unreleased)
 
 Synthetic cases check each editorial pattern and record its matched text.
 The documentation groups setup instructions and validator limitations by
 workflow. Inputs and validation rules are unchanged.
 
-### Unreleased: cloud-footer support
+### `pin-check` (v1.6)
+
+New reusable workflow `pin-check.yml` checks pins against their tags and
+callers, with a dogfood caller (`pin-check-caller.yml`) and fixtures in
+`scripts/test-pin-check`, which `workflow-lint.yml` runs. See "`pin-check`"
+above.
+
+### Cloud-footer support (v1.6)
 
 PR and issue bodies can end with the recognised Claude Code cloud footer
 without failing editorial lint. Only the trailing pair is excluded; other
 provenance text and changelogs retain their existing checks.
 
-### Unreleased: proof after clean base integrations
+### Proof after clean base integrations (v1.6)
 
 A successful CI run can remain valid after the PR integrates its base without
 adding content. The witness anchors the integrated parent to the base
 branch's first-parent history and verifies Git's merge result. Parser and
 witness tests run in `workflow-lint.yml`.
 
-### Unreleased: rendered proof validation
+### Rendered proof validation (v1.6)
 
 The validator checks GitHub-rendered proof sections, including nested boxes,
 footnotes and linked run artifacts. Run URLs are canonicalised and tied to the

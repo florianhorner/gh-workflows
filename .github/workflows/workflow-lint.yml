@@ -50,6 +50,9 @@ jobs:
       - name: Test checkout credential audit
         run: bash scripts/test-checkout-credentials
 
+      - name: Test pin check
+        run: bash scripts/test-pin-check
+
   # Test parser rejection and merge-witness acceptance for consuming workflows.
   scripts:
     name: Parser and witness tests
