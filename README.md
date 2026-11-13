@@ -214,6 +214,7 @@ script checkout to the ref the caller pinned.
 
 ### Proof syntax
 
+Choose one alternative per line and remove `OR` with the unused alternative.
 Replace each placeholder with an artifact or a reason for `n/a`:
 
 ```markdown
@@ -222,8 +223,8 @@ Replace each placeholder with an artifact or a reason for `n/a`:
 - [x] build: <ci-run-url> [proof: build]
 - [x] tests: <ci-run-url> OR TestFunctionName [proof: tests]
 - [x] lint: <ci-run-url> [proof: lint]
-- [ ] runtime: <artifact-url> OR "n/a — <reason>" [proof: runtime]
-- [ ] schema: "n/a — no MQTT or HA interface changes" OR <diff-url> [proof: schema]
+- [ ] runtime: <artifact-url> OR n/a — <reason> [proof: runtime]
+- [ ] schema: n/a — no MQTT or HA interface changes OR <diff-url> [proof: schema]
 ```
 
 | Item | Requirement |
@@ -429,8 +430,12 @@ jobs:
 The caller needs `contents: read` and `actions: read` for checkout and pinned
 ref resolution. Extra files supply a `LINT_PATTERNS` array added to the
 baseline. Consumers cannot remove baseline patterns through an override.
-Files come from the caller's base ref, so a PR cannot weaken the rules judging
-it in the same change.
+Extra-pattern files come from the caller's base ref, so a PR cannot weaken the
+rules judging it in the same change.
+
+For a pull request, `target: changelog` also reads the changelog from the base
+ref, so a passing check does not validate the proposed changelog. Check that
+file separately before merge.
 
 PR and issue bodies use CORE, BODY and PROSE_STYLE patterns. Changelogs use
 CORE only. The em-dash style rule blocks body prose; proof checkbox lines and
