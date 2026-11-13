@@ -1,0 +1,1441 @@
+#!/usr/bin/env bash
+# Tests for .github/workflows/pin-check.yml.
+#
+# Each step under test is extracted from the workflow and run the way the
+# runner runs it. Stand-in `git` and `gh` executables, first on PATH, serve
+# fixture tag listings and API responses, so the shipped lookup code runs,
+# failure paths included. The last cases go online (git ls-remote against
+# github.com); set PIN_CHECK_OFFLINE=1 to skip them.
+set -euo pipefail
+
+PYYAML="pyyaml==6.0.3"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workflow="${repo_root}/.github/workflows/pin-check.yml"
+caller="${repo_root}/.github/workflows/pin-check-caller.yml"
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+failures=0
+fail() {
+  echo "FAIL: $*" >&2
+  failures=$((failures + 1))
+}
+
+# The workflow runs the check with `uv run --with pyyaml`, which puts its
+# interpreter's directory first on PATH; on a runner that directory also holds
+# git and gh and would shadow the stand-ins below. The tests therefore run the
+# extracted script with a venv's interpreter called directly, which leaves
+# PATH alone. The shell line itself is asserted below.
+uv venv --no-config --quiet "${work}/venv"
+uv pip install --no-config --quiet --python "${work}/venv/bin/python" "${PYYAML}"
+python="${work}/venv/bin/python"
+
+# --- the three steps, exactly as the workflow carries them
+"${python}" - "${workflow}" "${work}" "${PYYAML}" <<'PY'
+import sys
+
+import yaml
+
+workflow, out, pyyaml = sys.argv[1:4]
+with open(workflow) as handle:
+    job = yaml.safe_load(handle)["jobs"]["pins"]
+assert "continue-on-error" not in job and "if" not in job, "the pins job must not fail open"
+steps = job["steps"]
+wanted = {
+    "Prepare audit target": ("prepare.sh", "bash"),
+    "Require full-SHA pins": ("full-sha.sh", "bash"),
+    "Check version comments and reusable-workflow permissions":
+        ("check.py", f"uv run --no-config --no-project --with {pyyaml} python3 {{0}}"),
+}
+for step in steps:
+    if step.get("name") in wanted:
+        filename, shell = wanted.pop(step["name"])
+        assert step.get("shell") == shell, (step["name"], step.get("shell"))
+        # A step that may fail, or may not run, would switch the gate off.
+        assert "continue-on-error" not in step and "if" not in step, step["name"]
+        with open(f"{out}/{filename}", "w") as handle:
+            handle.write(step["run"])
+assert not wanted, f"steps not found in the workflow: {sorted(wanted)}"
+PY
+
+# --- stand-ins for git ls-remote and the GitHub API
+fakebin="${work}/bin"
+export FAKE_GIT_DIR="${work}/git" FAKE_GH_DIR="${work}/gh"
+mkdir -p "${fakebin}" "${FAKE_GIT_DIR}/acme" "${FAKE_GH_DIR}"
+cat > "${fakebin}/git" <<'PY'
+#!/usr/bin/env python3
+import os, re, sys
+args = sys.argv[1:]
+if args[:2] != ["ls-remote", "--tags"] or len(args) != 3:
+    sys.exit(f"stand-in git: unsupported call {args}")
+match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)\.git", args[2])
+if not match:
+    sys.exit(f"stand-in git: unexpected URL {args[2]}")
+path = os.path.join(os.environ["FAKE_GIT_DIR"], match[1], match[2] + ".tags")
+if os.path.isfile(path[:-5] + ".stderr"):
+    sys.stderr.write(open(path[:-5] + ".stderr").read())
+    sys.exit(128)
+if not os.path.isfile(path):
+    sys.stderr.write("fatal: could not read Username for 'https://github.com': terminal prompts disabled\n")
+    sys.exit(128)
+sys.stdout.write(open(path).read())
+PY
+cat > "${fakebin}/gh" <<'PY'
+#!/usr/bin/env python3
+import os, re, subprocess, sys
+args = sys.argv[1:]
+if not args or args[0] != "api":
+    sys.exit(f"stand-in gh: unsupported call {args}")
+import hashlib, json
+endpoint, jq, paginate, rest = None, None, False, args[1:]
+while rest:
+    arg = rest.pop(0)
+    if arg == "--paginate":
+        paginate = True
+    elif arg == "--jq":
+        jq = rest.pop(0)
+    elif arg.startswith("-"):
+        sys.exit(f"stand-in gh: unsupported flag {arg}")
+    else:
+        endpoint = arg
+# Responses are keyed by the exact endpoint, less the API host, so a request
+# with a different path or query finds nothing.
+key = hashlib.sha256(re.sub(r"^https://api\.github\.com/", "", endpoint).encode()).hexdigest()
+path = os.path.join(os.environ["FAKE_GH_DIR"], key)
+if os.path.isfile(path + ".seq"):
+    # A sequence answers successive calls in turn and then repeats its last
+    # answer: a pull request whose head moves between two reads.
+    sequence = json.load(open(path + ".seq"))
+    pages = sequence[:1]
+    if len(sequence) > 1:
+        json.dump(sequence[1:], open(path + ".seq", "w"))
+elif not os.path.isfile(path):
+    sys.stderr.write("gh: Not Found (HTTP 404)\n")
+    sys.exit(1)
+else:
+    pages = json.load(open(path))
+if not paginate:
+    pages = pages[:1]  # without --paginate, gh returns the first page only
+status = 0
+for body in pages:
+    if jq is None:
+        sys.stdout.write(body)
+        continue
+    result = subprocess.run(["jq", "-r", jq], input=body, text=True, capture_output=True)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    status = status or result.returncode
+sys.exit(status)
+PY
+chmod +x "${fakebin}/git" "${fakebin}/gh"
+
+# gh_response ENDPOINT BODY [BODY ...]: what the stand-in gh returns for
+# exactly ENDPOINT, one body per page
+gh_response() {
+  local endpoint="$1"
+  shift
+  "${python}" -c 'import hashlib, json, sys
+key = hashlib.sha256(sys.argv[2].encode()).hexdigest()
+json.dump(sys.argv[3:], open(f"{sys.argv[1]}/{key}", "w"))' "${FAKE_GH_DIR}" "${endpoint}" "$@"
+}
+
+# gh_sequence ENDPOINT BODY [BODY ...]: one body per call to exactly ENDPOINT,
+# the last repeated
+gh_sequence() {
+  local endpoint="$1"
+  shift
+  "${python}" -c 'import hashlib, json, sys
+key = hashlib.sha256(sys.argv[2].encode()).hexdigest()
+json.dump(sys.argv[3:], open(f"{sys.argv[1]}/{key}.seq", "w"))' "${FAKE_GH_DIR}" "${endpoint}" "$@"
+}
+
+# contents_response REPOSITORY PATH REF TEXT: a contents-API file
+contents_response() {
+  local content
+  content="$(printf '%s\n' "$4" | base64 | tr -d '\n')"
+  gh_response "repos/$1/contents/$2?ref=$3" "{\"type\":\"file\",\"encoding\":\"base64\",\"content\":\"${content}\"}"
+}
+
+A=1111111111111111111111111111111111111111   # v1.2.0
+TEN=7777777777777777777777777777777777777777 # v10.0.0, not in the v1 line
+RC=8888888888888888888888888888888888888888  # v1.0.0-rc.1 only, a pre-release
+B=2222222222222222222222222222222222222222   # v1.3.0, and the alias v1
+C=3333333333333333333333333333333333333333   # no tag points here
+T=4444444444444444444444444444444444444444   # annotated tag object of v2.0.0
+D=5555555555555555555555555555555555555555   # the commit v2.0.0 points at
+E=abcdefabcdefabcdefabcdefabcdefabcdefabcd   # v3.0.0
+E_UPPER=ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD
+H=6666666666666666666666666666666666666666   # head of the stand-in pull requests
+for repository in tool wf; do
+  printf '%s\trefs/tags/%s\n' \
+    "${A}" v1.2.0 "${B}" v1.3.0 "${B}" v1 "${T}" v2.0.0 "${D}" 'v2.0.0^{}' "${E}" v3.0.0 "${TEN}" v10.0.0 "${RC}" v1.0.0-rc.1 \
+    > "${FAKE_GIT_DIR}/acme/${repository}.tags"
+done
+printf 'zzzz\trefs/tags/v9.9.9\n' >> "${FAKE_GIT_DIR}/acme/tool.tags"
+
+# write_file FIXTURE PATH CONTENTS
+write_file() {
+  mkdir -p "$(dirname "${work}/fixtures/$1/$2")"
+  printf '%s\n' "$3" > "${work}/fixtures/$1/$2"
+}
+
+# step_workflow FIXTURE USES: a one-step workflow
+step_workflow() {
+  write_file "$1" .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $2"
+}
+
+# run_check FIXTURE [VAR=VALUE ...]: the version-comment and permission step
+run_check() {
+  local fixture="$1"
+  shift
+  env AUDIT_TARGET="${work}/fixtures/${fixture}" PATH="${fakebin}:${PATH}" "$@" \
+    "${python}" "${work}/check.py" > "${work}/${fixture}.out" 2>&1
+}
+
+# The runner reads a line as a workflow command when, after leading
+# whitespace, it starts with `::`, or when it holds `##[` anywhere; between
+# `::stop-commands::TOKEN` and `::TOKEN::` it reads none.
+cat > "${work}/commands.py" <<'DETECT'
+import re, sys
+registered = {"add-mask", "add-matcher", "remove-matcher", "add-path", "set-env", "set-output", "save-state",
+              "debug", "notice", "warning", "error", "group", "endgroup", "echo", "stop-commands"}
+own = re.compile(r"^::error (file=[^:]*,line=[0-9]+,)?title=pin-check( unpinned)?::")
+def parse(line):
+    trimmed = line.lstrip()
+    if trimmed.startswith("::") and (end := trimmed.find("::", 2)) >= 0:
+        name = trimmed[2:end].split(" ", 1)[0]
+        if name.lower() in registered:
+            return "v2", name, trimmed[end + 2:]
+    if (start := line.find("##[")) >= 0 and (close := line.find("]", start)) >= 0:
+        name = line[start + 3:close].split(" ", 1)[0]
+        if name.lower() in registered:
+            return "v1", name, line[close + 1:]
+    return None
+stopped, forged = None, []
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+for number, line in enumerate(re.split(r"\r\n|\r|\n", text), 1):
+    command = parse(line)
+    if command is None:
+        continue
+    kind, name, payload = command
+    if stopped is not None:
+        if name.lower() == stopped.lower():
+            stopped = None
+        continue
+    if kind == "v2" and name.lower() == "stop-commands" and re.fullmatch(r"[0-9a-f]{32}", payload):
+        stopped = payload
+        registered.add(payload.lower())
+        continue
+    if not (kind == "v2" and own.match(line.lstrip())):
+        forged.append(f"{number}: {line[:160]}")
+print("\n".join(forged))
+sys.exit(1 if forged else 0)
+DETECT
+
+# no_forged_commands FILE: every workflow command the runner would read in FILE is one this check wrote
+no_forged_commands() {
+  if ! "${python}" "${work}/commands.py" "$1" > "$1.commands"; then
+    fail "$1: output carries a workflow command the check did not write"
+    sed 's/^/    /' "$1.commands" >&2
+  fi
+}
+
+expect_pass() {
+  local fixture="$1"
+  shift
+  if ! run_check "${fixture}" "$@"; then
+    fail "${fixture}: expected the check to pass"
+    sed 's/^/    /' "${work}/${fixture}.out" >&2
+  fi
+  no_forged_commands "${work}/${fixture}.out"
+}
+
+# expect_fail FIXTURE TEXT [VAR=VALUE ...]: fails, and an annotation contains TEXT
+expect_fail() {
+  local fixture="$1" text="$2"
+  shift 2
+  if run_check "${fixture}" "$@"; then
+    fail "${fixture}: expected the check to fail"
+  elif ! grep -F -- '::error ' "${work}/${fixture}.out" | grep -Fq -- "${text}"; then
+    fail "${fixture}: no annotation contains: ${text}"
+    sed 's/^/    /' "${work}/${fixture}.out" >&2
+  fi
+  no_forged_commands "${work}/${fixture}.out"
+}
+
+# expect_also FIXTURE TEXT: the last run of FIXTURE also carries an annotation with TEXT
+expect_also() {
+  if ! grep -F -- '::error ' "${work}/$1.out" | grep -Fq -- "$2"; then
+    fail "$1: no annotation contains: $2"
+  fi
+}
+
+# --- version comments
+step_workflow exact "acme/tool@${A} # v1.2.0"
+expect_pass exact
+
+step_workflow alias-moved "acme/tool@${A} # v1"
+expect_pass alias-moved
+
+step_workflow stale-comment "acme/tool@${A} # v1.3.0"
+expect_fail stale-comment "tag v1.3.0 of acme/tool is at 222222222222, not 111111111111; 111111111111 is tagged v1.2.0"
+
+step_workflow no-comment "acme/tool@${A}"
+expect_fail no-comment "has no version comment"
+
+step_workflow unknown-tag "acme/tool@${A} # v9"
+expect_fail unknown-tag "the comment names v9, which is not a tag of acme/tool; 111111111111 is tagged v1.2.0"
+
+step_workflow untagged "acme/tool@${C} # v1.2.0"
+expect_fail untagged "no tag of acme/tool points at 333333333333"
+
+step_workflow annotated "acme/tool@${D} # v2.0.0"
+expect_pass annotated
+
+step_workflow annotated-object "acme/tool@${T} # v2.0.0"
+expect_fail annotated-object "tag v2.0.0 of acme/tool is at 555555555555, not 444444444444"
+
+step_workflow quoted "'acme/tool@${A}' # v1.2.0"
+expect_pass quoted
+
+step_workflow upper-case-sha "acme/tool@${E_UPPER} # v3.0.0"
+expect_pass upper-case-sha
+
+step_workflow alias-other-line "acme/tool@${TEN} # v1"
+expect_fail alias-other-line "tag v1 of acme/tool is at 222222222222, not 777777777777; 777777777777 is tagged v10.0.0"
+
+step_workflow alias-pre-release "acme/tool@${RC} # v1"
+expect_fail alias-pre-release "tag v1 of acme/tool is at 222222222222, not 888888888888; 888888888888 is tagged v1.0.0-rc.1"
+
+step_workflow malformed-tag-row "acme/tool@${A} # v9.9.9"
+expect_fail malformed-tag-row "the comment names v9.9.9, which is not a tag of acme/tool"
+
+# An anchor may stand before the key on the step line too (it anchors the key).
+write_file anchor-before-key .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - &tool uses: acme/tool@${A} # v1.2.0"
+expect_pass anchor-before-key
+
+write_file set-step .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - !!set {uses: acme/tool@main}"
+expect_fail set-step "is not a plain mapping"
+
+# A .git directory is never read.
+write_file dot-git .git/x/action.yml "name: x
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@v1"
+write_file dot-git .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+expect_pass dot-git
+
+# A linked workflow or action file loads whatever it points at, which can
+# change without touching the link.
+write_file symlink ci/x-action.yaml "name: x
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.2.0"
+mkdir -p "${work}/fixtures/symlink/tools/x"
+ln -s ../../ci/x-action.yaml "${work}/fixtures/symlink/tools/x/action.yml"
+expect_fail symlink "tools/x/action.yml,line=1,title=pin-check::is a symbolic link"
+
+# File names are annotation properties: line breaks are escaped.
+write_file lf-name $'.github/workflows/a\nb.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@v1"
+expect_fail lf-name "::error file=.github/workflows/a%0Ab.yml,line=8,title=pin-check::acme/tool@v1 is not pinned"
+write_file cr-name $'.github/workflows/a\rb.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@v1"
+expect_fail cr-name "::error file=.github/workflows/a%0Db.yml,line=8,title=pin-check::acme/tool@v1 is not pinned"
+
+step_workflow upper-case-wrong "acme/tool@${E_UPPER} # v1.2.0"
+expect_fail upper-case-wrong "tag v1.2.0 of acme/tool is at 111111111111, not abcdefabcdef; abcdefabcdef is tagged v3.0.0"
+
+# An image needs a tag or a digest.
+for case in "docker-untagged-check:docker://alpine" "docker-registry-port:docker://localhost:5000/img" \
+    "docker-short-digest:docker://alpine@sha256:abc"; do
+  step_workflow "${case%%:*}" "${case#*:}"
+  expect_fail "${case%%:*}" "${case#*:} names no image tag or digest"
+done
+
+# Merge keys are refused anywhere, not only where a uses could hide.
+write_file merge-permissions .github/workflows/test.yml "name: test
+on: pull_request
+x-grant: &grant
+  contents: read
+  actions: read
+jobs:
+  lint:
+    permissions:
+      <<: *grant
+    uses: acme/wf/.github/workflows/lint.yml@${A} # v1.2.0"
+expect_fail merge-permissions "YAML merge keys are not supported (line 9)"
+
+step_workflow docker-empty-tag "'docker://alpine:'"
+expect_fail docker-empty-tag "docker://alpine: names no image tag or digest"
+
+step_workflow docker-digest "docker://alpine@sha256:$(printf 'a%.0s' $(seq 1 64))"
+expect_pass docker-digest
+
+write_file dangling-link .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+ln -s ../../nowhere.yml "${work}/fixtures/dangling-link/.github/workflows/linked.yml"
+expect_fail dangling-link "file=.github/workflows/linked.yml,line=1,title=pin-check::is a symbolic link"
+
+# Local and docker references are not pins; the check passes over them.
+write_file not-pins .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./tools/setup
+      - uses: docker://alpine:3.20
+      - uses: acme/tool@${A} # v1.2.0"
+expect_pass not-pins
+
+# A lookup tool that cannot be started fails the check.
+step_workflow no-git "acme/tool@${A} # v1.2.0"
+expect_fail no-git "listing the tags of acme/tool failed: [Errno 2]" PATH=/nonexistent
+
+step_workflow tag-pin "acme/tool@v1"
+expect_fail tag-pin "acme/tool@v1 is not pinned to a full commit SHA"
+
+# zizmor sees a hash pin here and stays silent, so this step must not skip it.
+step_workflow unreadable-path "acme/tool/x+y@${C} # v1.2.0"
+expect_fail unreadable-path "cannot read 'acme/tool/x+y@${C}' as owner/repo[/path]@ref"
+
+step_workflow no-tag-listing "acme/missing@${A} # v1.2.0"
+expect_fail no-tag-listing "listing the tags of acme/missing failed: fatal: could not read Username"
+
+write_file composite actions/lint/action.yml "name: lint
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.3.0"
+expect_fail composite "tag v1.3.0 of acme/tool"
+
+write_file node-modules tools/node_modules/setup/action.yml "name: setup
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${C} # v1.2.0"
+expect_fail node-modules "no tag of acme/tool points at 333333333333"
+
+write_file dot-yml .github/workflows/.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+expect_fail dot-yml "no tag of acme/tool points at 333333333333"
+
+# A runner on a case-insensitive file system loads Action.yml as action.yml.
+write_file action-case tools/setup/Action.yml "name: setup
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${C} # v1.2.0"
+expect_fail action-case "no tag of acme/tool points at 333333333333"
+
+# YAML merge keys and tagged steps hide keys from a node walk; they are refused.
+write_file merge-step .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - &base {uses: acme/tool@${C}}
+    steps:
+      - <<: *base"
+expect_fail merge-step "YAML merge keys are not supported"
+
+write_file merge-jobs .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+x-jobs: &all
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C}
+jobs:
+  <<: *all"
+expect_fail merge-jobs "YAML merge keys are not supported"
+
+write_file omap-step .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - !!omap [uses: acme/tool@main]"
+expect_fail omap-step "is not a plain mapping"
+
+# An anchored pin and its alias are read from the anchor's line.
+write_file anchor-ok .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: &tool acme/tool@${A} # v1.2.0
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: *tool"
+expect_pass anchor-ok
+
+write_file anchor-stale .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: &tool acme/tool@${A} # v1.3.0
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: *tool"
+expect_fail anchor-stale "tag v1.3.0 of acme/tool"
+
+# The comment is read from the line YAML puts the uses on, so a look-alike
+# line in a run block can neither satisfy the check nor break it.
+write_file decoy .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          uses: acme/tool@${A} # v1.2.0
+      - \"uses\": acme/tool@${A} # v1.3.0"
+expect_fail decoy "cannot read the version comment of acme/tool@${A}"
+
+write_file run-block-noise .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0
+      - run: |
+          cat <<'YAML'
+          - uses: acme/tool@${A}
+          YAML"
+expect_pass run-block-noise
+
+write_file flow-style .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - {uses: acme/tool@${A}} # v1.2.0"
+expect_fail flow-style "cannot read the version comment of acme/tool@${A}"
+
+# --- reusable-workflow permissions
+contents_response acme/wf .github/workflows/lint.yml "${A}" 'on: workflow_call
+permissions:
+  contents: read
+  actions: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+
+# reusable_workflow FIXTURE WORKFLOW-PERMISSIONS JOB-PERMISSIONS USES [TRIGGER]
+reusable_workflow() {
+  write_file "$1" .github/workflows/test.yml "name: test
+on: ${5:-pull_request}
+$2
+jobs:
+  lint:
+$3
+    uses: $4"
+}
+
+lint_pin="acme/wf/.github/workflows/lint.yml@${A} # v1.2.0"
+lint_ref="acme/wf/.github/workflows/lint.yml@${A}"
+
+reusable_workflow job-level-stale '' '    permissions:
+      contents: read
+      actions: read' "acme/wf/.github/workflows/lint.yml@${A} # v1.3.0"
+expect_fail job-level-stale "tag v1.3.0 of acme/wf is at 222222222222, not 111111111111"
+
+reusable_workflow job-level-no-comment '' '    permissions:
+      contents: read
+      actions: read' "acme/wf/.github/workflows/lint.yml@${A}"
+expect_fail job-level-no-comment "acme/wf@${A} has no version comment"
+
+reusable_workflow job-level-tag-pin '' '    permissions: {}' "acme/wf/.github/workflows/lint.yml@v1"
+expect_fail job-level-tag-pin "acme/wf/.github/workflows/lint.yml@v1 is not pinned to a full commit SHA"
+
+reusable_workflow elevation '' '    permissions:
+      contents: read' "${lint_pin}"
+expect_fail elevation "job 'lint' grants actions: none, but ${lint_ref} asks for actions: read"
+
+reusable_workflow fit '' '    permissions:
+      contents: read
+      actions: read' "${lint_pin}"
+expect_pass fit
+
+reusable_workflow workflow-level 'permissions:
+  contents: read
+  actions: read' '' "${lint_pin}"
+expect_pass workflow-level
+
+reusable_workflow job-overrides-workflow 'permissions: write-all' '    permissions:
+      contents: read' "${lint_pin}"
+expect_fail job-overrides-workflow "grants actions: none"
+
+reusable_workflow empty-grant '' '    permissions: {}' "${lint_pin}"
+expect_fail empty-grant "grants actions: none"
+
+reusable_workflow write-all '' '    permissions: write-all' "${lint_pin}"
+expect_pass write-all
+
+reusable_workflow undeclared-elevation '' '' "${lint_pin}"
+expect_fail undeclared-elevation "job 'lint' declares no permissions, but ${lint_ref} asks for actions: read"
+
+contents_response acme/wf .github/workflows/contents.yml "${B}" 'on: workflow_call
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow undeclared-default '' '' "acme/wf/.github/workflows/contents.yml@${B} # v1.3.0"
+expect_pass undeclared-default
+
+contents_response acme/wf .github/workflows/job-level.yml "${B}" 'on: workflow_call
+permissions: write-all
+jobs:
+  narrow:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  wide:
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-jobs '' '    permissions:
+      contents: read
+      issues: read' "acme/wf/.github/workflows/job-level.yml@${B} # v1.3.0"
+expect_fail callee-jobs "grants issues: read, but acme/wf/.github/workflows/job-level.yml@${B} asks for issues: write"
+
+contents_response acme/wf .github/workflows/narrowed.yml "${B}" 'on: workflow_call
+permissions: write-all
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-job-narrows '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/narrowed.yml@${B} # v1.3.0"
+expect_pass callee-job-narrows   # GitHub checks each called job, and this job asks for contents: read only
+
+contents_response acme/wf .github/workflows/inherit.yml "${B}" 'on: workflow_call
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-inherits '' '    permissions: {}' "acme/wf/.github/workflows/inherit.yml@${B} # v1.3.0"
+expect_pass callee-inherits
+
+# A shorthand grant covers scopes this check does not list by name.
+contents_response acme/wf .github/workflows/unlisted.yml "${B}" 'on: workflow_call
+jobs:
+  build:
+    permissions:
+      artifact-metadata: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow write-all-unlisted-scope '' '    permissions: write-all' "acme/wf/.github/workflows/unlisted.yml@${B} # v1.3.0"
+expect_pass write-all-unlisted-scope
+
+contents_response acme/wf .github/workflows/everything.yml "${B}" 'on: workflow_call
+permissions: write-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-write-all '' '    permissions:
+      contents: write
+      actions: write' "acme/wf/.github/workflows/everything.yml@${B} # v1.3.0"
+expect_fail callee-write-all "job 'lint' grants less than write-all, which acme/wf/.github/workflows/everything.yml@${B} asks for"
+
+# A job in a workflow run only by workflow_call inherits its caller's grant,
+# which is not visible here. It must declare what it passes on; declared, it
+# is checked here and its own caller's grant one level up.
+reusable_workflow reusable-caller '' '' "${lint_pin}" workflow_call
+expect_fail reusable-caller "job 'lint' declares no permissions and its workflow runs on workflow_call"
+
+reusable_workflow reusable-caller-declared '' '    permissions:
+      contents: read
+      actions: read' "${lint_pin}" workflow_call
+expect_pass reusable-caller-declared
+
+reusable_workflow reusable-caller-asks-nothing '' '' "acme/wf/.github/workflows/inherit.yml@${B} # v1.3.0" workflow_call
+expect_pass reusable-caller-asks-nothing
+
+contents_response acme/wf .github/workflows/nothing.yml "${B}" 'on: workflow_call
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow reusable-caller-callee-none '' '' "acme/wf/.github/workflows/nothing.yml@${B} # v1.3.0" workflow_call
+expect_pass reusable-caller-callee-none
+
+reusable_workflow reusable-caller-missing-callee '' '' "acme/wf/.github/workflows/absent.yml@${A} # v1.2.0" workflow_call
+expect_fail reusable-caller-missing-callee "gh: Not Found (HTTP 404)"
+
+reusable_workflow reusable-and-push '' '' "${lint_pin}" '[workflow_call, push]'
+expect_fail reusable-and-push "job 'lint' declares no permissions and its workflow runs on workflow_call"
+
+reusable_workflow local-callee '' '    permissions:
+      issues: read' './.github/workflows/callee.yml'
+write_file local-callee .github/workflows/callee.yml 'on: workflow_call
+permissions:
+  issues: write
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+expect_fail local-callee "grants issues: read, but ./.github/workflows/callee.yml asks for issues: write"
+
+reusable_workflow head-callee '' '    permissions:
+      issues: read' './.github/workflows/head-callee.yml'
+contents_response acme/repo .github/workflows/head-callee.yml "${H}" 'on: workflow_call
+permissions:
+  issues: write
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+expect_fail head-callee "grants issues: read, but ./.github/workflows/head-callee.yml asks for issues: write" \
+  PIN_CHECK_HEAD_SHA="${H}" GITHUB_REPOSITORY=acme/repo
+
+reusable_workflow local-with-ref '' '    permissions:
+      issues: read' './.github/workflows/callee.yml@v1'
+expect_fail local-with-ref "cannot read './.github/workflows/callee.yml@v1' as owner/repo[/path]@ref"
+
+reusable_workflow dot-segment '' '    permissions: {}' "acme/../wf/.github/workflows/lint.yml@${A} # v1.2.0"
+expect_fail dot-segment "refusing a dot segment"
+
+reusable_workflow nested-path '' '    permissions: {}' "acme/wf/.github/workflows/sub/lint.yml@${A} # v1.2.0"
+expect_fail nested-path "not a reusable workflow path"
+
+reusable_workflow missing-callee '' '    permissions: {}' "acme/wf/.github/workflows/absent.yml@${A} # v1.2.0"
+expect_fail missing-callee "reading acme/wf/.github/workflows/absent.yml@${A} failed: gh: Not Found (HTTP 404)"
+
+gh_response "repos/acme/wf/contents/.github/workflows/garbled.yml?ref=${A}" 'not json'
+reusable_workflow garbled-callee '' '    permissions: {}' "acme/wf/.github/workflows/garbled.yml@${A} # v1.2.0"
+expect_fail garbled-callee "job 'lint': Expecting value: line 1 column 1"
+
+gh_response "repos/acme/wf/contents/.github/workflows/dir.yml?ref=${A}" '{"type":"dir"}'
+reusable_workflow not-a-file '' '    permissions: {}' "acme/wf/.github/workflows/dir.yml@${A} # v1.2.0"
+expect_fail not-a-file "is not a base64 file"
+
+contents_response acme/wf .github/workflows/listed-jobs.yml "${B}" 'on: workflow_call
+permissions: write-all
+jobs:
+  - build'
+reusable_workflow callee-jobs-not-mapping '' '    permissions: {}' "acme/wf/.github/workflows/listed-jobs.yml@${B} # v1.3.0"
+expect_fail callee-jobs-not-mapping "jobs is not a mapping"
+
+# A permissions key spelled like the check's own catch-all is just another scope.
+reusable_workflow star-key '' '    permissions:
+      "*": write' "${lint_pin}"
+expect_fail star-key "grants actions: none"
+
+# Job ids that PyYAML reads as booleans or null still resolve.
+write_file job-id-yes .github/workflows/test.yml "name: test
+on: pull_request
+jobs:
+  yes:
+    permissions:
+      contents: read
+      actions: read
+    uses: ${lint_pin}"
+expect_pass job-id-yes
+
+# Job ids that safe_load folds together (yes, on, true) are distinct jobs to
+# GitHub; each is checked against its own grant.
+write_file folded-ids .github/workflows/test.yml "name: test
+on: pull_request
+jobs:
+  yes:
+    permissions: {}
+    uses: ${lint_pin}
+  on:
+    permissions:
+      contents: read
+      actions: read
+    uses: ${lint_pin}"
+expect_fail folded-ids "job 'yes' grants actions: none, but ${lint_ref} asks for actions: read"
+
+write_file repeated-id .github/workflows/test.yml "name: test
+on: pull_request
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: ${lint_pin}
+  lint:
+    permissions: write-all
+    uses: ${lint_pin}"
+expect_fail repeated-id "job 'lint' grants actions: none, but ${lint_ref} asks for actions: read"
+
+contents_response acme/wf .github/workflows/folded.yml "${B}" 'on: workflow_call
+jobs:
+  yes:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  on:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow callee-folded-ids '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/folded.yml@${B} # v1.3.0"
+expect_fail callee-folded-ids "grants contents: read, but acme/wf/.github/workflows/folded.yml@${B} asks for contents: write"
+
+contents_response acme/wf .github/workflows/job-list.yml "${B}" 'on: workflow_call
+jobs:
+  build:
+    - run: true'
+reusable_workflow callee-job-not-mapping '' '    permissions: {}' "acme/wf/.github/workflows/job-list.yml@${B} # v1.3.0"
+expect_fail callee-job-not-mapping "job 'build' is not a mapping"
+
+# A shorthand that falls short comes with every named scope beyond it.
+contents_response acme/wf .github/workflows/mixed.yml "${B}" 'on: workflow_call
+jobs:
+  read:
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  write:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow mixed-shorthand '' '    permissions:
+      contents: read' "acme/wf/.github/workflows/mixed.yml@${B} # v1.3.0"
+expect_fail mixed-shorthand "grants less than read-all, which acme/wf/.github/workflows/mixed.yml@${B} asks for"
+expect_also mixed-shorthand "grants contents: read, but acme/wf/.github/workflows/mixed.yml@${B} asks for contents: write"
+
+# A reusable workflow pinned with an upper-case SHA is read at the lower-case ref.
+contents_response acme/wf .github/workflows/lint.yml "${E}" 'on: workflow_call
+permissions:
+  contents: read
+  actions: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow upper-case-callee '' '    permissions:
+      contents: read
+      actions: read' "acme/wf/.github/workflows/lint.yml@${E_UPPER} # v3.0.0"
+expect_pass upper-case-callee
+
+# A name from YAML cannot start a workflow command of its own.
+contents_response acme/wf .github/workflows/forge.yml "${B}" 'on: workflow_call
+jobs:
+  "x\n::warning file=README.md,line=1::looks fine":
+    permissions:
+      contents: bogus
+    runs-on: ubuntu-latest
+    steps:
+      - run: true'
+reusable_workflow forged-annotation '' '    permissions: {}' "acme/wf/.github/workflows/forge.yml@${B} # v1.3.0"
+expect_fail forged-annotation "unknown permission level 'bogus'"
+
+# Text from a lookup can carry line breaks; none of it may start a command.
+printf 'remote: 50%%\r::warning::cr\nremote: x\n::warning file=README.md,line=1::looks fine\nfatal: not found\n' \
+  > "${FAKE_GIT_DIR}/acme/noisy.stderr"
+step_workflow noisy-lookup "acme/noisy@${A} # v1.2.0"
+# Python reads the stand-in's stderr in text mode, so its CR arrives as LF.
+expect_fail noisy-lookup "listing the tags of acme/noisy failed: remote: 50%25%0A::warning::cr%0Aremote: x%0A::warning file=README.md"
+
+# A file name is an annotation property: commas and colons are escaped.
+write_file property-escape '.github/workflows/a,line=1:b.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+expect_fail property-escape "::error file=.github/workflows/a%2Cline=1%3Ab.yml,line=8,title=pin-check::"
+
+step_workflow unexpected-failure "acme/tool@${A} # v1.2.0"
+expect_fail unexpected-failure "unexpected failure: ValueError" 'PIN_CHECK_COLLECTED=x
+##[warning]looks fine'
+
+step_workflow partial-check "acme/tool@${A} # v1.2.0"
+expect_fail partial-check "collected 2 file(s) but checked 1" PIN_CHECK_COLLECTED=2
+
+# --- the full-SHA step: zizmor's offline unpinned-uses, run from the workflow
+# run_full_sha FIXTURE: 0 when the step passes
+run_full_sha() {
+  mkdir -p "${work}/runner-$1"
+  local status=0
+  AUDIT_TARGET="${work}/fixtures/$1" AUDIT_TARGET_EMPTY=false RUNNER_TEMP="${work}/runner-$1" \
+    bash --noprofile --norc -eo pipefail "${work}/full-sha.sh" > "${work}/$1.full-sha.out" 2>&1 || status=$?
+  no_forged_commands "${work}/$1.full-sha.out"
+  return "${status}"
+}
+step_workflow checkout-tag "actions/checkout@v4"
+reusable_workflow wf-tag-pin '' '' "acme/wf/.github/workflows/lint.yml@v1"
+write_file composite-tag actions/lint/action.yml 'name: lint
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@v1'
+for fixture in tag-pin checkout-tag wf-tag-pin composite-tag; do
+  if run_full_sha "${fixture}"; then
+    fail "${fixture}: the full-SHA step passed a tag pin"
+  elif ! grep -Fq 'title=pin-check unpinned::action is not pinned to a hash' "${work}/${fixture}.full-sha.out" \
+      || ! grep -Fxq 'Found 1 unpinned reference(s).' "${work}/${fixture}.full-sha.out"; then
+    fail "${fixture}: the full-SHA step failed without reporting the unpinned uses"
+    sed 's/^/    /' "${work}/${fixture}.full-sha.out" >&2
+  fi
+done
+grep -Fq '::error file=.github/workflows/test.yml,line=8,title=pin-check unpinned::' "${work}/tag-pin.full-sha.out" \
+  || fail "tag-pin: the full-SHA annotation does not name the file relative to the repository"
+write_file full-sha-escape '.github/workflows/a,line=1:b.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@v1"
+if run_full_sha full-sha-escape; then
+  fail "full-sha-escape: the full-SHA step passed a tag pin"
+elif ! grep -Fq '::error file=.github/workflows/a%2Cline=1%3Ab.yml,line=8,title=pin-check unpinned::' "${work}/full-sha-escape.full-sha.out"; then
+  fail "full-sha-escape: the file property is not escaped"
+  sed 's/^/    /' "${work}/full-sha-escape.full-sha.out" >&2
+fi
+write_file zizmor-quotes-expression .github/workflows/test.yml "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    if: |
+      \${{ (
+      ::notice title=pin-check::Every pin matches its tag.
+      ##[warning file=README.md;line=1]looks fine
+      }}
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+write_file zizmor-quotes-name '.github/workflows/a##[warning]b.yml' "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+write_file zizmor-fails .github/workflows/test.yml "name: test
+on: push
+jobs:
+  test:
+    runs-on: ['
+::warning file=README.md,line=1::looks fine
+##[warning file=README.md;line=1]looks fine"
+if run_full_sha zizmor-fails; then
+  fail "zizmor-fails: the full-SHA step passed a file zizmor could not read"
+elif ! grep -Eq '^::stop-commands::[0-9a-f]{32}$' "${work}/zizmor-fails.full-sha.out"; then
+  fail "zizmor-fails: zizmor's log was not fenced off"
+fi
+step_workflow docker-untagged "docker://alpine"
+if run_full_sha docker-untagged; then
+  fail "docker-untagged: the full-SHA step passed an image with no tag"
+elif ! grep -Fq 'Pin the image to a tag or a sha256 digest.' "${work}/docker-untagged.full-sha.out"; then
+  fail "docker-untagged: the advice does not fit an image"
+fi
+if run_full_sha lf-name; then
+  fail "lf-name: the full-SHA step passed a tag pin"
+elif ! grep -Fq '::error file=.github/workflows/a%0Ab.yml,line=8,title=pin-check unpinned::' "${work}/lf-name.full-sha.out"; then
+  fail "lf-name: the file property's line break is not escaped"
+fi
+for fixture in exact fit local-callee composite zizmor-quotes-expression zizmor-quotes-name; do
+  if ! run_full_sha "${fixture}"; then
+    fail "${fixture}: the full-SHA step failed a SHA or local pin"
+    sed 's/^/    /' "${work}/${fixture}.full-sha.out" >&2
+  fi
+done
+
+# --- the PR-mode collection step, against the stand-in API
+api_file() {  # api_file PATH [REF]: one entry of the pull request's file list
+  printf '{"status":"modified","filename":"%s","contents_url":"https://api.github.com/repos/acme/repo/contents/%s?ref=%s"}' "$1" "$1" "${2:-${H}}"
+}
+gh_response "repos/acme/repo/pulls/7" "{\"changed_files\":4,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/7/files?per_page=100" \
+  "[$(api_file .github/workflows/a.yml),$(api_file tools/setup/action.yml)]" \
+  "[$(api_file README.md),{\"status\":\"removed\",\"filename\":\".github/workflows/old.yml\",\"contents_url\":\"https://api.github.com/repos/acme/repo/contents/.github/workflows/old.yml?ref=${H}\"}]"
+gh_response "repos/acme/repo/pulls/12" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/12/files?per_page=100" "[$(api_file README.md)]"
+gh_response "repos/acme/repo/pulls/13" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/13/files?per_page=100" "[$(api_file ../escape/action.yml)]"
+contents_response acme/repo .github/workflows/a.yml "${H}" "name: a
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+contents_response acme/repo tools/setup/action.yml "${H}" "name: setup
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.3.0"
+gh_response "repos/acme/repo/pulls/8" "{\"changed_files\":4,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/8/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/10" "{\"changed_files\":2,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/10/files?per_page=100" "[$(api_file .github/workflows/a.yml),$(api_file tools/setup/Action.yml)]"
+contents_response acme/repo tools/setup/Action.yml "${H}" "name: setup
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${C} # v1.2.0"
+H2=6666666666666666666666666666666666666662   # a head whose tree links an action file
+H3=6666666666666666666666666666666666666663   # a head whose tree is truncated
+gh_response "repos/acme/repo/git/trees/${H}?recursive=1" '{"truncated":false,"tree":[{"path":"README.md","mode":"100644"}]}'
+gh_response "repos/acme/repo/git/trees/${H2}?recursive=1" \
+  '{"truncated":false,"tree":[{"path":"tools/x/action.yml","mode":"120000"},{"path":"ci/x-action.yaml","mode":"100644"}]}'
+gh_response "repos/acme/repo/git/trees/${H3}?recursive=1" '{"truncated":true,"tree":[]}'
+gh_response "repos/acme/repo/pulls/15" "{\"changed_files\":1,\"head\":{\"sha\":\"${H2}\"}}"
+gh_response "repos/acme/repo/pulls/15/files?per_page=100" "[$(api_file ci/x-action.yaml)]"
+gh_response "repos/acme/repo/pulls/16" "{\"changed_files\":1,\"head\":{\"sha\":\"${H3}\"}}"
+gh_response "repos/acme/repo/pulls/16/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/17" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/17/files?per_page=100" "[$(api_file .github/workflows/.yml)]"
+contents_response acme/repo .github/workflows/.yml "${H}" "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+long_name="tools/$(printf 'A%.0s' $(seq 1 300))/action.yml"
+gh_response "repos/acme/repo/pulls/18" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/18/files?per_page=100" "[$(api_file "${long_name}")]"
+gh_response "repos/acme/repo/pulls/19" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/19/files?per_page=100" "[$(api_file 'tools/x##[warning title=pin-check]Every pin matches its tag/action.yml')]"
+gh_response "repos/acme/repo/pulls/20" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/20/files?per_page=100" "[$(api_file tools/only/Action.yml)]"
+contents_response acme/repo tools/only/Action.yml "${H}" "name: only
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: acme/tool@${A} # v1.2.0"
+gh_response "repos/acme/repo/pulls/23" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/23/files?per_page=100" "[$(api_file .github/workflows/.yaml)]"
+contents_response acme/repo .github/workflows/.yaml "${H}" "name: test
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+gh_response "repos/acme/repo/pulls/24" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/24/files?per_page=100" "[$(api_file tools/img/Action.yml)]"
+contents_response acme/repo tools/img/Action.yml "${H}" "name: img
+description: fixture
+runs:
+  using: composite
+  steps:
+    - uses: docker://alpine"
+gh_response "repos/acme/repo/pulls/21" '{"changed_files":1,"head":{"sha":"not-a-sha"}}'
+gh_response "repos/acme/repo/pulls/22" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/22/files?per_page=100" "[$(api_file tools/dir/action.yml)]"
+gh_response "repos/acme/repo/contents/tools/dir/action.yml?ref=${H}" '{"type":"dir"}'
+gh_response "repos/acme/repo/pulls/11" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/11/files?per_page=100" "[$(api_file 'tools/x\n##[warning file=README.md;line=1;title=pin-check]looks fine/action.yml')]"
+gh_response "repos/acme/repo/pulls/9" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/9/files?per_page=100" "[$(api_file '..\n::warning::forged/action.yml')]"
+# One commit throughout: a head that moves during collection with the same
+# number of changed files, an event that names another head, contents URLs
+# that name a newer head, and a name that needs percent-encoding.
+H4=6666666666666666666666666666666666666664   # a head the pull request moves to
+gh_sequence "repos/acme/repo/pulls/25" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}" "{\"changed_files\":1,\"head\":{\"sha\":\"${H4}\"}}"
+gh_response "repos/acme/repo/pulls/25/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/26" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/26/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/27" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/27/files?per_page=100" "[$(api_file .github/workflows/pinned.yml "${H4}")]"
+contents_response acme/repo .github/workflows/pinned.yml "${H}" "name: pinned
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+contents_response acme/repo .github/workflows/pinned.yml "${H4}" "name: pinned
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${C} # v1.2.0"
+gh_sequence "repos/acme/repo/pulls/29" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}" 'not json'
+gh_response "repos/acme/repo/pulls/29/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+# The base branch: an event that named another base, and a base retargeted
+# during collection, which changes the file list without moving the head.
+gh_response "repos/acme/repo/pulls/30" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"main\"}}"
+gh_response "repos/acme/repo/pulls/30/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_sequence "repos/acme/repo/pulls/31" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"main\"}}" \
+  "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"},\"base\":{\"ref\":\"release\"}}"
+gh_response "repos/acme/repo/pulls/31/files?per_page=100" "[$(api_file .github/workflows/a.yml)]"
+gh_response "repos/acme/repo/pulls/28" "{\"changed_files\":1,\"head\":{\"sha\":\"${H}\"}}"
+gh_response "repos/acme/repo/pulls/28/files?per_page=100" "[$(api_file '.github/workflows/a b#c.yml')]"
+contents_response acme/repo '.github/workflows/a%20b%23c.yml' "${H}" "name: encoded
+on: push
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: acme/tool@${A} # v1.2.0"
+
+# run_prepare CASE PULL_REQUEST_NUMBER: 0 when the step passes
+run_prepare() {
+  local dir="${work}/prepare-$1"
+  mkdir -p "${dir}/temp" "${dir}/workspace"
+  : > "${dir}/env"
+  local status=0
+  GITHUB_ENV="${dir}/env" RUNNER_TEMP="${dir}/temp" GITHUB_WORKSPACE="${dir}/workspace" \
+    GITHUB_REPOSITORY=acme/repo PULL_REQUEST_NUMBER="$2" EVENT_HEAD_SHA="${EVENT_HEAD_SHA:-}" \
+    EVENT_BASE_REF="${EVENT_BASE_REF:-}" PATH="${fakebin}:${PATH}" \
+    bash --noprofile --norc -eo pipefail "${work}/prepare.sh" > "${dir}/out" 2>&1 || status=$?
+  no_forged_commands "${dir}/out"
+  return "${status}"
+}
+# run_pipeline CASE PULL_REQUEST_NUMBER: the collection step, then the two
+# checks with the variables it wrote to GITHUB_ENV; 0 when all three pass
+run_pipeline() {
+  local dir="${work}/prepare-$1" status=0
+  run_prepare "$1" "$2" || return 1
+  (
+    set -a
+    # shellcheck disable=SC1090,SC1091
+    . "${dir}/env"
+    set +a
+    RUNNER_TEMP="${dir}/temp" bash --noprofile --norc -eo pipefail "${work}/full-sha.sh" > "${dir}/full-sha.out" 2>&1 \
+      && PATH="${fakebin}:${PATH}" GITHUB_REPOSITORY=acme/repo "${python}" "${work}/check.py" > "${dir}/check.out" 2>&1
+  ) || status=1
+  no_forged_commands "${dir}/full-sha.out"
+  [ ! -f "${dir}/check.out" ] || no_forged_commands "${dir}/check.out"
+  return "${status}"
+}
+if run_pipeline empty 12; then
+  grep -Fxq "AUDIT_TARGET_EMPTY=true" "${work}/prepare-empty/env" || fail "prepare empty: AUDIT_TARGET_EMPTY is not true"
+  grep -Fxq "PIN_CHECK_COLLECTED=0" "${work}/prepare-empty/env" || fail "prepare empty: collected count"
+else
+  fail "prepare empty: a pull request with no workflow YAML failed"
+fi
+if run_prepare dot-segment 13; then
+  fail "prepare dot-segment: '../escape/action.yml' was accepted"
+elif ! grep -Fq "Unsafe workflow path returned by GitHub (base64)" "${work}/prepare-dot-segment/out"; then
+  fail "prepare dot-segment: unexpected output"
+fi
+if run_pipeline pipeline 7; then
+  fail "prepare pipeline: the stale comment in the collected action passed"
+elif ! grep -Fq "::error file=tools/setup/action.yml,line=6,title=pin-check::tag v1.3.0 of acme/tool" "${work}/prepare-pipeline/check.out"; then
+  fail "prepare pipeline: unexpected output"
+  sed 's/^/    /' "${work}/prepare-pipeline/"*.out >&2 || true
+fi
+if run_prepare pr 7; then
+  grep -Fxq "AUDIT_TARGET=${work}/prepare-pr/temp/pin-check-audit" "${work}/prepare-pr/env" || fail "prepare pr: audit target"
+  grep -Fxq "AUDIT_TARGET_EMPTY=false" "${work}/prepare-pr/env" || fail "prepare pr: AUDIT_TARGET_EMPTY is not false"
+  [ ! -e "${work}/prepare-pr/temp/pin-check-audit/.github/workflows/old.yml" ] || fail "prepare pr: collected a removed file"
+  grep -Fxq "PIN_CHECK_COLLECTED=2" "${work}/prepare-pr/env" || fail "prepare pr: collected count"
+  grep -Fxq "PIN_CHECK_HEAD_SHA=${H}" "${work}/prepare-pr/env" || fail "prepare pr: head SHA"
+  [ -f "${work}/prepare-pr/temp/pin-check-audit/tools/setup/action.yml" ] || fail "prepare pr: action outside .github not collected"
+  [ ! -e "${work}/prepare-pr/temp/pin-check-audit/README.md" ] || fail "prepare pr: collected a file that is not workflow YAML"
+  # The collected files, end to end: the action's comment is stale.
+  if env AUDIT_TARGET="${work}/prepare-pr/temp/pin-check-audit" PIN_CHECK_COLLECTED=2 PATH="${fakebin}:${PATH}" \
+      "${python}" "${work}/check.py" > "${work}/prepare-pr/check.out" 2>&1; then
+    fail "prepare pr: the stale comment in the collected action passed"
+  elif ! grep -Fq "::error file=tools/setup/action.yml,line=6,title=pin-check::tag v1.3.0 of acme/tool" "${work}/prepare-pr/check.out"; then
+    fail "prepare pr: unexpected check output"
+    sed 's/^/    /' "${work}/prepare-pr/check.out" >&2
+  fi
+  no_forged_commands "${work}/prepare-pr/check.out"
+else
+  fail "prepare pr: the collection step failed"
+  sed 's/^/    /' "${work}/prepare-pr/out" >&2
+fi
+if run_prepare case 10; then
+  grep -Fxq "PIN_CHECK_COLLECTED=2" "${work}/prepare-case/env" || fail "prepare case: Action.yml not collected"
+  if env AUDIT_TARGET="${work}/prepare-case/temp/pin-check-audit" PIN_CHECK_COLLECTED=2 PATH="${fakebin}:${PATH}" \
+      "${python}" "${work}/check.py" > "${work}/prepare-case/check.out" 2>&1; then
+    fail "prepare case: the untagged pin in Action.yml passed"
+  fi
+  no_forged_commands "${work}/prepare-case/check.out"
+else
+  fail "prepare case: the collection step failed"
+  sed 's/^/    /' "${work}/prepare-case/out" >&2
+fi
+if run_prepare partial 8; then
+  fail "prepare partial: a short file list was accepted"
+elif ! grep -Fq "refusing a partial audit" "${work}/prepare-partial/out"; then
+  fail "prepare partial: unexpected output"
+fi
+if run_prepare unsafe 9; then
+  fail "prepare unsafe: a dot-segment path was accepted"
+else
+  grep -Fq "Unsafe workflow path returned by GitHub (base64)" "${work}/prepare-unsafe/out" || fail "prepare unsafe: unexpected output"
+fi
+if run_prepare legacy 11; then
+  fail "prepare legacy: a path with a line break was accepted"
+fi
+if run_prepare symlink 15; then
+  fail "prepare symlink: a linked action file was accepted"
+elif ! grep -Fq "Workflow or action files that are symbolic links (base64): $(printf 'tools/x/action.yml' | base64 -w0)" "${work}/prepare-symlink/out"; then
+  fail "prepare symlink: unexpected output"
+fi
+if run_prepare truncated 16; then
+  fail "prepare truncated: a truncated tree was accepted"
+elif ! grep -Fq "too large to list in one response" "${work}/prepare-truncated/out"; then
+  fail "prepare truncated: unexpected output"
+fi
+if run_pipeline dot-yml 17; then
+  fail "prepare dot-yml: the untagged pin in .github/workflows/.yml passed"
+else
+  grep -Fxq "PIN_CHECK_COLLECTED=1" "${work}/prepare-dot-yml/env" || fail "prepare dot-yml: .yml not collected"
+fi
+for case in long:18 command:19; do
+  if run_prepare "${case%%:*}-name" "${case##*:}"; then
+    fail "prepare ${case%%:*}-name: an unsafe name was accepted"
+  elif ! grep -Fq "Unsafe workflow path returned by GitHub (base64)" "${work}/prepare-${case%%:*}-name/out"; then
+    fail "prepare ${case%%:*}-name: unexpected output"
+  fi
+done
+if run_pipeline zizmor-skip 20; then
+  grep -Fq "zizmor found no file it reads" "${work}/prepare-zizmor-skip/full-sha.out" || fail "prepare zizmor-skip: zizmor's verdict was not taken as a skip"
+else
+  fail "prepare zizmor-skip: a correctly pinned Action.yml alone failed"
+  sed 's/^/    /' "${work}/prepare-zizmor-skip/"*.out >&2 || true
+fi
+if ! run_pipeline dot-yaml-ok 23; then
+  fail "prepare dot-yaml-ok: a correctly pinned .github/workflows/.yaml alone failed"
+  sed 's/^/    /' "${work}/prepare-dot-yaml-ok/"*.out >&2 || true
+fi
+if run_pipeline image-only 24; then
+  fail "prepare image-only: an untagged image in an Action.yml passed"
+elif ! grep -Fq "docker://alpine names no image tag or digest" "${work}/prepare-image-only/check.out"; then
+  fail "prepare image-only: unexpected output"
+fi
+if run_prepare bad-head 21; then
+  fail "prepare bad-head: a head that is not a SHA was accepted"
+elif ! grep -Fq "Unexpected pull request head SHA (base64)" "${work}/prepare-bad-head/out"; then
+  fail "prepare bad-head: unexpected output"
+fi
+if run_prepare not-a-file 22; then
+  fail "prepare not-a-file: a contents entry that is not a file was accepted"
+fi
+if run_prepare moved 25; then
+  fail "prepare moved: a head that moved during collection was accepted"
+elif ! grep -Fq "moved to another head or base branch while its files were collected" "${work}/prepare-moved/out"; then
+  fail "prepare moved: unexpected output"
+  sed 's/^/    /' "${work}/prepare-moved/out" >&2
+fi
+if run_prepare reread-fails 29; then
+  fail "prepare reread-fails: a failed second read of the head was accepted"
+elif grep -Fq "AUDIT_TARGET=" "${work}/prepare-reread-fails/env"; then
+  fail "prepare reread-fails: the audit target was written"
+fi
+if EVENT_HEAD_SHA="${H4}" run_prepare event-old 26; then
+  fail "prepare event-old: a head other than the event's was checked"
+elif ! grep -Fq "no longer the commit this run was started for" "${work}/prepare-event-old/out"; then
+  fail "prepare event-old: unexpected output"
+  sed 's/^/    /' "${work}/prepare-event-old/out" >&2
+fi
+if ! EVENT_HEAD_SHA="${H}" run_prepare event-same 26; then
+  fail "prepare event-same: the event's own head failed"
+  sed 's/^/    /' "${work}/prepare-event-same/out" >&2
+fi
+if EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=release run_prepare base-old 30; then
+  fail "prepare base-old: files listed against another base than the event's were accepted"
+elif ! grep -Fq "no longer targets the base branch this run was started for" "${work}/prepare-base-old/out"; then
+  fail "prepare base-old: unexpected output"
+  sed 's/^/    /' "${work}/prepare-base-old/out" >&2
+fi
+if ! EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=main run_prepare base-same 30; then
+  fail "prepare base-same: the event's own base failed"
+  sed 's/^/    /' "${work}/prepare-base-same/out" >&2
+fi
+if EVENT_HEAD_SHA="${H}" EVENT_BASE_REF=main run_prepare base-moved 31; then
+  fail "prepare base-moved: a base retargeted during collection was accepted"
+elif ! grep -Fq "moved to another head or base branch while its files were collected" "${work}/prepare-base-moved/out"; then
+  fail "prepare base-moved: unexpected output"
+  sed 's/^/    /' "${work}/prepare-base-moved/out" >&2
+fi
+if run_pipeline pinned 27; then
+  grep -Fq "acme/tool@${A} # v1.2.0" "${work}/prepare-pinned/temp/pin-check-audit/.github/workflows/pinned.yml" \
+    || fail "prepare pinned: the file was not read at the checked head"
+else
+  fail "prepare pinned: the file was read at the head its contents URL named, not at the checked head"
+  sed 's/^/    /' "${work}/prepare-pinned/"*.out >&2 || true
+fi
+if run_pipeline encoded 28; then
+  [ -f "${work}/prepare-encoded/temp/pin-check-audit/.github/workflows/a b#c.yml" ] \
+    || fail "prepare encoded: the file was not collected under its own name"
+else
+  fail "prepare encoded: a name that needs percent-encoding was not read"
+  sed 's/^/    /' "${work}/prepare-encoded/"*.out >&2 || true
+fi
+if run_prepare push 0; then
+  grep -Fxq "AUDIT_TARGET=${work}/prepare-push/workspace" "${work}/prepare-push/env" || fail "prepare push: audit target"
+  grep -Fxq "AUDIT_TARGET_EMPTY=false" "${work}/prepare-push/env" || fail "prepare push: AUDIT_TARGET_EMPTY is not false"
+  grep -Fxq "PIN_CHECK_COLLECTED=" "${work}/prepare-push/env" || fail "prepare push: a collected count is set"
+else
+  fail "prepare push: the step failed"
+fi
+
+# --- the gate's own shape
+grep -Eq '^  pull_request_target:$' "${caller}" || fail "caller: must run on pull_request_target"
+if grep -Eq '^  pull_request:$' "${caller}"; then
+  fail "caller: pull_request would let a PR replace its own gate"
+fi
+if grep -Eq '^    paths(-ignore)?:$' "${caller}"; then
+  fail "caller: path filters can skip the gate on oversized diffs"
+fi
+grep -Eq '^        if: inputs\.pull_request_number == 0$' "${workflow}" || fail "workflow: checkout must be push-only"
+# A problem matcher reads a step's log even with workflow commands switched off.
+grep -Eq '^          add-problem-matchers: false$' "${workflow}" || fail "workflow: setup-uv must not add problem matchers"
+for flag in --offline --no-config --no-ignores --strict-collection; do
+  grep -Eq -- "^            ${flag} \\\\$" "${workflow}" || fail "workflow: zizmor must run with ${flag}"
+done
+# shellcheck disable=SC2016 # the expressions are matched literally
+grep -Fxq '          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' "${workflow}" \
+  || fail "workflow: the collection step must be given the event's head"
+# shellcheck disable=SC2016
+grep -Fxq '          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}' "${workflow}" \
+  || fail "workflow: the collection step must be given the event's base branch"
+# A base-branch change sends `edited`; without it the caller keeps a result
+# measured against the old base.
+grep -Fxq '    types: [opened, synchronize, reopened, edited]' "${caller}" \
+  || fail "caller: must run on opened, synchronize, reopened and edited"
+
+# --- online: this repository's own pins, and one real mismatch
+if [ "${PIN_CHECK_OFFLINE:-0}" != 1 ]; then
+  if ! AUDIT_TARGET="${repo_root}" "${python}" "${work}/check.py" > "${work}/self.out" 2>&1; then
+    fail "self: this repository's pins do not pass"
+    sed 's/^/    /' "${work}/self.out" >&2
+  fi
+  no_forged_commands "${work}/self.out"
+  checkout_v4=11d5960a326750d5838078e36cf38b85af677262
+  step_workflow real-mismatch "actions/checkout@${checkout_v4} # v3"
+  if AUDIT_TARGET="${work}/fixtures/real-mismatch" "${python}" "${work}/check.py" \
+      > "${work}/real-mismatch.out" 2>&1; then
+    fail "real-mismatch: a v4 commit commented as v3 passed"
+  elif ! grep -Fq "tag v3 of actions/checkout is at" "${work}/real-mismatch.out"; then
+    fail "real-mismatch: unexpected output"
+    sed 's/^/    /' "${work}/real-mismatch.out" >&2
+  fi
+  no_forged_commands "${work}/real-mismatch.out"
+fi
+
+if [ "${failures}" -ne 0 ]; then
+  echo "${failures} pin-check test(s) failed" >&2
+  exit 1
+fi
+echo "pin-check tests passed"

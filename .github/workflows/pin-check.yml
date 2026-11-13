@@ -1,0 +1,748 @@
+name: pin-check
+
+# Checks the action and reusable-workflow pins in a caller's workflow and
+# composite-action definitions. A dependency bot rewrites the SHA and the
+# version comment of a pin and nothing else, so nobody reads upstream code in
+# that change. These are the parts of it that a machine can verify:
+#
+#   1. Every `uses:` other than a local `./` path or a `docker://` image is
+#      pinned to a full commit SHA. zizmor's unpinned-uses checks this; the last
+#      step requires it again of every reference zizmor lets through, including
+#      one zizmor reads as a hash pin whose path the step cannot parse. A
+#      reference zizmor cannot parse at all stops the job in zizmor's step.
+#   2. The version comment names a tag of the same repository, and that tag is
+#      at the pinned commit. If the tag is an alias that has since moved (v4),
+#      a release tag in its line (v4.x.y) must still be at the pinned commit.
+#      A SHA that no tag of the repository points at fails here, which also
+#      rules out a commit that exists only in a fork.
+#   3. A called reusable workflow asks for no permission that the calling job
+#      does not grant. GitHub refuses such a run before it starts
+#      (startup_failure, no logs, no check run), so a pin bump that raises the
+#      callee's permissions otherwise shows up only as an unexplained red run.
+#
+# Every lookup that fails, and every reference the checks cannot read, fails
+# the check.
+
+on:
+  workflow_call:
+    inputs:
+      pull_request_number:
+        description: Pull request whose changed workflow and action files should be checked
+        required: false
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pins:
+    name: Check action and reusable-workflow pins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        if: inputs.pull_request_number == 0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          # Its Python problem matcher would read the later steps' logs, which
+          # quote the checked files, and turn a matching pair of lines into an
+          # annotation even while workflow commands are switched off.
+          add-problem-matchers: false
+
+      # As in checkout-credentials.yml: a pull_request_target caller is loaded
+      # from the trusted base branch, and the proposed YAML is read through
+      # GitHub's API. Pull-request code is never checked out or run.
+      - name: Prepare audit target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          # The commit this run was started for, which its result is reported
+          # on, and the base branch the changed files are measured against;
+          # both empty when the caller's event is not a pull request event.
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${PULL_REQUEST_NUMBER}" -eq 0 ]; then
+            {
+              echo "AUDIT_TARGET=${GITHUB_WORKSPACE}"
+              echo "AUDIT_TARGET_EMPTY=false"
+              echo "PIN_CHECK_HEAD_SHA="
+              echo "PIN_CHECK_COLLECTED="
+            } >> "${GITHUB_ENV}"
+            exit 0
+          fi
+
+          audit_root="${RUNNER_TEMP}/pin-check-audit"
+          manifest="${RUNNER_TEMP}/pin-check-files"
+          mkdir -p "${audit_root}"
+
+          pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}")"
+          expected_count="$(jq -r '.changed_files' <<< "${pull}")"
+          head_sha="$(jq -r '.head.sha' <<< "${pull}")"
+          if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unexpected pull request head SHA (base64): $(printf '%s' "${head_sha}" | base64 -w0)" >&2
+            exit 1
+          fi
+          # Every file below is read at head_sha, and the result is reported on
+          # the event's head. The changed files are those GitHub lists against
+          # the pull request's base branch. When either has changed since the
+          # event, the push or edit that changed it starts a run of its own.
+          base_ref="$(jq -r '.base.ref' <<< "${pull}")"
+          if [ -n "${EVENT_HEAD_SHA:-}" ] && [ "${head_sha}" != "${EVENT_HEAD_SHA}" ]; then
+            echo "The pull request head is no longer the commit this run was started for; this run does not check the new head." >&2
+            exit 1
+          fi
+          if [ -n "${EVENT_BASE_REF:-}" ] && [ "${base_ref}" != "${EVENT_BASE_REF}" ]; then
+            echo "The pull request no longer targets the base branch this run was started for; this run does not check it." >&2
+            exit 1
+          fi
+
+          # A workflow or action file that is a symbolic link loads whatever it
+          # points at, which a pull request can change without touching the
+          # link, so such files are refused. The head commit's tree shows them.
+          tree="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees/${head_sha}?recursive=1")"
+          if [ "$(jq -r '.truncated' <<< "${tree}")" != "false" ]; then
+            echo "The pull request's file tree is too large to list in one response; refusing a partial check." >&2
+            exit 1
+          fi
+          links="$(jq -r '
+            [.tree[]
+             | select(.mode == "120000")
+             | .path
+             | select(test("^\\.github/workflows/[^/]*\\.ya?ml$") or (ascii_downcase | test("(^|/)action\\.ya?ml$")))
+             | @base64]
+            | join(" ")
+          ' <<< "${tree}")"
+          if [ -n "${links}" ]; then
+            echo "Workflow or action files that are symbolic links (base64): ${links}" >&2
+            exit 1
+          fi
+
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/files?per_page=100" \
+            --jq '
+              .[]
+              | [.status, .filename,
+                 (.filename | test("[\\r\\n\\t]") or contains("##[")
+                   or (split("/") | any(. == "" or . == "." or . == ".." or utf8bytelength > 255)))]
+              | @base64
+            ' > "${manifest}"
+
+          actual_count="$(wc -l < "${manifest}" | tr -d ' ')"
+          if [ "${actual_count}" -ne "${expected_count}" ]; then
+            echo "GitHub returned ${actual_count} of ${expected_count} changed files; refusing a partial audit." >&2
+            exit 1
+          fi
+
+          count=0
+          while IFS= read -r encoded; do
+            [ -n "${encoded}" ] || continue
+            record="$(printf '%s' "${encoded}" | base64 --decode)"
+            status="$(jq -r '.[0]' <<< "${record}")"
+            filename="$(jq -r '.[1]' <<< "${record}")"
+            unsafe="$(jq -r '.[2]' <<< "${record}")"
+
+            if [ "${status}" = "removed" ]; then
+              continue
+            fi
+            # Workflows, plus composite actions wherever they live: actions are
+            # often kept outside .github/actions so that other repositories
+            # can call them. The action-file name is matched in any case: a
+            # runner on a case-insensitive file system loads Action.yml as
+            # action.yml.
+            lowered="$(printf '%s' "${filename}" | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "${filename}" =~ ^\.github/workflows/[^/]*\.ya?ml$ \
+              && ! "${lowered}" =~ (^|/)action\.ya?ml$ ]]; then
+              continue
+            fi
+
+            # A name with a control character, `##[`, an empty or dot segment,
+            # or a segment too long to create is refused before any command
+            # handles it, and shown base64-encoded: raw, it could start a
+            # workflow command of its own in this log.
+            if [ "${unsafe}" != "false" ]; then
+              echo "Unsafe workflow path returned by GitHub (base64): $(jq -r '.[1] | @base64' <<< "${record}")" >&2
+              exit 1
+            fi
+
+            destination="${audit_root}/${filename}"
+            mkdir -p "$(dirname "${destination}")"
+            # Read at head_sha, the commit whose tree was checked for links,
+            # not at the head the file list happened to be taken from. Each
+            # path segment is percent-encoded; the slashes between them stay.
+            encoded_path="$(jq -rn --arg name "${filename}" '$name | @uri | gsub("%2F"; "/")')"
+            gh api "repos/${GITHUB_REPOSITORY}/contents/${encoded_path}?ref=${head_sha}" \
+              --jq 'if .type == "file" and .encoding == "base64" then .content else error("expected base64 file content") end' \
+              | tr -d '\n' \
+              | base64 --decode > "${destination}"
+            count=$((count + 1))
+          done < "${manifest}"
+
+          # The file list shows the pull request as it was when it was read. If
+          # the head or the base branch changed during collection, the list may
+          # belong to another commit or base than the files. A change that is
+          # undone within one collection is not seen here, but undoing it is a
+          # push or an edit that starts a run of its own, on this same commit.
+          pull_after="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}")"
+          head_after="$(jq -r '.head.sha' <<< "${pull_after}")"
+          base_after="$(jq -r '.base.ref' <<< "${pull_after}")"
+          if [ "${head_after}" != "${head_sha}" ] || [ "${base_after}" != "${base_ref}" ]; then
+            echo "The pull request moved to another head or base branch while its files were collected; this run does not check a mixed set of files." >&2
+            exit 1
+          fi
+
+          {
+            echo "AUDIT_TARGET=${audit_root}"
+            echo "PIN_CHECK_HEAD_SHA=${head_sha}"
+            echo "PIN_CHECK_COLLECTED=${count}"
+          } >> "${GITHUB_ENV}"
+          if [ "${count}" -eq 0 ]; then
+            echo "AUDIT_TARGET_EMPTY=true" >> "${GITHUB_ENV}"
+            echo "No retained workflow or composite-action YAML files to check."
+          else
+            echo "AUDIT_TARGET_EMPTY=false" >> "${GITHUB_ENV}"
+            echo "Collected ${count} changed workflow/action file(s) through the GitHub API."
+          fi
+
+      - name: Require full-SHA pins
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${AUDIT_TARGET_EMPTY}" = "true" ]; then
+            exit 0
+          fi
+
+          report="${RUNNER_TEMP}/zizmor-pin-check.json"
+          log="${RUNNER_TEMP}/zizmor-pin-check.log"
+
+
+          # Offline on purpose. zizmor's online rules depend on API calls: one
+          # failing call aborts the whole run, and ref-version-mismatch reports
+          # nothing for a reusable-workflow pin. The next step makes its own
+          # lookups and fails when one fails.
+          #
+          # zizmor's log quotes the checked files (expressions it cannot parse,
+          # file names, spans of bad YAML), so it never reaches this log with
+          # workflow commands switched on: it is dropped on success and shown
+          # between stop-commands markers with a random token on failure.
+          if ! uvx --no-config --from zizmor==1.28.0 zizmor \
+            --offline \
+            --strict-collection \
+            --collect=workflows,actions \
+            --no-config \
+            --no-ignores \
+            --no-exit-codes \
+            --format=json-v1 \
+            "${AUDIT_TARGET}" > "${report}" 2> "${log}"; then
+            # zizmor skips some files the next step reads (an Action.yml, a
+            # workflow named .yml, paths a .gitignore covers). When those are
+            # all there is, it stops with nothing to read; the next step, which
+            # requires full SHAs too, then checks them.
+            if sed 's/\x1b\[[0-9;]*m//g' "${log}" | grep -qx 'error: no inputs collected'; then
+              echo "zizmor found no file it reads; the next step checks the pins."
+              exit 0
+            fi
+            token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::error title=pin-check unpinned::zizmor could not read the checked files; its log follows, with workflow commands switched off."
+            echo "::stop-commands::${token}"
+            cat "${log}"
+            echo "::${token}::"
+            exit 1
+          fi
+
+          count="$(jq '[.[] | select(.ident == "unpinned-uses" and .ignored == false)] | length' "${report}")"
+
+          # Paths and messages are escaped as workflow-command data: a file
+          # name from a pull request must not be able to start a command.
+          jq -r --arg root "${AUDIT_TARGET}/" '
+            def data: tostring | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+            def prop: data | gsub(":"; "%3A") | gsub(","; "%2C");
+            .[]
+            | select(.ident == "unpinned-uses" and .ignored == false)
+            | .locations[]
+            | select(.symbolic.kind == "Primary")
+            | (.symbolic.annotation // "action is not pinned to a hash") as $what
+            | (if ($what | startswith("image")) then "Pin the image to a tag or a sha256 digest."
+               else "Pin the full commit SHA and name its tag in a trailing comment." end) as $advice
+            | "::error file=\((.symbolic.key.Local.verbatim_path // "workflow") | ltrimstr($root) | ltrimstr("./") | prop),line=\((.concrete.location.start_point.row // 0) + 1),title=pin-check unpinned::\($what | data). \($advice)"
+          ' "${report}"
+
+          if [ "${count}" -ne 0 ]; then
+            echo "Found ${count} unpinned reference(s)."
+            exit 1
+          fi
+
+          echo "Every pin is a full commit SHA."
+
+      # Embedded rather than checked out, so the gate runs no code from the
+      # repository it checks. scripts/test-pin-check extracts this exact
+      # script from the workflow and runs it with stand-in git and gh.
+      - name: Check version comments and reusable-workflow permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: uv run --no-config --no-project --with pyyaml==6.0.3 python3 {0}
+        run: |
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          LEVELS = {"none": 0, "read": 1, "write": 2}
+          NAMES = {0: "none", 1: "read", 2: "write"}
+          ALL = None  # the level of every scope a permissions value does not list
+          # GITHUB_TOKEN under GitHub's restricted default (metadata: read is implicit).
+          RESTRICTED_DEFAULT = {ALL: 0, "contents": 1, "packages": 1}
+          NAME = r"[A-Za-z0-9_.-]+"
+          REMOTE = re.compile(rf"^(?P<owner>{NAME})/(?P<repo>{NAME})(?P<path>(?:/{NAME})*)@(?P<ref>[^\s@]+)$")
+          REUSABLE = re.compile(rf"^/\.github/workflows/{NAME}\.ya?ml$")
+          LOCAL_REUSABLE = re.compile(rf"^\./(?P<path>\.github/workflows/{NAME}\.ya?ml)$")
+          SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+          MERGE_TAG = "tag:yaml.org,2002:merge"
+          ACTION_FILES = ("action.yml", "action.yaml")
+          IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+          USES_LINE = re.compile(
+              r"""^\s*(?:-\s+)?(?:&\S+\s+)?uses:\s*(?:&\S+\s+)?(?P<q>['"]?)(?P<uses>[^'"\s#]+)(?P=q)\s*(?:#\s*(?P<comment>\S+).*)?$"""
+          )
+
+
+          class Refused(Exception):
+              pass
+
+
+          def escape_data(value):
+              return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def escape_property(value):
+              return escape_data(value).replace(":", "%3A").replace(",", "%2C")
+
+
+          def error(path, line, message):
+              """One annotation. Names and messages can come from a pull request, so both are escaped."""
+              print(f"::error file={escape_property(path)},line={line},title=pin-check::{escape_data(message)}")
+
+
+          def normalize(spec, where):
+              """A permissions value as {scope: level}, with ALL for unlisted scopes; None when absent."""
+              if spec is None:
+                  return None
+              if spec == "read-all":
+                  return {ALL: 1}
+              if spec == "write-all":
+                  return {ALL: 2}
+              if isinstance(spec, dict):
+                  levels = {ALL: 0}
+                  for scope, level in spec.items():
+                      if level not in LEVELS:
+                          raise Refused(f"{where}: unknown permission level {level!r} for {scope!r}")
+                      levels[str(scope)] = LEVELS[level]
+                  return levels
+              raise Refused(f"{where}: unreadable permissions value {spec!r}")
+
+
+          def level_of(levels, scope):
+              return levels.get(scope, levels.get(ALL, 0))
+
+
+          def run(command, what):
+              try:
+                  result = subprocess.run(
+                      command, capture_output=True, text=True, timeout=120, check=False,
+                      env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                  )
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  raise Refused(f"{what} failed: {exc}") from None
+              if result.returncode != 0:
+                  raise Refused(f"{what} failed: {result.stderr.strip()[:300]}")
+              return result.stdout
+
+
+          def parse_remote(uses):
+              match = REMOTE.match(uses)
+              if not match:
+                  return None
+              parts = [match["owner"], match["repo"], *match["path"].split("/")[1:]]
+              if any(part in (".", "..") for part in parts):
+                  raise Refused(f"refusing a dot segment in {uses!r}")
+              return match
+
+
+          def tag_commits(repository):
+              """{tag: commit}; an annotated tag resolves to the commit it points at."""
+              listing = run(["git", "ls-remote", "--tags", f"https://github.com/{repository}.git"],
+                            f"listing the tags of {repository}")
+              plain, peeled = {}, {}
+              for row in listing.splitlines():
+                  commit, _, ref = row.partition("\t")
+                  if not SHA.match(commit) or not ref.startswith("refs/tags/"):
+                      continue
+                  name = ref[len("refs/tags/"):]
+                  if name.endswith("^{}"):
+                      peeled[name[:-3]] = commit.lower()
+                  else:
+                      plain[name] = commit.lower()
+              return {name: peeled.get(name, commit) for name, commit in plain.items()}
+
+
+          def comment_problem(repository, sha, comment, tags):
+              """None when the comment names a tag at the pinned commit, or an alias with a release in its
+              line at it; else why not."""
+              if not comment:
+                  return f"{repository}@{sha} has no version comment naming the tag it was pinned from"
+              at_sha = sorted(name for name, commit in tags.items() if commit == sha)
+              if comment not in tags:
+                  hint = f"; {sha[:12]} is tagged {', '.join(at_sha)}" if at_sha else ""
+                  return f"the comment names {comment}, which is not a tag of {repository}{hint}"
+              if tags[comment] == sha:
+                  return None
+              line_release = re.compile(re.escape(comment) + r"(\.\d+)+")
+              if any(line_release.fullmatch(name) for name in at_sha):
+                  return None  # an alias that moved on; the pin is still a release in its line
+              hint = (f"{sha[:12]} is tagged {', '.join(at_sha)}" if at_sha
+                      else f"no tag of {repository} points at {sha[:12]}")
+              return f"tag {comment} of {repository} is at {tags[comment][:12]}, not {sha[:12]}; {hint}"
+
+
+          def gh_file(repository, path, ref):
+              """File text through GitHub's contents API."""
+              payload = json.loads(run(["gh", "api", f"repos/{repository}/contents/{path}?ref={ref}"],
+                                       f"reading {repository}/{path}@{ref}"))
+              if not isinstance(payload, dict) or payload.get("type") != "file" or payload.get("encoding") != "base64":
+                  raise Refused(f"{repository}/{path}@{ref} is not a base64 file")
+              return base64.b64decode(payload["content"]).decode("utf-8")
+
+
+          def callee_text(uses, root):
+              remote = parse_remote(uses)
+              if remote:
+                  if not REUSABLE.match(remote["path"]):
+                      raise Refused(f"not a reusable workflow path: {uses!r}")
+                  return gh_file(f"{remote['owner']}/{remote['repo']}", remote["path"][1:], remote["ref"].lower())
+              local = LOCAL_REUSABLE.match(uses)
+              if local:
+                  candidate = root / local["path"]
+                  if candidate.is_file():
+                      return candidate.read_text()
+                  head_sha = os.environ.get("PIN_CHECK_HEAD_SHA", "")
+                  if head_sha:
+                      return gh_file(os.environ["GITHUB_REPOSITORY"], local["path"], head_sha)
+                  raise Refused(f"local reusable workflow not found: {uses!r}")
+              raise Refused(f"unrecognised reusable workflow reference: {uses!r}")
+
+
+          def refuse_merge_keys(node, where):
+              """safe_load applies a merge key (`<<`) wherever it stands; GitHub does not, so none is read."""
+              stack, seen = [node], set()
+              while stack:
+                  current = stack.pop()
+                  if id(current) in seen:
+                      continue
+                  seen.add(id(current))
+                  if isinstance(current, yaml.MappingNode):
+                      for key, value in current.value:
+                          if key.tag == MERGE_TAG:
+                              raise Refused(f"{where}: YAML merge keys are not supported (line {key.start_mark.line + 1})")
+                          stack.extend((key, value))
+                  elif isinstance(current, yaml.SequenceNode):
+                      stack.extend(current.value)
+
+
+          def construct(node):
+              """The value safe_load would build for one composed node."""
+              loader = yaml.SafeLoader("")
+              try:
+                  return loader.construct_document(node)
+              finally:
+                  loader.dispose()
+
+
+          def load_yaml(text, where):
+              try:
+                  data = yaml.safe_load(text)
+              except yaml.YAMLError as exc:
+                  raise Refused(f"{where}: invalid YAML ({exc})") from None
+              if not isinstance(data, dict):
+                  raise Refused(f"{where}: not a YAML mapping")
+              return data
+
+
+          def requested(text, where):
+              """Highest level per scope that any job of the called workflow asks for; None if all inherit.
+
+              Each job is read from its own YAML node: safe_load would fold job ids such as `yes` and `on`
+              into one key, and keep only the last of a repeated id, dropping what the others ask for.
+              """
+              top = normalize(load_yaml(text, where).get("permissions"), f"{where} (workflow permissions)")
+              try:
+                  document = yaml.compose(text, Loader=yaml.SafeLoader)
+              except yaml.YAMLError as exc:
+                  raise Refused(f"{where}: invalid YAML ({exc})") from None
+              refuse_merge_keys(document, where)
+              jobs = mapping_values(document, "jobs")
+              if len(jobs) != 1 or not isinstance(jobs[0], yaml.MappingNode):
+                  raise Refused(f"{where}: jobs is not a mapping")
+              if any(key.tag == MERGE_TAG for key, _ in jobs[0].value):
+                  raise Refused(f"{where}: YAML merge keys are not supported")
+              wanted = None
+              for key, node in jobs[0].value:
+                  name = key.value if isinstance(key, yaml.ScalarNode) else "?"
+                  if not isinstance(node, yaml.MappingNode) or node.tag != "tag:yaml.org,2002:map":
+                      raise Refused(f"{where}: job {name!r} is not a mapping")
+                  job = construct(node)
+                  effective = normalize(job.get("permissions"), f"{where} job {name!r}")
+                  if effective is None:
+                      effective = top
+                  if effective is None:
+                      continue
+                  if wanted is None:
+                      wanted = {ALL: 0}
+                  for scope in set(effective) | set(wanted):
+                      wanted[scope] = max(level_of(wanted, scope), level_of(effective, scope))
+              return wanted
+
+
+          def shortfalls(wanted, granted):
+              """(what, asked, granted) entries that together say what the caller must grant.
+
+              A shorthand the callee asks for (read-all, write-all) that the grant falls short of comes
+              first; after it, every named scope the callee asks more of than that shorthand would give.
+              A list of scopes never counts as a shorthand here.
+              """
+              shorthand = level_of(wanted, ALL) > level_of(granted, ALL)
+              found = []
+              if shorthand:
+                  found.append((f"{NAMES[level_of(wanted, ALL)]}-all", level_of(wanted, ALL), level_of(granted, ALL)))
+              for scope in sorted(s for s in wanted if s is not ALL):
+                  have = level_of(granted, scope)
+                  if level_of(wanted, scope) > max(have, level_of(wanted, ALL) if shorthand else have):
+                      found.append((scope, level_of(wanted, scope), have))
+              return found
+
+
+          def triggers(data):
+              on = data.get("on", data.get(True))  # PyYAML reads a bare `on:` key as True
+              if isinstance(on, str):
+                  return {on}
+              if isinstance(on, (list, dict)):
+                  return {str(event) for event in on}
+              return set()
+
+
+          def mapping_values(node, key):
+              """The value nodes for `key` in a plain YAML mapping node, every one if the key repeats."""
+              if not isinstance(node, yaml.MappingNode):
+                  return []
+              if any(name.tag == MERGE_TAG for name, _ in node.value):
+                  # safe_load would merge in keys this walk cannot see, a uses among them.
+                  raise Refused(f"YAML merge keys are not supported (line {node.start_mark.line + 1})")
+              return [value for name, value in node.value if isinstance(name, yaml.ScalarNode) and name.value == key]
+
+
+          def plain_mapping(node, what):
+              if not isinstance(node, yaml.MappingNode) or node.tag != "tag:yaml.org,2002:map":
+                  raise Refused(f"{what} on line {node.start_mark.line + 1} is not a plain mapping")
+              return node
+
+
+          def uses_nodes(root):
+              """(uses node, job name, job node) for a reusable-workflow call; (uses node, None, None) for a step."""
+              found = []
+
+              def steps_of(owner):
+                  for steps in mapping_values(owner, "steps"):
+                      for step in (steps.value if isinstance(steps, yaml.SequenceNode) else []):
+                          found.extend((node, None, None) for node in mapping_values(plain_mapping(step, "a step"), "uses"))
+
+              for jobs in mapping_values(root, "jobs"):
+                  if isinstance(jobs, yaml.MappingNode) and any(key.tag == MERGE_TAG for key, _ in jobs.value):
+                      raise Refused(f"YAML merge keys are not supported (line {jobs.start_mark.line + 1})")
+                  for key, job in (jobs.value if isinstance(jobs, yaml.MappingNode) else []):
+                      name = key.value if isinstance(key, yaml.ScalarNode) else None
+                      found.extend((node, name, job) for node in mapping_values(plain_mapping(job, "a job"), "uses"))
+                      steps_of(job)
+              for runs in mapping_values(root, "runs"):
+                  steps_of(runs)
+              return found
+
+
+          def check_comments(shown, lines, found, tag_cache):
+              problems = 0
+              for node, _, _ in found:
+                  line = node.start_mark.line + 1
+                  if not isinstance(node, yaml.ScalarNode):
+                      error(shown, line, "uses must be a single string")
+                      problems += 1
+                      continue
+                  uses = node.value.strip()
+                  if uses.startswith("docker://"):
+                      # zizmor checks images too, but not in files it does not read.
+                      image = uses[len("docker://"):]
+                      name = image.rsplit("/", 1)[-1]
+                      pinned = IMAGE_DIGEST.search(image) if "@" in name else name.partition(":")[2]
+                      if not pinned:
+                          error(shown, line, f"{uses} names no image tag or digest")
+                          problems += 1
+                      continue
+                  if uses.startswith("./") and "@" not in uses:
+                      continue
+                  try:
+                      remote = None if uses.startswith("./") else parse_remote(uses)
+                  except Refused as exc:
+                      error(shown, line, str(exc))
+                      problems += 1
+                      continue
+                  if not remote:
+                      error(shown, line, f"cannot read {uses!r} as owner/repo[/path]@ref, so its pin cannot be checked")
+                      problems += 1
+                      continue
+                  if not SHA.match(remote["ref"]):
+                      error(shown, line, f"{uses} is not pinned to a full commit SHA")
+                      problems += 1
+                      continue
+                  # The comment is read from the line YAML puts this uses on, never from a
+                  # look-alike line elsewhere (a run: block, say).
+                  match = USES_LINE.match(lines[line - 1]) if line <= len(lines) else None
+                  if not match or match["uses"] != uses:
+                      error(shown, line, f"cannot read the version comment of {uses}; "
+                                         f"write it as `uses: {uses} # <tag>` on one line")
+                      problems += 1
+                      continue
+                  repository = f"{remote['owner']}/{remote['repo']}"
+                  try:
+                      if repository not in tag_cache:
+                          tag_cache[repository] = tag_commits(repository)
+                  except Refused as exc:
+                      error(shown, line, str(exc))
+                      problems += 1
+                      continue
+                  problem = comment_problem(repository, remote["ref"].lower(), match["comment"], tag_cache[repository])
+                  if problem:
+                      error(shown, line, problem)
+                      problems += 1
+              return problems
+
+
+          def check_permissions(shown, data, found, root):
+              problems = 0
+              top = normalize(data.get("permissions"), f"{shown} (workflow permissions)")
+              for node, name, job_node in found:
+                  if name is None or not isinstance(node, yaml.ScalarNode):
+                      continue
+                  uses, line = node.value.strip(), node.start_mark.line + 1
+                  remote = None if uses.startswith("./") else REMOTE.match(uses)
+                  if remote and not SHA.match(remote["ref"]):
+                      continue  # not a SHA pin: reported above, and not fetched at a moving ref
+                  try:
+                      job = construct(job_node)  # its own node: safe_load folds `yes` and `on`, and repeated ids
+                      granted = normalize(job.get("permissions"), f"{shown} job {name!r}")
+                      declared = granted is not None or top is not None
+                      if granted is None:
+                          granted = top
+                      wanted = requested(callee_text(uses, root), uses)
+                  except (Refused, OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+                      error(shown, line, f"job {name!r}: {exc}")
+                      problems += 1
+                      continue
+                  if wanted is None or not any(level > 0 for level in wanted.values()):
+                      continue
+                  if not declared and "workflow_call" in triggers(data):
+                      # Called, the job passes on whatever its own caller grants, which is not visible
+                      # here. Declared, the grant is checked here, and the caller's grant one level up.
+                      asks = ", ".join(f"{scope}: {NAMES[level]}" for scope, level in sorted(
+                          (s, v) for s, v in wanted.items() if s is not ALL and v > 0))
+                      if level_of(wanted, ALL) > 0:
+                          asks = f"{NAMES[level_of(wanted, ALL)]}-all"
+                      error(shown, line, f"job {name!r} declares no permissions and its workflow runs on "
+                                         f"workflow_call, so the grant it inherits cannot be compared with what "
+                                         f"{uses} asks for ({asks}). Declare those permissions on the job.")
+                      problems += 1
+                      continue
+                  for scope, asked, have in shortfalls(wanted, granted if declared else RESTRICTED_DEFAULT):
+                      shorthand = scope.endswith("-all")
+                      asks = scope if shorthand else f"{scope}: {NAMES[asked]}"
+                      if not declared:
+                          message = (f"job {name!r} declares no permissions, but {uses} asks for {asks}. Under the "
+                                     f"restricted default token GitHub refuses the run before it starts; grant it "
+                                     f"on the job.")
+                      elif shorthand:
+                          message = (f"job {name!r} grants less than {scope}, which {uses} asks for, as far as a "
+                                     f"listed grant shows. Grant {scope} on the job.")
+                      else:
+                          message = (f"job {name!r} grants {scope}: {NAMES[have]}, but {uses} asks for {asks}. "
+                                     f"GitHub refuses the run before it starts.")
+                      error(shown, line, message)
+                      problems += 1
+              return problems
+
+
+          def main():
+              if os.environ.get("AUDIT_TARGET_EMPTY") == "true":
+                  return 0
+              root = Path(os.environ["AUDIT_TARGET"])
+              workflows = sorted(p for p in (root / ".github" / "workflows").glob("*")
+                                 if (p.is_symlink() or p.is_file()) and p.name.endswith((".yml", ".yaml")))
+              actions = set()
+              for directory, subdirectories, files in os.walk(root):
+                  subdirectories[:] = [d for d in subdirectories if d != ".git"]
+                  actions.update(Path(directory) / f for f in files if f.lower() in ACTION_FILES)
+              actions = sorted(actions - set(workflows))
+              tag_cache, problems = {}, 0
+              for path in workflows + actions:
+                  shown = path.relative_to(root).as_posix()
+                  if path.is_symlink():
+                      error(shown, 1, "is a symbolic link; a runner loads whatever it points at, which can change "
+                                      "without touching this file, so linked workflow and action files are refused")
+                      problems += 1
+                      continue
+                  text = path.read_text()
+                  try:
+                      data = load_yaml(text, shown)
+                      document = yaml.compose(text, Loader=yaml.SafeLoader)
+                      refuse_merge_keys(document, shown)
+                      found = uses_nodes(document)
+                  except (Refused, yaml.YAMLError) as exc:
+                      error(shown, 1, str(exc))
+                      problems += 1
+                      continue
+                  problems += check_comments(shown, text.splitlines(), found, tag_cache)
+                  if path in workflows:
+                      try:
+                          problems += check_permissions(shown, data, found, root)
+                      except Refused as exc:
+                          error(shown, 1, str(exc))
+                          problems += 1
+              collected = os.environ.get("PIN_CHECK_COLLECTED", "")
+              if collected and int(collected) != len(workflows) + len(actions):
+                  print(f"::error title=pin-check::collected {collected} file(s) but checked "
+                        f"{len(workflows) + len(actions)}; refusing a partial check.")
+                  problems += 1
+              if problems:
+                  print(f"Found {problems} pin problem(s).")
+                  return 1
+              print(f"Checked {len(workflows) + len(actions)} file(s): every version comment matches its tag, "
+                    f"and no reusable workflow asks for more than its caller grants.")
+              return 0
+
+
+          try:
+              status = main()
+          except Exception as exc:  # fail closed, and keep the text of an unexpected failure escaped
+              print(f"::error title=pin-check::unexpected failure: {escape_data(type(exc).__name__)}: {escape_data(exc)}")
+              status = 1
+          sys.exit(status)

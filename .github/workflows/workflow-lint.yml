@@ -61,6 +61,9 @@ jobs:
       - name: Test checkout credential audit
         run: bash scripts/test-checkout-credentials
 
+      - name: Test pin check
+        run: bash scripts/test-pin-check
+
   # A test that nothing runs is not a gate — the same reason body-lint-caller.yml
   # carries its pattern harness. scripts/__tests__ was dev-machine-only until
   # this job existed: `scripts/package.json` defined `test`, and no workflow
