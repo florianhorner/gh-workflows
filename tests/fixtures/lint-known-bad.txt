@@ -1,6 +1,8 @@
 # Synthetic rejection examples for each editorial pattern.
 # All changes and reviews described below are fictional.
 # Non-comment, nonblank lines must match at least one baseline pattern.
+# A line starting with "# " is a comment; Markdown heading cases use "##" or
+# deeper and are asserted like any other line.
 
 # Review noun followed by a discovery verb.
 The review found a missing queue limit
@@ -86,6 +88,15 @@ The example mentions untracked code
 The draft was written in a Conductor workspace
 A Conductor session produced this example
 A Conductor agent produced this example
+
+# Alternatives that need a positive case of their own.
+Findings from review are listed below
+Two edge cases were raised during review of the parser
+One finding was left open after the change
+Four findings were closed in this change
+12 findings were deferred to a follow-up
+The station's own listening data drove the change
+The draft was written in this Conductor workspace
 
 # Prose punctuation.
 The retry counter is reset — the connection stays open

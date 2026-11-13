@@ -15,8 +15,9 @@
 #                 and lost matches before updating it.
 #   6. FOOTER   - exempt the trailing cloud footer. Mid-body copies, near-matches
 #                 and changelog copies still fail.
-#   7. COVERAGE - each pattern matches a synthetic positive case and rejects a
-#                 synthetic control. Check each rule independently.
+#   7. COVERAGE - each pattern matches a line of the synthetic corpus and does
+#                 not match one neutral sentence. That sentence is a sanity
+#                 check; per-rule near-misses are lint-known-good.txt (step 3).
 #   8. REPORT   - preserve columns, source IDs, line numbers and heading matches.
 set -uo pipefail
 
@@ -63,7 +64,7 @@ match_any() {
 echo "[2/8] recall: known-bad lines must all be caught"
 n=0
 while IFS= read -r line; do
-  case "$line" in ''|'#'*) continue ;; esac
+  case "$line" in ''|'#'|'# '*) continue ;; esac
   n=$((n+1))
   if match_any "$line" >/dev/null; then ok
   else bad "uncaught known-bad line: $line"; fi
@@ -74,7 +75,7 @@ echo "      $n known-bad lines checked"
 echo "[3/8] precision: known-good lines must all be clean"
 n=0
 while IFS= read -r line; do
-  case "$line" in ''|'#'*) continue ;; esac
+  case "$line" in ''|'#'|'# '*) continue ;; esac
   # The em-dash exemption is a property of check-body-lint.sh, not of the
   # pattern; exempt lines are asserted separately in step 4.
   if printf '%s\n' "$line" | grep -qE -- "$LINT_PROSE_STYLE_EXEMPT" 2>/dev/null; then
@@ -193,7 +194,7 @@ else bad "relative body path 'body=pr.md': expected exit 1, got $EQ_RC"; fi
 rm -rf "$EQ_DIR"
 
 # --- 7. COVERAGE -----------------------------------------------------------
-echo "[7/8] each pattern has a synthetic positive and a negative control"
+echo "[7/8] each pattern has a synthetic positive and passes a neutral sentence"
 CORPUS_TEXT="$(mktemp)"
 sed 's/^#[0-9]*://' tests/fixtures/lint-corpus-synthetic.txt > "$CORPUS_TEXT"
 for pat in "${ALL_PATTERNS[@]}"; do

@@ -1,6 +1,8 @@
 # Synthetic acceptance controls for the editorial pattern classes.
 # Non-comment, nonblank lines must pass all patterns, except the proof examples
-# tested through check-body-lint.sh's prose-style exemption.
+# tested through check-body-lint.sh's prose-style exemption. A line starting
+# with "# " is a comment; Markdown heading cases use "##" or deeper and are
+# asserted like any other line.
 
 # Runtime behaviour and present-tense review vocabulary.
 The linter reports an invalid field name
@@ -55,6 +57,17 @@ Generated files are stored under build/
 The cache stash is cleared on shutdown
 Files untracked by the manifest are ignored
 Pushed builds use the release identifier
+
+# Near-misses: each line sits just outside one gap bound or word anchor, so
+# widening that bound or dropping that anchor makes the line match.
+The audit log keeps one entry for every accepted configuration update the parser found valid
+Caught exceptions from the network client are retried in the audit job
+The parser found an invalid record in the nightly configuration audit
+Errors found in reviewed files are listed by path
+The app's own settings page lists every field, and the export writes the data
+Telemetry data stays in the local cache until the user has confirmed the upload
+The lint report lists rule7 findings in a separate column
+The summary table labels its last column # Findings
 
 # Proof-block punctuation is accepted by the body linter.
 - [ ] runtime: n/a — no runtime change
