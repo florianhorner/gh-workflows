@@ -2,11 +2,13 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
-// Reviewed at this immutable commit: POST /markdown in gfm mode,
-// cleanIntegrateWitness, pinned script checkout, PR_BASE_REF and full history
-// for CI-run proofs. A different SHA requires reviewing its workflow and
-// validator before changing this contract. No network or git history needed.
-const reviewedSha = "9085c9da024edbfd5fafbd8801d996776c4fdbcf";
+// v1.6 is at this immutable commit. Its verify-claims workflow and validator
+// are identical to the reviewed commit 9085c9da024edbfd5fafbd8801d996776c4fdbcf:
+// POST /markdown in gfm mode, cleanIntegrateWitness, pinned script checkout,
+// PR_BASE_REF and full history for CI-run proofs. A different SHA requires
+// reviewing its workflow and validator before changing this contract. No
+// network or git history needed.
+const reviewedSha = "6b69633101c7086ed53dbfc12233f26a782a1632";
 const workflowPath = "florianhorner/gh-workflows/.github/workflows/verify-claims.yml";
 const readme = readFileSync(`${import.meta.dir}/../../README.md`, "utf8");
 const caller = readme.split("### Caller workflow\n")[1]?.split("### Proof syntax\n")[0] ?? "";
@@ -17,8 +19,8 @@ describe("README verify-claims caller", () => {
     expect(examples).toHaveLength(1);
     const workflow = parseYaml(examples[0]![1]!);
     expect(workflow.jobs.verify.uses).toBe(`${workflowPath}@${reviewedSha}`);
-    expect(caller).toContain(`# merged main commit; no release tag`);
-    expect(caller).toContain("This commit has no release tag.");
+    expect(caller).toContain(`@${reviewedSha} # v1.6\n`);
+    expect(caller).toContain("the first release with GitHub-rendered validation");
     expect(caller).toContain("do not substitute `v1.5`");
   });
 

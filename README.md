@@ -179,12 +179,11 @@ Draft PRs and PRs authored by `dependabot[bot]`, `pre-commit-ci[bot]` or
 
 Add `.github/workflows/verify-claims.yml` to the consuming repository:
 
-The example pins merged commit
-[`9085c9da024edbfd5fafbd8801d996776c4fdbcf`](https://github.com/florianhorner/gh-workflows/commit/9085c9da024edbfd5fafbd8801d996776c4fdbcf),
-which contains GitHub-rendered validation and the clean-integration witness.
-This commit has no release tag. The latest version tag, `v1.5`, lacks both
-features and does not provide the validation described below. Use the full
-SHA for these checks; do not substitute `v1.5`.
+The example pins `v1.6`
+([`6b69633101c7086ed53dbfc12233f26a782a1632`](https://github.com/florianhorner/gh-workflows/commit/6b69633101c7086ed53dbfc12233f26a782a1632)),
+the first release with GitHub-rendered validation and the clean-integration
+witness. `v1.5` and earlier tags lack both features and do not provide the
+validation described below; do not substitute `v1.5`.
 
 ```yaml
 name: verify-claims
@@ -196,7 +195,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@9085c9da024edbfd5fafbd8801d996776c4fdbcf # merged main commit; no release tag
+    uses: florianhorner/gh-workflows/.github/workflows/verify-claims.yml@6b69633101c7086ed53dbfc12233f26a782a1632 # v1.6
     with:
       owned_repos: "florianhorner/govee2mqtt,florianhorner/mammamiradio"
 ```
@@ -525,9 +524,9 @@ These fixes preserve templates, function signatures and tag naming.
 
 ### Upgrade and compatibility
 
-- The `verify-claims` caller example pins a merged commit without a release
-  tag to provide the checks documented here. Cloud-footer support requires
-  updating the separate `body-lint.yml` pin; inputs do not change.
+- The `verify-claims` caller example pins `v1.6`, the first release with the
+  checks documented here. Cloud-footer support requires a `body-lint.yml` pin
+  at `v1.6` or later; inputs do not change.
 - Clean-integration support passes `PR_BASE_REF` and fetches full history when
   the body cites a CI run. Existing callers need no new inputs.
 - Backtick paths that Markdown reformats. Move Proof headings outside
