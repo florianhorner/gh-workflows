@@ -16,6 +16,11 @@ through GitHub's API without checking out or executing pull request code.
 Pushes scan the complete checkout. Only `artipacked` findings fail this audit;
 other zizmor rules are outside its policy.
 
+In a public repository, GitHub blocks `pull_request_target` from December 2,
+2026 unless an Actions policy allows it. Under **Settings → Actions →
+Policies**, add an active policy that targets the caller file and allows the
+`pull_request_target` and `push` events.
+
 Add a SHA-pinned caller without trigger-level path filters. GitHub evaluates a
 bounded changed-file list for filtered events, so filters can skip the audit
 on oversized pull requests.
@@ -105,6 +110,11 @@ push or edit that changed it starts a run of its own. A change made and undone
 within one collection is not seen, but undoing it starts a run on that same
 commit, which replaces the earlier result. Pushes check the complete
 repository.
+
+In a public repository, GitHub blocks `pull_request_target` from December 2,
+2026 unless an Actions policy allows it. Under **Settings → Actions →
+Policies**, add an active policy that targets the caller file and allows the
+`pull_request_target` and `push` events.
 
 List `edited` with the other event types, as below: it is the event GitHub
 sends when a pull request's base branch changes. Without it, a check made
